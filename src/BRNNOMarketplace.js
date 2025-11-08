@@ -2047,14 +2047,18 @@ function MarketplacePage({
 }
 
 function DetailerCard({ detailer, onClick }) {
+    // Default logo for Cloud Mobile if no image is set
+    const isCloudMobile = detailer.name?.toLowerCase().includes('cloud mobile');
+    const imageUrl = detailer.image || (isCloudMobile ? 'https://via.placeholder.com/400x200/3B82F6/FFFFFF?text=Cloud+Mobile' : null);
+
     return (
         <div
             onClick={onClick}
             className="bg-white rounded-xl border border-gray-200 overflow-hidden hover:shadow-lg transition-shadow cursor-pointer"
         >
             <div className="h-48 bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
-                {detailer.image ? (
-                    <img src={detailer.image} alt={detailer.name} className="w-full h-full object-cover" />
+                {imageUrl ? (
+                    <img src={imageUrl} alt={detailer.name} className="w-full h-full object-cover" />
                 ) : (
                     <span className="text-4xl sm:text-5xl md:text-6xl font-bold text-white">
                         {detailer.name.charAt(0)}
