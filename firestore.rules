@@ -1,101 +1,55 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    
     // Helper function to check if user is admin
     function isAdmin() {
-      return request.auth != null && 
+      return request.auth != null &&
              exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
              get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
     }
     
-    // Helper function to check if user is provider
-    function isProvider() {
-      return request.auth != null && 
-             exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
-             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.accountType == 'provider';
-    }
-    
-    // ===== EXISTING COLLECTIONS =====
-    
+    // Users collection
     match /users/{userId} {
-      allow read, write: if request.auth != null && request.auth.uid == userId;
-      allow read: if isAdmin(); // Admins can read all users
+      allow read: if request.auth != null;
+      allow create: if request.auth != null;
+      allow update: if request.auth != null && request.auth.uid == resource.data.uid;
     }
-    
-    match /detailers/{detailerId} {
-      allow read: if true;
+
+    // Saved Addresses under a user
+    match /users/{userId}/addresses/{addressId} {
+      allow read, create, update, delete: if request.auth != null && request.auth.uid == userId;
+    }
+
+    // Saved Vehicles under a user
+    match /users/{userId}/vehicles/{vehicleId} {
+      allow read, create, update, delete: if request.auth != null && request.auth.uid == userId;
+    }
+
+    // Providers collection
+    match /providers/{providerId} {
+      allow read: if true; // Anyone can view providers
       allow write: if request.auth != null;
     }
-    
+
+    // Bookings collection
     match /bookings/{bookingId} {
-      allow read, write: if request.auth != null && request.auth.uid == resource.data.userId;
-      allow create: if request.auth != null && request.auth.uid == request.resource.data.userId;
-      allow read: if isAdmin();
-      // Allow providers to read their own bookings
-      allow read: if request.auth != null && request.auth.uid == resource.data.providerId;
-    }
-    
-    // ===== NEW MARKETPLACE COLLECTIONS =====
-    
-    // Waitlist - anyone can JOIN, only admins can READ
-    match /waitlist/{document} {
-      allow create: if true; // Anyone can join waitlist
-      allow read, delete, update: if isAdmin(); // Only admins can see/manage waitlist data
-    }
-    
-    // Provider applications - anyone can apply, only admins can see
-    match /providerApplications/{applicationId} {
-      allow create: if true; // Anyone can apply
-      allow read, update, delete: if isAdmin(); // Only admins can review/manage
-    }
-    
-    // Provider profiles - public can browse, providers can edit own
-    match /providers/{providerId} {
-      allow read: if true; // Public can browse providers
-      allow create: if request.auth != null; // Authenticated users can create provider applications
-      allow write: if request.auth != null && request.auth.uid == providerId;
-      allow read, update: if request.auth != null && 
-        (resource.data.userId == request.auth.uid || isAdmin()); // Users can read their own applications, admins can read all
-      // Allow providers to update their own provider documents
-      allow update: if request.auth != null && resource.data.userId == request.auth.uid;
-    }
-    
-    // Customer profiles
-    match /customers/{customerId} {
-      allow read, write: if request.auth != null && request.auth.uid == customerId;
-      allow read: if isAdmin();
-    }
-    
-    // Marketplace bookings
-    match /marketplaceBookings/{bookingId} {
-      allow read, write: if request.auth != null && 
-                     (request.auth.uid == resource.data.customerId || 
-                      request.auth.uid == resource.data.providerId);
-      allow create: if request.auth != null;
-      allow read, update: if isAdmin();
-    }
-    
-    // Reviews - public can read, customers can write
-    match /reviews/{reviewId} {
-      allow read: if true;
-      allow create: if request.auth != null;
-      allow update, delete: if request.auth != null && request.auth.uid == resource.data.customerId;
-      allow write: if isAdmin();
-    }
-    
-    // User vehicles - users can manage their own vehicles
-    match /vehicles/{vehicleId} {
-      allow read, write: if request.auth != null && request.auth.uid == resource.data.userId;
-      allow create: if request.auth != null && request.auth.uid == request.resource.data.userId;
-      allow read, update, delete: if isAdmin();
-    }
-    
-    // User addresses - users can manage their own addresses
-    match /addresses/{addressId} {
-      allow read, write: if request.auth != null && request.auth.uid == resource.data.userId;
-      allow create: if request.auth != null && request.auth.uid == request.resource.data.userId;
-      allow read, update, delete: if isAdmin();
+      // Allow read if user is the customer, provider (by providerUserId), or admin
+      // Note: We check providerUserId directly for query efficiency
+      // providerId is a document ID, so we can't easily check it in queries without document lookups
+      allow read: if request.auth != null && (
+        resource.data.customerId == request.auth.uid ||
+        (resource.data.providerUserId != null && resource.data.providerUserId == request.auth.uid) ||
+        isAdmin()
+      );
+      // Allow create for authenticated users - validate that customerId matches the authenticated user
+      allow create: if request.auth != null && 
+        request.resource.data.customerId == request.auth.uid;
+      // Allow update if user is the customer, provider (by providerUserId), or admin
+      allow update: if request.auth != null && (
+        resource.data.customerId == request.auth.uid ||
+        (resource.data.providerUserId != null && resource.data.providerUserId == request.auth.uid) ||
+        isAdmin()
+      );
     }
   }
 }

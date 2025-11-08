@@ -1,196 +1,17 @@
-import {
-    collection,
-    addDoc,
-    getDocs,
-    query,
-    orderBy,
-    limit,
-    where,
-    doc,
-    updateDoc,
-    increment,
-    getDoc,
-    setDoc,
-    deleteDoc
-} from 'firebase/firestore';
-import { db } from './firebase/config';
+// Import Services Script
+// This script imports services from JSON and replaces all detailer services
+// 
+// USAGE OPTIONS:
+// 1. Browser Console: Copy the entire script and paste in browser console
+// 2. Import in code: import { importServicesToAllDetailers } from './scripts/import-services';
+// 3. Admin Dashboard: Add button to trigger this function
 
-// Waitlist analytics function
-export const getWaitlistAnalytics = async () => {
-    try {
-        const waitlistQuery = query(collection(db, 'waitlist'));
-        const waitlistSnapshot = await getDocs(waitlistQuery);
+// For browser console usage, you'll need to import Firebase first:
+// const { collection, getDocs, updateDoc, doc, query } = await import('firebase/firestore');
+// const { db } = await import('./src/firebase/config.js');
 
-        const analytics = {
-            totalCount: waitlistSnapshot.size,
-            recentSignups: 0,
-            byCity: {},
-            byService: {},
-            byUrgency: {},
-            byVehicleType: {}
-        };
-
-        const oneDayAgo = new Date();
-        oneDayAgo.setDate(oneDayAgo.getDate() - 1);
-
-        waitlistSnapshot.forEach((doc) => {
-            const data = doc.data();
-
-            // Count recent signups
-            if (data.createdAt && data.createdAt.toDate() > oneDayAgo) {
-                analytics.recentSignups++;
-            }
-
-            // Count by city
-            if (data.city) {
-                analytics.byCity[data.city] = (analytics.byCity[data.city] || 0) + 1;
-            }
-
-            // Count by service
-            if (data.service) {
-                analytics.byService[data.service] = (analytics.byService[data.service] || 0) + 1;
-            }
-
-            // Count by urgency
-            if (data.urgency) {
-                analytics.byUrgency[data.urgency] = (analytics.byUrgency[data.urgency] || 0) + 1;
-            }
-
-            // Count by vehicle type
-            if (data.vehicleType) {
-                analytics.byVehicleType[data.vehicleType] = (analytics.byVehicleType[data.vehicleType] || 0) + 1;
-            }
-        });
-
-        return analytics;
-    } catch (error) {
-        console.error('Error fetching waitlist analytics:', error);
-        throw error;
-    }
-};
-
-// Provider management functions
-export const getProviderBookings = async (providerId) => {
-    try {
-        const bookingsQuery = query(
-            collection(db, 'bookings'),
-            where('providerId', '==', providerId),
-            orderBy('date', 'desc')
-        );
-        const bookingsSnapshot = await getDocs(bookingsQuery);
-
-        const bookings = [];
-        bookingsSnapshot.forEach((doc) => {
-            bookings.push({
-                id: doc.id,
-                ...doc.data()
-            });
-        });
-
-        return bookings;
-    } catch (error) {
-        console.error('Error fetching provider bookings:', error);
-        throw error;
-    }
-};
-
-export const updateProviderServices = async (providerId, services) => {
-    try {
-        // Update in users collection
-        await updateDoc(doc(db, 'users', providerId), {
-            services: services
-        });
-
-        // Also update in providers collection
-        const providerQuery = query(collection(db, 'providers'), where('userId', '==', providerId));
-        const providerSnapshot = await getDocs(providerQuery);
-
-        if (!providerSnapshot.empty) {
-            const providerDoc = providerSnapshot.docs[0];
-            await updateDoc(providerDoc.ref, {
-                services: services
-            });
-        }
-
-        return true;
-    } catch (error) {
-        console.error('Error updating provider services:', error);
-        throw error;
-    }
-};
-
-export const updateProviderAvailability = async (providerId, availability) => {
-    try {
-        const providerQuery = query(collection(db, 'providers'), where('userId', '==', providerId));
-        const providerSnapshot = await getDocs(providerQuery);
-
-        if (!providerSnapshot.empty) {
-            const providerDoc = providerSnapshot.docs[0];
-            await updateDoc(providerDoc.ref, {
-                defaultAvailability: availability
-            });
-        }
-
-        return true;
-    } catch (error) {
-        console.error('Error updating provider availability:', error);
-        throw error;
-    }
-};
-
-export const addProviderDateOverride = async (providerId, dateOverride) => {
-    try {
-        const providerQuery = query(collection(db, 'providers'), where('userId', '==', providerId));
-        const providerSnapshot = await getDocs(providerQuery);
-
-        if (!providerSnapshot.empty) {
-            const providerDoc = providerSnapshot.docs[0];
-            const providerData = providerDoc.data();
-            const dateOverrides = providerData.dateOverrides || {};
-
-            const overrideId = Date.now().toString();
-            dateOverrides[overrideId] = dateOverride;
-
-            await updateDoc(providerDoc.ref, {
-                dateOverrides: dateOverrides
-            });
-        }
-
-        return true;
-    } catch (error) {
-        console.error('Error adding date override:', error);
-        throw error;
-    }
-};
-
-export const removeProviderDateOverride = async (providerId, overrideId) => {
-    try {
-        const providerQuery = query(collection(db, 'providers'), where('userId', '==', providerId));
-        const providerSnapshot = await getDocs(providerQuery);
-
-        if (!providerSnapshot.empty) {
-            const providerDoc = providerSnapshot.docs[0];
-            const providerData = providerDoc.data();
-            const dateOverrides = providerData.dateOverrides || {};
-
-            delete dateOverrides[overrideId];
-
-            await updateDoc(providerDoc.ref, {
-                dateOverrides: dateOverrides
-            });
-        }
-
-        return true;
-    } catch (error) {
-        console.error('Error removing date override:', error);
-        throw error;
-    }
-};
-
-// ==================== SERVICE IMPORT FUNCTION ====================
-// Imports services from JSON and REPLACES all services for ALL detailers
-
-const SERVICES_JSON = [
+// Services JSON data
+const servicesJson = [
     {
         "category": "interior",
         "name": "Interior Vacuum",
@@ -377,8 +198,10 @@ const SERVICES_JSON = [
     }
 ];
 
+// Convert JSON services to Firebase format
 function convertServices(servicesJson) {
     return servicesJson.map(service => {
+        // Calculate average price
         const avgPrice = Math.round((service.avgPriceRange.min + service.avgPriceRange.max) / 2);
         
         return {
@@ -398,11 +221,12 @@ function convertServices(servicesJson) {
     });
 }
 
-export const importServicesToAllDetailers = async () => {
+// Import services to all detailers (REPLACES existing services)
+export async function importServicesToAllDetailers() {
     try {
         console.log('🔄 Starting service import...');
         
-        const convertedServices = convertServices(SERVICES_JSON);
+        const convertedServices = convertServices(servicesJson);
         console.log(`✅ Converted ${convertedServices.length} services`);
         
         // Get all providers
@@ -459,10 +283,11 @@ export const importServicesToAllDetailers = async () => {
         alert('Error importing services: ' + error.message);
         throw error;
     }
-};
+}
 
-// Make available in browser console for admin usage
+// For browser console usage
 if (typeof window !== 'undefined') {
     window.importServicesToAllDetailers = importServicesToAllDetailers;
+    console.log('💡 To import services, run: importServicesToAllDetailers()');
 }
 

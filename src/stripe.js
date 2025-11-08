@@ -1,7 +1,13 @@
 import { loadStripe } from '@stripe/stripe-js';
 import config from './config';
 
-// Initialize Stripe with publishable key from environment variables
-const stripePromise = loadStripe(config.stripePublishableKey);
+// Use environment variable first, fallback to config.js (which has test key)
+const publishableKey = process.env.REACT_APP_STRIPE_PUBLISHABLE_KEY || config.stripePublishableKey || '';
+
+export const stripePromise = publishableKey
+    ? loadStripe(publishableKey)
+    : Promise.resolve(null);
 
 export default stripePromise;
+
+
