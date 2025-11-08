@@ -1,7 +1,7 @@
 import React from 'react';
 import { createRoot } from 'react-dom/client';
 import { Elements } from '@stripe/react-stripe-js';
-import BrnnoMarketplace from './BrnnoMarketplace';
+import BrnnoMarketplace from './BRNNOMarketplace';
 import { stripePromise } from './stripe';
 import './firebaseService'; // ensure service import helpers are bundled (attaches to window for admin tools)
 
