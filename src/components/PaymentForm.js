@@ -1,11 +1,12 @@
 import React, { useState } from 'react';
-import { CardElement, useElements, useStripe } from '@stripe/react-stripe-js';
+import { CardElement, AddressElement, useElements, useStripe } from '@stripe/react-stripe-js';
 
-export default function PaymentForm({ amount, onClose, onComplete }) {
+export default function PaymentForm({ amount, serviceAddress, onClose, onComplete }) {
     const stripe = useStripe();
     const elements = useElements();
     const [isLoading, setIsLoading] = useState(false);
     const [errorMessage, setErrorMessage] = useState('');
+    const [billingAddress, setBillingAddress] = useState(null);
 
     const handleSubmit = async (e) => {
         e.preventDefault();
@@ -14,12 +15,30 @@ export default function PaymentForm({ amount, onClose, onComplete }) {
         setIsLoading(true);
 
         try {
+            // Get billing address from AddressElement if available
+            const addressElement = elements.getElement(AddressElement);
+            let billingAddressData = null;
+            if (addressElement) {
+                const { complete, value } = await addressElement.getValue();
+                if (complete && value) {
+                    billingAddressData = {
+                        line1: value.address.line1,
+                        line2: value.address.line2,
+                        city: value.address.city,
+                        state: value.address.state,
+                        postal_code: value.address.postal_code,
+                        country: value.address.country,
+                    };
+                }
+            }
+
             const res = await fetch('/api/create-payment-intent', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     amountCents: Math.round((amount || 0) * 100),
-                    metadata: { source: 'brnno-marketplace' }
+                    metadata: { source: 'brnno-marketplace' },
+                    serviceAddress: serviceAddress || null, // Pass service location for tax calculation
                 })
             });
             const data = await res.json();
@@ -27,8 +46,20 @@ export default function PaymentForm({ amount, onClose, onComplete }) {
 
             const clientSecret = data.clientSecret;
             const card = elements.getElement(CardElement);
+            
+            // Prepare payment method options with billing address if available
+            const paymentMethodOptions = {
+                card: card,
+            };
+            
+            if (billingAddressData) {
+                paymentMethodOptions.billing_details = {
+                    address: billingAddressData,
+                };
+            }
+
             const { error: confirmError, paymentIntent } = await stripe.confirmCardPayment(clientSecret, {
-                payment_method: { card }
+                payment_method: paymentMethodOptions
             });
             if (confirmError) throw new Error(confirmError.message);
 
@@ -51,8 +82,31 @@ export default function PaymentForm({ amount, onClose, onComplete }) {
                     <h3 className="text-lg font-semibold text-gray-900">Checkout</h3>
                     <button onClick={onClose} className="text-gray-400 hover:text-gray-600">✕</button>
                 </div>
-                <p className="text-sm text-gray-600 mb-4">Amount due: <span className="font-semibold">${amount?.toFixed?.(2) || amount}</span></p>
+                <p className="text-sm text-gray-600 mb-4">
+                    Subtotal: <span className="font-semibold">${amount?.toFixed?.(2) || amount}</span>
+                    <br />
+                    <span className="text-xs text-gray-500">Tax will be calculated automatically based on service location</span>
+                </p>
                 <form onSubmit={handleSubmit} className="space-y-4">
+                    {/* Billing Address */}
+                    <div className="p-3 border-2 border-gray-200 rounded-lg">
+                        <AddressElement 
+                            options={{
+                                mode: 'billing',
+                                allowedCountries: ['US'],
+                                fields: {
+                                    phone: 'auto',
+                                },
+                            }}
+                            onChange={(e) => {
+                                if (e.complete) {
+                                    setBillingAddress(e.value);
+                                }
+                            }}
+                        />
+                    </div>
+                    
+                    {/* Card Details */}
                     <div className="p-3 border-2 border-gray-200 rounded-lg">
                         <CardElement options={{ style: { base: { fontSize: '16px' } } }} />
                     </div>

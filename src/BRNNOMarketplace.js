@@ -1946,6 +1946,7 @@ function BookingSidebar({
                 <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
                     <PaymentForm
                         amount={bookingData.price}
+                        serviceAddress={bookingData.address}
                         onClose={() => {
                             setShowPayment(false);
                             setBookingData(null);
