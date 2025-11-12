@@ -1288,8 +1288,8 @@ function SignupModal({ signupData, setSignupData, onEmailSignup, onGoogleSignup,
 // ==================== BOOKING SIDEBAR COMPONENT ====================
 function BookingSidebar({
     detailer,
-    selectedService: selectedServiceProp,
-    setSelectedService: setSelectedServiceProp,
+    selectedServices: selectedServicesProp,
+    setSelectedServices: setSelectedServicesProp,
     selectedDate: selectedDateProp,
     setSelectedDate: setSelectedDateProp,
     selectedTime: selectedTimeProp,
@@ -1304,7 +1304,7 @@ function BookingSidebar({
     onBook // backward compatibility
 }) {
     // Local state fallbacks if parent doesn't control these
-    const [selectedServiceState, setSelectedServiceState] = useState(selectedServiceProp || null);
+    const [selectedServicesState, setSelectedServicesState] = useState(selectedServicesProp || []);
     const [selectedTimeState, setSelectedTimeState] = useState(selectedTimeProp || '');
     const [selectedDateState, setSelectedDateState] = useState(selectedDateProp || '');
     const [isBookingState, setIsBookingState] = useState(!!isBookingProp);
@@ -1315,8 +1315,8 @@ function BookingSidebar({
     const [showPayment, setShowPayment] = useState(false);
     const [bookingData, setBookingData] = useState(null);
 
-    const selectedService = selectedServiceProp ?? selectedServiceState;
-    const setSelectedService = setSelectedServiceProp ?? setSelectedServiceState;
+    const selectedServices = selectedServicesProp ?? selectedServicesState;
+    const setSelectedServices = setSelectedServicesProp ?? setSelectedServicesState;
     const selectedTime = selectedTimeProp ?? selectedTimeState;
     const setSelectedTime = setSelectedTimeProp ?? setSelectedTimeState;
     const selectedDate = selectedDateProp ?? selectedDateState;
@@ -1326,11 +1326,13 @@ function BookingSidebar({
     // Get current user from auth if not provided
     const currentUser = currentUserProp || auth.currentUser;
 
+    // Calculate total price from selected services
+    const totalPrice = useMemo(() => {
+        return selectedServices.reduce((sum, service) => sum + (service.price || 0), 0);
+    }, [selectedServices]);
+
     useEffect(() => {
-        // Pre-select first service if available
-        if (detailer.services && detailer.services.length > 0) {
-            setSelectedService(detailer.services[0]);
-        }
+        // Don't pre-select - let user choose services
         setSelectedCategory('all');
         setServiceSearch('');
         setServicesExpanded(true);
@@ -1412,8 +1414,8 @@ function BookingSidebar({
             console.warn('Could not check if user is provider:', err);
         }
 
-        if (!selectedService) {
-            alert('Please select a service');
+        if (!selectedServices || selectedServices.length === 0) {
+            alert('Please select at least one service');
             return;
         }
 
@@ -1454,10 +1456,21 @@ function BookingSidebar({
             providerId: detailer.id,
             providerUserId: actualProviderUserId,
             providerName: detailer.name,
-            serviceName: selectedService.name,
-            serviceId: selectedService.id,
-            price: selectedService.price,
-            duration: selectedService.duration,
+            // Store services as array
+            services: selectedServices.map(s => ({
+                id: s.id,
+                slug: s.slug,
+                name: s.name,
+                price: s.price,
+                duration: s.duration,
+                category: s.category
+            })),
+            // Keep serviceName for backward compatibility
+            serviceName: selectedServices.length === 1 
+                ? selectedServices[0].name 
+                : `${selectedServices.length} Services`,
+            // Store total price
+            price: totalPrice,
             date: selectedDate,
             time: selectedTime,
             address: address,
@@ -1491,7 +1504,12 @@ function BookingSidebar({
 
             const bookingRef = await addDoc(collection(db, 'bookings'), finalBookingData);
 
-            alert(`Booking confirmed! Your ${bookingData.serviceName} is scheduled for ${bookingData.date} at ${bookingData.time}.`);
+            const serviceText = bookingData.services && bookingData.services.length > 0
+                ? (bookingData.services.length === 1 
+                    ? bookingData.services[0].name 
+                    : `${bookingData.services.length} services`)
+                : bookingData.serviceName || 'service';
+            alert(`Booking confirmed! Your ${serviceText} ${bookingData.services?.length === 1 ? 'is' : 'are'} scheduled for ${bookingData.date} at ${bookingData.time}.`);
 
             setShowPayment(false);
             setBookingData(null);
@@ -1535,7 +1553,10 @@ function BookingSidebar({
     // Contact handlers
     const handleEmail = () => {
         if (!detailer?.email) return;
-        window.location.href = `mailto:${detailer.email}?subject=Question about ${selectedService?.name || 'your services'}`;
+        const serviceText = selectedServices.length > 0 
+            ? (selectedServices.length === 1 ? selectedServices[0].name : 'your services')
+            : 'your services';
+        window.location.href = `mailto:${detailer.email}?subject=Question about ${serviceText}`;
     };
 
     const handleCall = () => {
@@ -1636,8 +1657,8 @@ function BookingSidebar({
             {/* Select Service */}
             <div className="mb-6">
                 <div className="flex items-center justify-between mb-4">
-                    <h4 className="font-semibold text-gray-900">Select Service</h4>
-                    {selectedService && (
+                    <h4 className="font-semibold text-gray-900">Select Services</h4>
+                    {selectedServices.length > 0 && (
                         <button
                             onClick={() => setServicesExpanded(!servicesExpanded)}
                             className="text-sm text-blue-600 hover:text-blue-700 font-medium"
@@ -1647,29 +1668,39 @@ function BookingSidebar({
                     )}
                 </div>
 
-                {/* Show selected service summary when collapsed */}
-                {selectedService && !servicesExpanded && (
-                    <div className="mb-4 p-3 bg-blue-50 border-2 border-blue-200 rounded-lg">
-                        <div className="flex items-center justify-between">
-                            <div>
-                                <div className="font-semibold text-gray-900 text-sm">{selectedService.name}</div>
-                                <div className="text-xs text-gray-500">{selectedService.duration}</div>
+                {/* Show selected services summary when collapsed */}
+                {selectedServices.length > 0 && !servicesExpanded && (
+                    <div className="mb-4 space-y-2">
+                        {selectedServices.map((service, idx) => (
+                            <div key={service.slug || service.id || idx} className="p-3 bg-blue-50 border-2 border-blue-200 rounded-lg">
+                                <div className="flex items-center justify-between">
+                                    <div>
+                                        <div className="font-semibold text-gray-900 text-sm">{service.name}</div>
+                                        <div className="text-xs text-gray-500">{service.duration}</div>
+                                    </div>
+                                    <div className="text-right">
+                                        <div className="font-bold text-gray-900">${service.price}</div>
+                                    </div>
+                                </div>
                             </div>
-                            <div className="text-right">
-                                <div className="font-bold text-gray-900">${selectedService.price}</div>
+                        ))}
+                        <div className="p-3 bg-gray-50 border-2 border-gray-200 rounded-lg">
+                            <div className="flex items-center justify-between">
+                                <span className="font-semibold text-gray-900 text-sm">Total:</span>
+                                <span className="font-bold text-gray-900">${totalPrice}</span>
                             </div>
                         </div>
                         <button
                             onClick={() => setServicesExpanded(true)}
-                            className="mt-2 text-xs text-blue-600 hover:text-blue-700 font-medium"
+                            className="w-full text-xs text-blue-600 hover:text-blue-700 font-medium"
                         >
-                            Change Service
+                            Change Services
                         </button>
                     </div>
                 )}
 
-                {/* Services list - only show when expanded or no service selected */}
-                {(servicesExpanded || !selectedService) && (
+                {/* Services list - only show when expanded or no services selected */}
+                {(servicesExpanded || selectedServices.length === 0) && (
                     <>
                         <div className="flex flex-wrap items-center gap-2 mb-3">
                             {categories.map((cat) => (
@@ -1706,26 +1737,54 @@ function BookingSidebar({
                                         {category.replace(/-/g, ' ')}
                                     </p>
                                     <div className="space-y-2">
-                                        {services.map((service) => (
-                                            <button
-                                                key={service.id || service.slug || service.name}
-                                                onClick={() => {
-                                                    setSelectedService(service);
-                                                    setServicesExpanded(false); // Auto-collapse after selection
-                                                }}
-                                                className={`w-full text-left px-3 py-2 border-2 rounded-lg transition-all ${selectedService?.slug === service.slug ? 'border-blue-600 bg-blue-50' : 'border-gray-200 hover:border-blue-300'}`}
-                                            >
-                                                <div className="flex items-center justify-between gap-2">
-                                                    <div className="flex-1 min-w-0">
-                                                        <div className="font-semibold text-gray-900 text-sm truncate">{service.name}</div>
-                                                        <div className="text-xs text-gray-500">{service.duration}</div>
-                                                    </div>
-                                                    <div className="text-right flex-shrink-0">
-                                                        <div className="font-bold text-gray-900 text-sm">${service.price}</div>
+                                        {services.map((service) => {
+                                            const isSelected = selectedServices.some(s => 
+                                                (s.slug && s.slug === service.slug) || 
+                                                (s.id && s.id === service.id) ||
+                                                (s.name && s.name === service.name)
+                                            );
+                                            return (
+                                                <div
+                                                    key={service.id || service.slug || service.name}
+                                                    onClick={() => {
+                                                        if (isSelected) {
+                                                            // Remove service
+                                                            setSelectedServices(prev => prev.filter(s => 
+                                                                (s.slug !== service.slug) && 
+                                                                (s.id !== service.id) &&
+                                                                (s.name !== service.name)
+                                                            ));
+                                                        } else {
+                                                            // Add service
+                                                            setSelectedServices(prev => [...prev, service]);
+                                                        }
+                                                    }}
+                                                    className={`w-full text-left px-3 py-2 border-2 rounded-lg transition-all cursor-pointer ${
+                                                        isSelected 
+                                                            ? 'border-blue-600 bg-blue-50' 
+                                                            : 'border-gray-200 hover:border-blue-300'
+                                                    }`}
+                                                >
+                                                    <div className="flex items-center justify-between gap-2">
+                                                        <div className="flex items-center gap-2 flex-1 min-w-0">
+                                                            <input
+                                                                type="checkbox"
+                                                                checked={isSelected}
+                                                                onChange={() => {}} // Handled by parent div onClick
+                                                                className="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500 flex-shrink-0"
+                                                            />
+                                                            <div className="flex-1 min-w-0">
+                                                                <div className="font-semibold text-gray-900 text-sm truncate">{service.name}</div>
+                                                                <div className="text-xs text-gray-500">{service.duration}</div>
+                                                            </div>
+                                                        </div>
+                                                        <div className="text-right flex-shrink-0">
+                                                            <div className="font-bold text-gray-900 text-sm">${service.price}</div>
+                                                        </div>
                                                     </div>
                                                 </div>
-                                            </button>
-                                        ))}
+                                            );
+                                        })}
                                     </div>
                                 </div>
                             ))}
@@ -1774,11 +1833,19 @@ function BookingSidebar({
                 </div>
 
                 {/* Total */}
-                {selectedService && (
+                {selectedServices.length > 0 && (
                     <div className="p-4 bg-gray-50 rounded-lg mb-4">
-                        <div className="flex items-center justify-between">
+                        <div className="mb-2 space-y-1">
+                            {selectedServices.map((service, idx) => (
+                                <div key={service.slug || service.id || idx} className="flex items-center justify-between text-sm">
+                                    <span className="text-gray-600">{service.name}:</span>
+                                    <span className="text-gray-900 font-medium">${service.price}</span>
+                                </div>
+                            ))}
+                        </div>
+                        <div className="flex items-center justify-between pt-2 border-t border-gray-300">
                             <span className="text-gray-600 font-medium">Total:</span>
-                            <span className="text-3xl font-bold text-gray-900">${selectedService.price}</span>
+                            <span className="text-3xl font-bold text-gray-900">${totalPrice}</span>
                         </div>
                     </div>
                 )}
@@ -1786,21 +1853,36 @@ function BookingSidebar({
                 {/* Book Button */}
                 <button
                     onClick={onBookNow || handleBookNow}
-                    disabled={isBooking || !selectedService || !selectedTime || !selectedDate}
+                    disabled={isBooking || selectedServices.length === 0 || !selectedTime || !selectedDate}
                     className="w-full bg-blue-600 text-white py-4 rounded-xl font-bold text-lg hover:bg-blue-700 transition-colors shadow-lg disabled:bg-gray-300 disabled:cursor-not-allowed mb-4"
                 >
-                    {isBooking ? 'Booking...' : `Book ${selectedService?.name || 'Service'}`}
+                    {isBooking 
+                        ? 'Booking...' 
+                        : selectedServices.length === 0 
+                            ? 'Select Services' 
+                            : selectedServices.length === 1
+                                ? `Book ${selectedServices[0].name}`
+                                : `Book ${selectedServices.length} Services`
+                    }
                 </button>
             </div>
 
             {/* Mobile: Sticky footer with date/time and book button */}
             <div className="lg:hidden sticky bottom-0 bg-white border-t border-gray-200 p-4 -mx-6 -mb-6 mt-6 shadow-lg">
                 {/* Total */}
-                {selectedService && (
+                {selectedServices.length > 0 && (
                     <div className="mb-3 p-3 bg-gray-50 rounded-lg">
-                        <div className="flex items-center justify-between">
+                        <div className="mb-2 space-y-1">
+                            {selectedServices.map((service, idx) => (
+                                <div key={service.slug || service.id || idx} className="flex items-center justify-between text-xs">
+                                    <span className="text-gray-600 truncate pr-2">{service.name}:</span>
+                                    <span className="text-gray-900 font-medium">${service.price}</span>
+                                </div>
+                            ))}
+                        </div>
+                        <div className="flex items-center justify-between pt-2 border-t border-gray-300">
                             <span className="text-gray-600 font-medium text-sm">Total:</span>
-                            <span className="text-2xl font-bold text-gray-900">${selectedService.price}</span>
+                            <span className="text-2xl font-bold text-gray-900">${totalPrice}</span>
                         </div>
                     </div>
                 )}
@@ -1845,10 +1927,17 @@ function BookingSidebar({
                 {/* Book Button */}
                 <button
                     onClick={onBookNow || handleBookNow}
-                    disabled={isBooking || !selectedService || !selectedTime || !selectedDate}
+                    disabled={isBooking || selectedServices.length === 0 || !selectedTime || !selectedDate}
                     className="w-full bg-blue-600 text-white py-3 rounded-xl font-bold text-base hover:bg-blue-700 transition-colors shadow-lg disabled:bg-gray-300 disabled:cursor-not-allowed"
                 >
-                    {isBooking ? 'Booking...' : `Book ${selectedService?.name || 'Service'}`}
+                    {isBooking 
+                        ? 'Booking...' 
+                        : selectedServices.length === 0 
+                            ? 'Select Services' 
+                            : selectedServices.length === 1
+                                ? `Book ${selectedServices[0].name}`
+                                : `Book ${selectedServices.length} Services`
+                    }
                 </button>
             </div>
 
@@ -2402,7 +2491,10 @@ function CustomerDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                     return {
                         id: bookingDoc.id,
                         detailerName: providerName,
-                        service: booking.serviceName || 'Service',
+                        service: booking.services && booking.services.length > 0
+                            ? booking.services.map(s => s.name).join(', ')
+                            : booking.serviceName || 'Service',
+                        services: booking.services || (booking.serviceName ? [{ name: booking.serviceName, price: booking.price }] : []),
                         date: booking.date ? new Date(booking.date).toLocaleDateString() : 'TBD',
                         time: booking.time || 'TBD',
                         price: booking.price || 0,
@@ -3476,7 +3568,17 @@ function BookingHistory({ history }) {
                         <div className="flex items-start justify-between mb-3">
                             <div>
                                 <h3 className="font-bold text-gray-900">{booking.detailerName}</h3>
-                                <p className="text-gray-600">{booking.service}</p>
+                                {booking.services && booking.services.length > 0 ? (
+                                    <div className="space-y-1">
+                                        {booking.services.map((service, idx) => (
+                                            <p key={idx} className="text-gray-600">
+                                                {service.name} {service.price ? `- $${service.price}` : ''}
+                                            </p>
+                                        ))}
+                                    </div>
+                                ) : (
+                                    <p className="text-gray-600">{booking.service}</p>
+                                )}
                             </div>
                             <div className="text-right">
                                 <div className="font-bold text-gray-900">${booking.price}</div>
@@ -3726,7 +3828,10 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                         customerName,
                         customerEmail,
                         customerPhone,
-                        service: booking.serviceName || 'Service',
+                        service: booking.services && booking.services.length > 0
+                            ? booking.services.map(s => s.name).join(', ')
+                            : booking.serviceName || 'Service',
+                        services: booking.services || (booking.serviceName ? [{ name: booking.serviceName, price: booking.price }] : []),
                         date: booking.date ? new Date(booking.date.seconds ? booking.date.seconds * 1000 : booking.date).toLocaleDateString() : 'TBD',
                         time: booking.time || 'TBD',
                         price: booking.price || 0,
@@ -4161,7 +4266,20 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
 
                                                 {/* Service & Vehicle */}
                                                 <div className="mb-4">
-                                                    <p className="text-lg font-semibold text-gray-900 mb-2">{booking.service}</p>
+                                                    {booking.services && booking.services.length > 0 ? (
+                                                        <div className="space-y-2 mb-2">
+                                                            {booking.services.map((service, idx) => (
+                                                                <div key={idx} className="flex items-center justify-between">
+                                                                    <p className="text-lg font-semibold text-gray-900">{service.name}</p>
+                                                                    {service.price && (
+                                                                        <span className="text-sm font-medium text-gray-600">${service.price}</span>
+                                                                    )}
+                                                                </div>
+                                                            ))}
+                                                        </div>
+                                                    ) : (
+                                                        <p className="text-lg font-semibold text-gray-900 mb-2">{booking.service}</p>
+                                                    )}
                                                     <div className="flex items-center gap-2 text-sm text-gray-600">
                                                         <Car className="w-4 h-4" />
                                                         <span className="font-medium">Vehicle:</span>
@@ -4284,7 +4402,17 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                                                     </div>
                                                 )}
 
-                                                <p className="text-gray-600 mb-1">{booking.service}</p>
+                                                {booking.services && booking.services.length > 0 ? (
+                                                    <div className="mb-2">
+                                                        {booking.services.map((service, idx) => (
+                                                            <p key={idx} className="text-gray-600 mb-1">
+                                                                {service.name} {service.price ? `- $${service.price}` : ''}
+                                                            </p>
+                                                        ))}
+                                                    </div>
+                                                ) : (
+                                                    <p className="text-gray-600 mb-1">{booking.service}</p>
+                                                )}
                                                 <p className="text-sm text-gray-500 mb-2">
                                                     <span className="font-medium">Vehicle:</span> {booking.vehicleType || 'Not specified'}
                                                 </p>
