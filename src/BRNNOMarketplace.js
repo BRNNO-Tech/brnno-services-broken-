@@ -30,6 +30,7 @@ import {
 import { auth, db } from './firebase';
 import { GoogleAuthProvider } from 'firebase/auth';
 import PaymentForm from './components/PaymentForm';
+import { SERVICES_JSON, convertServices } from './firebaseService';
 import {
     requestNotificationPermission,
     saveFCMToken,
@@ -4533,11 +4534,24 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
         if (!confirm('Approve this provider? They will be able to accept bookings.')) return;
 
         try {
-            await updateDoc(doc(db, 'providers', providerId), {
+            // Get the provider document first to check if they have services
+            const providerDoc = await getDoc(doc(db, 'providers', providerId));
+            const providerData = providerDoc.data();
+            
+            // Prepare update data
+            const updateData = {
                 status: 'approved',
                 approvedAt: serverTimestamp(),
                 updatedAt: serverTimestamp()
-            });
+            };
+            
+            // If provider doesn't have services, initialize with default services
+            if (!providerData.services || providerData.services.length === 0) {
+                const defaultServices = convertServices(SERVICES_JSON);
+                updateData.services = defaultServices;
+            }
+            
+            await updateDoc(doc(db, 'providers', providerId), updateData);
             alert('Provider approved successfully!');
             loadPendingProviders();
         } catch (error) {

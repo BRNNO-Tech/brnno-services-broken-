@@ -190,7 +190,7 @@ export const removeProviderDateOverride = async (providerId, overrideId) => {
 // ==================== SERVICE IMPORT FUNCTION ====================
 // Imports services from JSON and REPLACES all services for ALL detailers
 
-const SERVICES_JSON = [
+export const SERVICES_JSON = [
     {
         "category": "interior",
         "name": "Interior Vacuum",
@@ -377,7 +377,7 @@ const SERVICES_JSON = [
     }
 ];
 
-function convertServices(servicesJson) {
+export function convertServices(servicesJson) {
     return servicesJson.map(service => {
         const avgPrice = Math.round((service.avgPriceRange.min + service.avgPriceRange.max) / 2);
         
