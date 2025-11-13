@@ -161,22 +161,66 @@ export async function markAllAsRead(userId) {
 export function subscribeToNotifications(userId, callback) {
     if (!userId) return () => {};
 
-    const q = query(
-        collection(db, 'notifications'),
-        where('userId', '==', userId),
-        orderBy('createdAt', 'desc'),
-        limit(50)
-    );
+    try {
+        // Try with orderBy first (requires composite index)
+        const q = query(
+            collection(db, 'notifications'),
+            where('userId', '==', userId),
+            orderBy('createdAt', 'desc'),
+            limit(50)
+        );
 
-    return onSnapshot(q, (snapshot) => {
-        const notifications = snapshot.docs.map(doc => ({
-            id: doc.id,
-            ...doc.data()
-        }));
-        callback(notifications);
-    }, (error) => {
-        console.error('Error in notification listener:', error);
-    });
+        return onSnapshot(q, (snapshot) => {
+            const notifications = snapshot.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data()
+            }));
+            // Sort manually as fallback
+            notifications.sort((a, b) => {
+                const aTime = a.createdAt?.toDate ? a.createdAt.toDate().getTime() : 
+                             (a.createdAt?.seconds ? a.createdAt.seconds * 1000 : 0);
+                const bTime = b.createdAt?.toDate ? b.createdAt.toDate().getTime() : 
+                             (b.createdAt?.seconds ? b.createdAt.seconds * 1000 : 0);
+                return bTime - aTime;
+            });
+            callback(notifications);
+        }, (error) => {
+            console.error('Error in notification listener (with orderBy):', error);
+            // Fallback: try without orderBy
+            if (error.code === 'failed-precondition') {
+                console.warn('Composite index missing, falling back to query without orderBy');
+                const fallbackQ = query(
+                    collection(db, 'notifications'),
+                    where('userId', '==', userId),
+                    limit(50)
+                );
+                return onSnapshot(fallbackQ, (snapshot) => {
+                    const notifications = snapshot.docs.map(doc => ({
+                        id: doc.id,
+                        ...doc.data()
+                    }));
+                    // Sort manually
+                    notifications.sort((a, b) => {
+                        const aTime = a.createdAt?.toDate ? a.createdAt.toDate().getTime() : 
+                                     (a.createdAt?.seconds ? a.createdAt.seconds * 1000 : 0);
+                        const bTime = b.createdAt?.toDate ? b.createdAt.toDate().getTime() : 
+                                     (b.createdAt?.seconds ? b.createdAt.seconds * 1000 : 0);
+                        return bTime - aTime;
+                    });
+                    callback(notifications);
+                }, (fallbackError) => {
+                    console.error('Error in fallback notification listener:', fallbackError);
+                    callback([]); // Return empty array on error
+                });
+            } else {
+                callback([]); // Return empty array on error
+            }
+        });
+    } catch (error) {
+        console.error('Error setting up notification listener:', error);
+        callback([]); // Return empty array on error
+        return () => {}; // Return no-op unsubscribe function
+    }
 }
 
 // Set up real-time listener for unread count

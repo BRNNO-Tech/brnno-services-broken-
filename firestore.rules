@@ -51,5 +51,18 @@ service cloud.firestore {
         isAdmin()
       );
     }
+
+    // Notifications collection
+    match /notifications/{notificationId} {
+      // Users can only read their own notifications
+      // Firestore will check this for each document returned by queries
+      allow read: if request.auth != null && 
+        resource.data.userId == request.auth.uid;
+      // Anyone authenticated can create notifications (for system notifications)
+      allow create: if request.auth != null;
+      // Users can only update their own notifications (mark as read)
+      allow update: if request.auth != null && 
+        resource.data.userId == request.auth.uid;
+    }
   }
 }

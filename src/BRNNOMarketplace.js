@@ -3,7 +3,8 @@ import config from './config';
 import {
     MapPin, Car, Calendar, Star, CheckCircle2, X, ChevronRight,
     Clock, DollarSign, Shield, User, CreditCard, Home, Package,
-    Edit2, Trash2, Plus, LogOut, Menu, Search, Mail, Phone, MessageSquare
+    Edit2, Trash2, Plus, LogOut, Menu, Search, Mail, Phone, MessageSquare,
+    Bell, CheckCircle
 } from 'lucide-react';
 import {
     signInWithEmailAndPassword,
@@ -207,6 +208,7 @@ export default function BrnnoMarketplace() {
     const [currentUser, setCurrentUser] = useState(null);
     const [loading, setLoading] = useState(true);
     const [userAccountType, setUserAccountType] = useState(null);
+    const [isProvider, setIsProvider] = useState(false);
 
     // User location
     const [userCoordinates, setUserCoordinates] = useState(null);
@@ -385,6 +387,7 @@ export default function BrnnoMarketplace() {
                 // User is not logged in - show landing page
                 setCurrentUser(null);
                 setUserAccountType(null);
+                setIsProvider(false);
                 setCurrentPage('landing');
             }
             setLoading(false);
@@ -409,12 +412,14 @@ export default function BrnnoMarketplace() {
             }
 
             const userData = userSnapshot.docs[0].data();
+            const accountType = userData.accountType || 'customer';
 
             // Store account type for conditional rendering
-            setUserAccountType(userData.accountType || 'customer');
+            setUserAccountType(accountType);
 
             // Providers/Admins should go straight to their dashboard
-            if (userData.accountType === 'provider' || userData.role === 'admin') {
+            if (accountType === 'provider' || userData.role === 'admin') {
+                setIsProvider(true);
 
                 try {
                     const providerSnapshot = await getDocs(
@@ -443,6 +448,8 @@ export default function BrnnoMarketplace() {
 
                 setCurrentPage('dashboard');
                 return;
+            } else {
+                setIsProvider(false);
             }
 
             // Customers - treat presence of profile as onboarded, even if address/preferences missing
@@ -741,7 +748,9 @@ export default function BrnnoMarketplace() {
                     createdAt: serverTimestamp(),
                     updatedAt: serverTimestamp()
                 });
-                // Redirect to provider dashboard (will show provider signup form)
+                // Set account type immediately so dashboard routing works
+                setUserAccountType('provider');
+                setIsProvider(true);
                 setModalType(null);
                 setCurrentPage('dashboard');
             } else {
@@ -802,6 +811,9 @@ export default function BrnnoMarketplace() {
     // Signup function - for new users going through onboarding
     async function handleGoogleSignup() {
         try {
+            // Capture account type BEFORE OAuth popup to ensure it's preserved
+            const selectedAccountType = signupData.accountType || 'customer';
+            
             const result = await signInWithPopup(auth, googleProvider);
 
             // Check if user already exists
@@ -820,17 +832,17 @@ export default function BrnnoMarketplace() {
                     firstName: result.user.displayName?.split(' ')[0] || '',
                     lastName: result.user.displayName?.split(' ').slice(1).join(' ') || '',
                     photoURL: result.user.photoURL,
-                    accountType: signupData.accountType || 'customer',
+                    accountType: selectedAccountType, // Use captured value
                     createdAt: serverTimestamp(),
                     updatedAt: serverTimestamp(),
                     address: address,
                     coordinates: userCoordinates || null,
                     preferences: answers,
-                    onboarded: signupData.accountType === 'provider' ? false : true
+                    onboarded: selectedAccountType === 'provider' ? false : true
                 });
 
                 // If provider, create provider document
-                if (signupData.accountType === 'provider') {
+                if (selectedAccountType === 'provider') { // Use captured value
                     await addDoc(collection(db, 'providers'), {
                         userId: result.user.uid,
                         ownerName: result.user.displayName,
@@ -839,6 +851,8 @@ export default function BrnnoMarketplace() {
                         createdAt: serverTimestamp(),
                         updatedAt: serverTimestamp()
                     });
+                    // Set account type immediately so dashboard routing works
+                    setUserAccountType('provider');
                     setModalType(null);
                     setCurrentPage('dashboard');
                 } else {
@@ -861,33 +875,10 @@ export default function BrnnoMarketplace() {
                     setCurrentPage('marketplace');
                 }
             } else {
-                // Optionally update onboarding flag and latest address/preferences
-                const docRef = existingUser.docs[0].ref;
-                try {
-                    await updateDoc(docRef, {
-                        onboarded: true,
-                        address: address || existingUser.docs[0].data().address || '',
-                        coordinates: userCoordinates || existingUser.docs[0].data().coordinates || null,
-                        preferences: Object.keys(answers || {}).length ? answers : existingUser.docs[0].data().preferences || {}
-                    });
-                    // Also ensure saved address exists
-                    if (address && address.trim()) {
-                        const addrDoc = doc(collection(db, 'users', docRef.id, 'addresses'), 'primary');
-                        await setDoc(addrDoc, {
-                            label: 'Home',
-                            address: address,
-                            coordinates: userCoordinates || null,
-                            updatedAt: serverTimestamp(),
-                            createdAt: serverTimestamp()
-                        }, { merge: true });
-                    }
-                } catch (e) {
-                    console.warn('Skipping optional user update:', e?.message || e);
-                }
+                // User already exists - sign them out and tell them to log in
+                await signOut(auth);
+                alert('Account already exists. Please log in instead.');
             }
-
-            setModalType(null);
-            setCurrentPage('marketplace');
         } catch (error) {
             console.error('Google signup error:', error.code, error.message);
             if (error.code === 'permission-denied') {
@@ -1032,7 +1023,7 @@ export default function BrnnoMarketplace() {
 
             {/* Dashboard - conditional based on account type */}
             {currentPage === 'dashboard' && (
-                userAccountType === 'provider' || currentUser?.role === 'admin' ? (
+                (userAccountType === 'provider' || isProvider || currentUser?.role === 'admin') ? (
                     <ProviderDashboard
                         currentUser={currentUser}
                         onBackToMarketplace={() => setCurrentPage('marketplace')}
@@ -3377,7 +3368,13 @@ function SavedAddresses({ addresses, userData, onRefresh }) {
 
 function UserProfile({ userData, currentUser, address, answers, userCoordinates }) {
     const [isEditingPreferences, setIsEditingPreferences] = useState(false);
+    const [isEditingProfile, setIsEditingProfile] = useState(false);
     const [editedAddress, setEditedAddress] = useState('');
+    const [editedProfile, setEditedProfile] = useState({
+        firstName: '',
+        lastName: '',
+        phone: ''
+    });
     const [editedPreferences, setEditedPreferences] = useState({
         vehicleType: '',
         serviceType: '',
@@ -3387,6 +3384,11 @@ function UserProfile({ userData, currentUser, address, answers, userCoordinates 
     useEffect(() => {
         if (userData) {
             setEditedAddress(userData.address || '');
+            setEditedProfile({
+                firstName: userData.firstName || '',
+                lastName: userData.lastName || '',
+                phone: userData.phone || ''
+            });
             setEditedPreferences(userData.preferences || {
                 vehicleType: '',
                 serviceType: '',
@@ -3394,6 +3396,28 @@ function UserProfile({ userData, currentUser, address, answers, userCoordinates 
             });
         }
     }, [userData]);
+
+    async function handleSaveProfile() {
+        if (!userData?.id) return;
+
+        try {
+            const userDocRef = doc(db, 'users', userData.id);
+            await updateDoc(userDocRef, {
+                firstName: editedProfile.firstName,
+                lastName: editedProfile.lastName,
+                name: `${editedProfile.firstName} ${editedProfile.lastName}`.trim(),
+                phone: editedProfile.phone,
+                updatedAt: serverTimestamp()
+            });
+
+            alert('Profile updated successfully!');
+            setIsEditingProfile(false);
+            window.location.reload(); // Reload to show updated data
+        } catch (error) {
+            console.error('Error updating profile:', error);
+            alert('Failed to update profile');
+        }
+    }
 
     async function handleSavePreferences() {
         if (!userData?.id) return;
@@ -3430,72 +3454,143 @@ function UserProfile({ userData, currentUser, address, answers, userCoordinates 
 
             {/* Personal Info */}
             <div className="bg-white rounded-xl border border-gray-200 p-8 mb-6">
-                <h3 className="text-lg font-bold text-gray-900 mb-4">Personal Information</h3>
-                <div className="max-w-2xl">
-                    <div className="grid grid-cols-2 gap-6">
-                        <div>
-                            <label className="block text-sm font-medium text-gray-500 mb-1">
-                                First Name
-                            </label>
-                            <div className="text-lg font-semibold text-gray-900">
-                                {userData.firstName || 'Not set'}
-                            </div>
-                        </div>
-
-                        <div>
-                            <label className="block text-sm font-medium text-gray-500 mb-1">
-                                Last Name
-                            </label>
-                            <div className="text-lg font-semibold text-gray-900">
-                                {userData.lastName || 'Not set'}
-                            </div>
-                        </div>
-
-                        <div>
-                            <label className="block text-sm font-medium text-gray-500 mb-1">
-                                Email
-                            </label>
-                            <div className="text-lg font-semibold text-gray-900">
-                                {userData.email}
-                            </div>
-                        </div>
-
-                        <div>
-                            <label className="block text-sm font-medium text-gray-500 mb-1">
-                                Phone
-                            </label>
-                            <div className="text-lg font-semibold text-gray-900">
-                                {userData.phone || 'Not set'}
-                            </div>
-                        </div>
-
-                        <div>
-                            <label className="block text-sm font-medium text-gray-500 mb-1">
-                                Account Type
-                            </label>
-                            <div className="text-lg font-semibold text-gray-900 capitalize">
-                                {userData.accountType || 'customer'}
-                            </div>
-                        </div>
-
-                        <div>
-                            <label className="block text-sm font-medium text-gray-500 mb-1">
-                                Member Since
-                            </label>
-                            <div className="text-lg font-semibold text-gray-900">
-                                {userData.createdAt ? new Date(userData.createdAt.seconds * 1000).toLocaleDateString() : 'N/A'}
-                            </div>
-                        </div>
-                    </div>
-
-                    <div className="mt-8 pt-8 border-t border-gray-200">
+                <div className="flex items-center justify-between mb-4">
+                    <h3 className="text-lg font-bold text-gray-900">Personal Information</h3>
+                    {!isEditingProfile && (
                         <button
-                            onClick={() => alert('Profile editing feature coming soon!')}
-                            className="px-6 py-3 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700"
+                            onClick={() => setIsEditingProfile(true)}
+                            className="flex items-center gap-2 px-4 py-2 border-2 border-gray-200 rounded-lg font-semibold hover:bg-gray-50"
                         >
-                            Edit Profile
+                            <Edit2 className="w-4 h-4" />
+                            Edit
                         </button>
-                    </div>
+                    )}
+                </div>
+                <div className="max-w-2xl">
+                    {!isEditingProfile ? (
+                        <div className="grid grid-cols-2 gap-6">
+                            <div>
+                                <label className="block text-sm font-medium text-gray-500 mb-1">
+                                    First Name
+                                </label>
+                                <div className="text-lg font-semibold text-gray-900">
+                                    {userData.firstName || 'Not set'}
+                                </div>
+                            </div>
+
+                            <div>
+                                <label className="block text-sm font-medium text-gray-500 mb-1">
+                                    Last Name
+                                </label>
+                                <div className="text-lg font-semibold text-gray-900">
+                                    {userData.lastName || 'Not set'}
+                                </div>
+                            </div>
+
+                            <div>
+                                <label className="block text-sm font-medium text-gray-500 mb-1">
+                                    Email
+                                </label>
+                                <div className="text-lg font-semibold text-gray-900">
+                                    {userData.email}
+                                </div>
+                                <p className="text-xs text-gray-500 mt-1">Email cannot be changed</p>
+                            </div>
+
+                            <div>
+                                <label className="block text-sm font-medium text-gray-500 mb-1">
+                                    Phone
+                                </label>
+                                <div className="text-lg font-semibold text-gray-900">
+                                    {userData.phone || 'Not set'}
+                                </div>
+                            </div>
+
+                            <div>
+                                <label className="block text-sm font-medium text-gray-500 mb-1">
+                                    Account Type
+                                </label>
+                                <div className="text-lg font-semibold text-gray-900 capitalize">
+                                    {userData.accountType || 'customer'}
+                                </div>
+                            </div>
+
+                            <div>
+                                <label className="block text-sm font-medium text-gray-500 mb-1">
+                                    Member Since
+                                </label>
+                                <div className="text-lg font-semibold text-gray-900">
+                                    {userData.createdAt ? new Date(userData.createdAt.seconds * 1000).toLocaleDateString() : 'N/A'}
+                                </div>
+                            </div>
+                        </div>
+                    ) : (
+                        <div className="space-y-4">
+                            <div className="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                                        First Name
+                                    </label>
+                                    <input
+                                        type="text"
+                                        value={editedProfile.firstName}
+                                        onChange={(e) => setEditedProfile({ ...editedProfile, firstName: e.target.value })}
+                                        className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                                        placeholder="First Name"
+                                    />
+                                </div>
+
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                                        Last Name
+                                    </label>
+                                    <input
+                                        type="text"
+                                        value={editedProfile.lastName}
+                                        onChange={(e) => setEditedProfile({ ...editedProfile, lastName: e.target.value })}
+                                        className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                                        placeholder="Last Name"
+                                    />
+                                </div>
+                            </div>
+
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700 mb-2">
+                                    Phone
+                                </label>
+                                <input
+                                    type="tel"
+                                    value={editedProfile.phone}
+                                    onChange={(e) => setEditedProfile({ ...editedProfile, phone: e.target.value })}
+                                    className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                                    placeholder="(555) 123-4567"
+                                />
+                            </div>
+
+                            <div className="flex gap-3 pt-4">
+                                <button
+                                    onClick={handleSaveProfile}
+                                    className="px-6 py-3 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700"
+                                >
+                                    Save Changes
+                                </button>
+                                <button
+                                    onClick={() => {
+                                        setIsEditingProfile(false);
+                                        // Reset to original values
+                                        setEditedProfile({
+                                            firstName: userData.firstName || '',
+                                            lastName: userData.lastName || '',
+                                            phone: userData.phone || ''
+                                        });
+                                    }}
+                                    className="px-6 py-3 border-2 border-gray-200 rounded-lg font-semibold hover:bg-gray-50"
+                                >
+                                    Cancel
+                                </button>
+                            </div>
+                        </div>
+                    )}
                 </div>
             </div>
 
@@ -3694,7 +3789,7 @@ function BookingHistory({ history }) {
 }
 
 // ==================== NOTIFICATION CENTER ====================
-function NotificationCenter({ notifications, unreadCount, onMarkAsRead, onMarkAllAsRead }) {
+function NotificationCenter({ notifications = [], unreadCount = 0, onMarkAsRead, onMarkAllAsRead }) {
     const getNotificationIcon = (type) => {
         switch (type) {
             case 'new_booking':
@@ -3730,19 +3825,43 @@ function NotificationCenter({ notifications, unreadCount, onMarkAsRead, onMarkAl
     };
 
     const formatDate = (timestamp) => {
-        if (!timestamp) return 'Just now';
-        const date = timestamp.toDate ? timestamp.toDate() : new Date(timestamp);
-        const now = new Date();
-        const diffMs = now - date;
-        const diffMins = Math.floor(diffMs / 60000);
-        const diffHours = Math.floor(diffMs / 3600000);
-        const diffDays = Math.floor(diffMs / 86400000);
+        try {
+            if (!timestamp) return 'Just now';
+            
+            let date;
+            if (timestamp && typeof timestamp.toDate === 'function') {
+                // Firestore Timestamp
+                date = timestamp.toDate();
+            } else if (timestamp && timestamp.seconds) {
+                // Firestore Timestamp object with seconds
+                date = new Date(timestamp.seconds * 1000);
+            } else if (typeof timestamp === 'string' || typeof timestamp === 'number') {
+                // String or number timestamp
+                date = new Date(timestamp);
+            } else {
+                return 'Just now';
+            }
+            
+            // Check if date is valid
+            if (isNaN(date.getTime())) {
+                return 'Just now';
+            }
+            
+            const now = new Date();
+            const diffMs = now - date;
+            const diffMins = Math.floor(diffMs / 60000);
+            const diffHours = Math.floor(diffMs / 3600000);
+            const diffDays = Math.floor(diffMs / 86400000);
 
-        if (diffMins < 1) return 'Just now';
-        if (diffMins < 60) return `${diffMins} minute${diffMins > 1 ? 's' : ''} ago`;
-        if (diffHours < 24) return `${diffHours} hour${diffHours > 1 ? 's' : ''} ago`;
-        if (diffDays < 7) return `${diffDays} day${diffDays > 1 ? 's' : ''} ago`;
-        return date.toLocaleDateString();
+            if (diffMins < 1) return 'Just now';
+            if (diffMins < 60) return `${diffMins} minute${diffMins > 1 ? 's' : ''} ago`;
+            if (diffHours < 24) return `${diffHours} hour${diffHours > 1 ? 's' : ''} ago`;
+            if (diffDays < 7) return `${diffDays} day${diffDays > 1 ? 's' : ''} ago`;
+            return date.toLocaleDateString();
+        } catch (error) {
+            console.warn('Error formatting date:', error);
+            return 'Just now';
+        }
     };
 
     return (
@@ -3766,7 +3885,7 @@ function NotificationCenter({ notifications, unreadCount, onMarkAsRead, onMarkAl
                 )}
             </div>
 
-            {notifications.length === 0 ? (
+            {!notifications || notifications.length === 0 ? (
                 <div className="bg-white rounded-xl border border-gray-200 p-12 text-center">
                     <Bell className="w-16 h-16 text-gray-300 mx-auto mb-4" />
                     <h3 className="text-xl font-semibold text-gray-900 mb-2">No notifications</h3>
@@ -3774,41 +3893,44 @@ function NotificationCenter({ notifications, unreadCount, onMarkAsRead, onMarkAl
                 </div>
             ) : (
                 <div className="space-y-3">
-                    {notifications.map((notification) => (
-                        <div
-                            key={notification.id}
-                            className={`bg-white rounded-xl border-2 p-5 transition-all cursor-pointer hover:shadow-md ${
-                                notification.read ? 'opacity-75' : getNotificationColor(notification.type)
-                            }`}
-                            onClick={() => !notification.read && onMarkAsRead(notification.id)}
-                        >
-                            <div className="flex items-start gap-4">
-                                <div className="flex-shrink-0 mt-0.5">
-                                    {getNotificationIcon(notification.type)}
-                                </div>
-                                <div className="flex-1 min-w-0">
-                                    <div className="flex items-start justify-between gap-2">
-                                        <div className="flex-1">
-                                            <h3 className="font-semibold text-gray-900 mb-1">
-                                                {notification.title}
-                                            </h3>
-                                            <p className="text-gray-600 text-sm mb-2">
-                                                {notification.message}
-                                            </p>
-                                            <p className="text-xs text-gray-500">
-                                                {formatDate(notification.createdAt)}
-                                            </p>
-                                        </div>
-                                        {!notification.read && (
-                                            <div className="flex-shrink-0">
-                                                <div className="w-2 h-2 bg-blue-600 rounded-full"></div>
+                    {notifications.map((notification) => {
+                        if (!notification) return null;
+                        return (
+                            <div
+                                key={notification.id || Math.random()}
+                                className={`bg-white rounded-xl border-2 p-5 transition-all cursor-pointer hover:shadow-md ${
+                                    notification.read ? 'opacity-75' : getNotificationColor(notification.type || 'default')
+                                }`}
+                                onClick={() => !notification.read && onMarkAsRead && onMarkAsRead(notification.id)}
+                            >
+                                <div className="flex items-start gap-4">
+                                    <div className="flex-shrink-0 mt-0.5">
+                                        {getNotificationIcon(notification.type || 'default')}
+                                    </div>
+                                    <div className="flex-1 min-w-0">
+                                        <div className="flex items-start justify-between gap-2">
+                                            <div className="flex-1">
+                                                <h3 className="font-semibold text-gray-900 mb-1">
+                                                    {notification.title || 'Notification'}
+                                                </h3>
+                                                <p className="text-gray-600 text-sm mb-2">
+                                                    {notification.message || ''}
+                                                </p>
+                                                <p className="text-xs text-gray-500">
+                                                    {formatDate(notification.createdAt)}
+                                                </p>
                                             </div>
-                                        )}
+                                            {!notification.read && (
+                                                <div className="flex-shrink-0">
+                                                    <div className="w-2 h-2 bg-blue-600 rounded-full"></div>
+                                                </div>
+                                            )}
+                                        </div>
                                     </div>
                                 </div>
                             </div>
-                        </div>
-                    ))}
+                        );
+                    })}
                 </div>
             )}
         </div>
@@ -3833,6 +3955,14 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
     const [loadingPending, setLoadingPending] = useState(false);
     const [notifications, setNotifications] = useState([]);
     const [unreadCount, setUnreadCount] = useState(0);
+    const [isEditingProfile, setIsEditingProfile] = useState(false);
+    const [editedProviderProfile, setEditedProviderProfile] = useState({
+        businessName: '',
+        serviceArea: '',
+        businessAddress: '',
+        phone: '',
+        email: ''
+    });
     const profileDropdownRef = React.useRef(null);
 
     // Close dropdown when clicking outside
@@ -3898,22 +4028,46 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
             // Set up foreground message handler
             setupForegroundMessageHandler();
             
-            // Subscribe to notifications
-            const unsubscribeNotifications = subscribeToNotifications(currentUser.uid, (notifs) => {
-                setNotifications(notifs);
-            });
-            
-            // Subscribe to unread count
-            const unsubscribeUnread = subscribeToUnreadCount(currentUser.uid, (count) => {
-                setUnreadCount(count);
-            });
-            
-            return () => {
-                unsubscribeNotifications();
-                unsubscribeUnread();
-            };
+            // Subscribe to notifications with error handling
+            try {
+                const unsubscribeNotifications = subscribeToNotifications(currentUser.uid, (notifs) => {
+                    try {
+                        setNotifications(Array.isArray(notifs) ? notifs : []);
+                    } catch (error) {
+                        console.error('Error setting notifications state:', error);
+                        setNotifications([]);
+                    }
+                });
+                
+                // Subscribe to unread count with error handling
+                const unsubscribeUnread = subscribeToUnreadCount(currentUser.uid, (count) => {
+                    try {
+                        setUnreadCount(typeof count === 'number' ? count : 0);
+                    } catch (error) {
+                        console.error('Error setting unread count state:', error);
+                        setUnreadCount(0);
+                    }
+                });
+                
+                return () => {
+                    try {
+                        if (typeof unsubscribeNotifications === 'function') unsubscribeNotifications();
+                        if (typeof unsubscribeUnread === 'function') unsubscribeUnread();
+                    } catch (error) {
+                        console.warn('Error unsubscribing from notifications:', error);
+                    }
+                };
+            } catch (subscriptionError) {
+                console.error('Error setting up notification subscriptions:', subscriptionError);
+                // Set defaults to prevent white screen
+                setNotifications([]);
+                setUnreadCount(0);
+            }
         } catch (error) {
             console.error('Error initializing notifications:', error);
+            // Set defaults to prevent white screen
+            setNotifications([]);
+            setUnreadCount(0);
         }
     }
 
@@ -3955,6 +4109,15 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                 const data = providerSnapshot.docs[0].data();
                 setProviderData(data);
                 setServices(data.services || []); // Load services
+                
+                // Initialize edited profile data
+                setEditedProviderProfile({
+                    businessName: data.businessName || '',
+                    serviceArea: data.serviceArea || '',
+                    businessAddress: data.businessAddress || data.address || '',
+                    phone: data.phone || '',
+                    email: data.email || ''
+                });
 
                 // Load availability and ensure enabled days have start/end times
                 const defaultAvail = data.defaultAvailability || {};
@@ -5246,55 +5409,185 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                 )}
                 {activeTab === 'profile' && (
                     <div>
-                        <h2 className="text-2xl font-bold text-gray-900 mb-6">Provider Profile</h2>
+                        <div className="flex items-center justify-between mb-6">
+                            <h2 className="text-2xl font-bold text-gray-900">Provider Profile</h2>
+                            {!isEditingProfile && providerData && (
+                                <button
+                                    onClick={() => setIsEditingProfile(true)}
+                                    className="flex items-center gap-2 px-4 py-2 border-2 border-gray-200 rounded-lg font-semibold hover:bg-gray-50"
+                                >
+                                    <Edit2 className="w-4 h-4" />
+                                    Edit Profile
+                                </button>
+                            )}
+                        </div>
                         {providerData ? (
                             <div className="bg-white rounded-xl border border-gray-200 p-8">
-                                <div className="space-y-6">
-                                    <div>
-                                        <label className="block text-sm font-medium text-gray-500 mb-1">
-                                            Business Name
-                                        </label>
-                                        <div className="text-lg font-semibold text-gray-900">
-                                            {providerData.businessName || 'Not set'}
+                                {!isEditingProfile ? (
+                                    <div className="space-y-6">
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-500 mb-1">
+                                                Business Name
+                                            </label>
+                                            <div className="text-lg font-semibold text-gray-900">
+                                                {providerData.businessName || 'Not set'}
+                                            </div>
                                         </div>
-                                    </div>
-                                    <div>
-                                        <label className="block text-sm font-medium text-gray-500 mb-1">
-                                            Service Area
-                                        </label>
-                                        <div className="text-lg font-semibold text-gray-900">
-                                            {providerData.serviceArea || providerData.businessAddress || 'Not set'}
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-500 mb-1">
+                                                Service Area
+                                            </label>
+                                            <div className="text-lg font-semibold text-gray-900">
+                                                {providerData.serviceArea || providerData.businessAddress || 'Not set'}
+                                            </div>
                                         </div>
-                                    </div>
-                                    <div>
-                                        <label className="block text-sm font-medium text-gray-500 mb-1">
-                                            Primary Service
-                                        </label>
-                                        <div className="text-lg font-semibold text-gray-900">
-                                            {providerData.primaryService || 'Not set'}
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-500 mb-1">
+                                                Business Address
+                                            </label>
+                                            <div className="text-lg font-semibold text-gray-900">
+                                                {providerData.businessAddress || providerData.address || 'Not set'}
+                                            </div>
                                         </div>
-                                    </div>
-                                    {providerData.phone && (
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-500 mb-1">
+                                                Primary Service
+                                            </label>
+                                            <div className="text-lg font-semibold text-gray-900">
+                                                {providerData.primaryService || 'Not set'}
+                                            </div>
+                                        </div>
                                         <div>
                                             <label className="block text-sm font-medium text-gray-500 mb-1">
                                                 Phone
                                             </label>
                                             <div className="text-lg font-semibold text-gray-900">
-                                                {providerData.phone}
+                                                {providerData.phone || 'Not set'}
                                             </div>
                                         </div>
-                                    )}
-                                    {providerData.email && (
                                         <div>
                                             <label className="block text-sm font-medium text-gray-500 mb-1">
                                                 Email
                                             </label>
                                             <div className="text-lg font-semibold text-gray-900">
-                                                {providerData.email}
+                                                {providerData.email || 'Not set'}
                                             </div>
                                         </div>
-                                    )}
-                                </div>
+                                    </div>
+                                ) : (
+                                    <div className="space-y-4">
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                Business Name
+                                            </label>
+                                            <input
+                                                type="text"
+                                                value={editedProviderProfile.businessName}
+                                                onChange={(e) => setEditedProviderProfile({ ...editedProviderProfile, businessName: e.target.value })}
+                                                className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                                                placeholder="Business Name"
+                                            />
+                                        </div>
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                Service Area
+                                            </label>
+                                            <input
+                                                type="text"
+                                                value={editedProviderProfile.serviceArea}
+                                                onChange={(e) => setEditedProviderProfile({ ...editedProviderProfile, serviceArea: e.target.value })}
+                                                className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                                                placeholder="City, State or ZIP codes"
+                                            />
+                                        </div>
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                Business Address
+                                            </label>
+                                            <input
+                                                type="text"
+                                                value={editedProviderProfile.businessAddress}
+                                                onChange={(e) => setEditedProviderProfile({ ...editedProviderProfile, businessAddress: e.target.value })}
+                                                className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                                                placeholder="123 Main St, City, State ZIP"
+                                            />
+                                        </div>
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                Phone
+                                            </label>
+                                            <input
+                                                type="tel"
+                                                value={editedProviderProfile.phone}
+                                                onChange={(e) => setEditedProviderProfile({ ...editedProviderProfile, phone: e.target.value })}
+                                                className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                                                placeholder="(555) 123-4567"
+                                            />
+                                        </div>
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                Email
+                                            </label>
+                                            <input
+                                                type="email"
+                                                value={editedProviderProfile.email}
+                                                onChange={(e) => setEditedProviderProfile({ ...editedProviderProfile, email: e.target.value })}
+                                                className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                                                placeholder="business@example.com"
+                                            />
+                                        </div>
+                                        <div className="flex gap-3 pt-4">
+                                            <button
+                                                onClick={async () => {
+                                                    try {
+                                                        const providerQuery = query(
+                                                            collection(db, 'providers'),
+                                                            where('userId', '==', currentUser.uid)
+                                                        );
+                                                        const providerSnapshot = await getDocs(providerQuery);
+                                                        
+                                                        if (!providerSnapshot.empty) {
+                                                            await updateDoc(doc(db, 'providers', providerSnapshot.docs[0].id), {
+                                                                businessName: editedProviderProfile.businessName,
+                                                                serviceArea: editedProviderProfile.serviceArea,
+                                                                businessAddress: editedProviderProfile.businessAddress,
+                                                                address: editedProviderProfile.businessAddress,
+                                                                phone: editedProviderProfile.phone,
+                                                                email: editedProviderProfile.email,
+                                                                updatedAt: serverTimestamp()
+                                                            });
+                                                            alert('Profile updated successfully!');
+                                                            setIsEditingProfile(false);
+                                                            loadProviderData(); // Reload to show updated data
+                                                        }
+                                                    } catch (error) {
+                                                        console.error('Error updating provider profile:', error);
+                                                        alert('Failed to update profile');
+                                                    }
+                                                }}
+                                                className="px-6 py-3 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700"
+                                            >
+                                                Save Changes
+                                            </button>
+                                            <button
+                                                onClick={() => {
+                                                    setIsEditingProfile(false);
+                                                    // Reset to original values
+                                                    setEditedProviderProfile({
+                                                        businessName: providerData.businessName || '',
+                                                        serviceArea: providerData.serviceArea || '',
+                                                        businessAddress: providerData.businessAddress || providerData.address || '',
+                                                        phone: providerData.phone || '',
+                                                        email: providerData.email || ''
+                                                    });
+                                                }}
+                                                className="px-6 py-3 border-2 border-gray-200 rounded-lg font-semibold hover:bg-gray-50"
+                                            >
+                                                Cancel
+                                            </button>
+                                        </div>
+                                    </div>
+                                )}
                             </div>
                         ) : (
                             <div className="bg-white rounded-xl border border-gray-200 p-12 text-center">
