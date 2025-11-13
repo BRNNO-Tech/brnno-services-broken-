@@ -4108,9 +4108,28 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
 
     async function handleSaveService(updatedService) {
         try {
-            const updatedServices = services.map(service =>
-                service.id === updatedService.id ? updatedService : service
-            );
+            // More robust matching - check id, slug, or name as fallback
+            const updatedServices = services.map(service => {
+                // Match by id first, then slug, then name as fallback
+                const matches = 
+                    (service.id && updatedService.id && service.id === updatedService.id) ||
+                    (service.slug && updatedService.slug && service.slug === updatedService.slug) ||
+                    (service.name && updatedService.name && service.name === updatedService.name);
+                
+                return matches ? updatedService : service;
+            });
+
+            // Check if we actually found and updated a service
+            const serviceFound = updatedServices.some((s, idx) => {
+                const original = services[idx];
+                return JSON.stringify(s) !== JSON.stringify(original);
+            });
+
+            if (!serviceFound) {
+                console.warn('Service not found for update:', updatedService);
+                alert('Service not found. Please try again.');
+                return;
+            }
 
             setServices(updatedServices);
             setShowEditModal(false);
@@ -4128,11 +4147,17 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                     services: updatedServices,
                     updatedAt: serverTimestamp()
                 });
+                
+                // Reload provider data to ensure consistency
+                await loadProviderData();
                 alert('Service updated successfully!');
+            } else {
+                throw new Error('Provider not found');
             }
         } catch (error) {
             console.error('Error saving service:', error);
-            alert('Failed to save service');
+            alert('Failed to save service: ' + (error.message || 'Unknown error'));
+            // Reload to revert any local changes
             loadProviderData();
         }
     }
