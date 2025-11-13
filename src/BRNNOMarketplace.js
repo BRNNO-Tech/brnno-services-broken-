@@ -233,7 +233,8 @@ export default function BrnnoMarketplace() {
     const [signupData, setSignupData] = useState({
         name: '',
         email: '',
-        password: ''
+        password: '',
+        accountType: 'customer'
     });
 
     // Reference for address input and autocomplete
@@ -721,33 +722,47 @@ export default function BrnnoMarketplace() {
                 email: signupData.email,
                 firstName: signupData.name.split(' ')[0],
                 lastName: signupData.name.split(' ').slice(1).join(' '),
-                accountType: 'customer',
+                accountType: signupData.accountType || 'customer',
                 createdAt: serverTimestamp(),
                 updatedAt: serverTimestamp(),
                 address: address,
                 coordinates: userCoordinates || null, // Save geocoded coordinates
                 preferences: answers,
-                onboarded: true
+                onboarded: signupData.accountType === 'provider' ? false : true
             });
 
-            // Persist the entered address into saved addresses subcollection
-            try {
-                if (address && address.trim()) {
-                    const addrDoc = doc(collection(db, 'users', userDocRef.id, 'addresses'));
-                    await setDoc(addrDoc, {
-                        label: 'Home',
-                        address: address,
-                        coordinates: userCoordinates || null,
-                        createdAt: serverTimestamp(),
-                        updatedAt: serverTimestamp()
-                    });
+            // If provider, create provider document with pending status
+            if (signupData.accountType === 'provider') {
+                await addDoc(collection(db, 'providers'), {
+                    userId: userCredential.user.uid,
+                    ownerName: signupData.name,
+                    email: signupData.email,
+                    status: 'pending', // Requires admin approval
+                    createdAt: serverTimestamp(),
+                    updatedAt: serverTimestamp()
+                });
+                // Redirect to provider dashboard (will show provider signup form)
+                setModalType(null);
+                setCurrentPage('dashboard');
+            } else {
+                // Customer flow - save address and go to marketplace
+                try {
+                    if (address && address.trim()) {
+                        const addrDoc = doc(collection(db, 'users', userDocRef.id, 'addresses'));
+                        await setDoc(addrDoc, {
+                            label: 'Home',
+                            address: address,
+                            coordinates: userCoordinates || null,
+                            createdAt: serverTimestamp(),
+                            updatedAt: serverTimestamp()
+                        });
+                    }
+                } catch (e) {
+                    console.warn('Could not save saved address (email signup):', e?.message || e);
                 }
-            } catch (e) {
-                console.warn('Could not save saved address (email signup):', e?.message || e);
+                setModalType(null);
+                setCurrentPage('marketplace');
             }
-
-            setModalType(null);
-            setCurrentPage('marketplace');
         } catch (error) {
             console.error('Signup error:', error);
             alert(error.message);
@@ -805,28 +820,45 @@ export default function BrnnoMarketplace() {
                     firstName: result.user.displayName?.split(' ')[0] || '',
                     lastName: result.user.displayName?.split(' ').slice(1).join(' ') || '',
                     photoURL: result.user.photoURL,
-                    accountType: 'customer',
+                    accountType: signupData.accountType || 'customer',
                     createdAt: serverTimestamp(),
                     updatedAt: serverTimestamp(),
                     address: address,
                     coordinates: userCoordinates || null,
                     preferences: answers,
-                    onboarded: true
+                    onboarded: signupData.accountType === 'provider' ? false : true
                 });
-                // Save address into subcollection for new user
-                try {
-                    if (address && address.trim()) {
-                        const addrDoc = doc(collection(db, 'users', newUserRef.id, 'addresses'));
-                        await setDoc(addrDoc, {
-                            label: 'Home',
-                            address: address,
-                            coordinates: userCoordinates || null,
-                            createdAt: serverTimestamp(),
-                            updatedAt: serverTimestamp()
-                        });
+
+                // If provider, create provider document
+                if (signupData.accountType === 'provider') {
+                    await addDoc(collection(db, 'providers'), {
+                        userId: result.user.uid,
+                        ownerName: result.user.displayName,
+                        email: result.user.email,
+                        status: 'pending',
+                        createdAt: serverTimestamp(),
+                        updatedAt: serverTimestamp()
+                    });
+                    setModalType(null);
+                    setCurrentPage('dashboard');
+                } else {
+                    // Customer flow - save address into subcollection for new user
+                    try {
+                        if (address && address.trim()) {
+                            const addrDoc = doc(collection(db, 'users', newUserRef.id, 'addresses'));
+                            await setDoc(addrDoc, {
+                                label: 'Home',
+                                address: address,
+                                coordinates: userCoordinates || null,
+                                createdAt: serverTimestamp(),
+                                updatedAt: serverTimestamp()
+                            });
+                        }
+                    } catch (e) {
+                        console.warn('Could not save saved address (google new):', e?.message || e);
                     }
-                } catch (e) {
-                    console.warn('Could not save saved address (google new):', e?.message || e);
+                    setModalType(null);
+                    setCurrentPage('marketplace');
                 }
             } else {
                 // Optionally update onboarding flag and latest address/preferences
@@ -1229,8 +1261,44 @@ function SignupModal({ signupData, setSignupData, onEmailSignup, onGoogleSignup,
                         Create your account
                     </h2>
                     <p className="text-gray-600">
-                        Sign up to see available detailers and book service
+                        Choose your account type to get started
                     </p>
+                </div>
+
+                {/* Account Type Selection */}
+                <div className="mb-6">
+                    <label className="block text-sm font-medium text-gray-700 mb-3">
+                        I want to sign up as:
+                    </label>
+                    <div className="grid grid-cols-2 gap-3">
+                        <button
+                            type="button"
+                            onClick={() => setSignupData({ ...signupData, accountType: 'customer' })}
+                            className={`px-4 py-3 rounded-xl border-2 font-medium transition-all ${
+                                signupData.accountType === 'customer'
+                                    ? 'border-blue-600 bg-blue-50 text-blue-700'
+                                    : 'border-gray-200 text-gray-700 hover:border-gray-300'
+                            }`}
+                        >
+                            Customer
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => setSignupData({ ...signupData, accountType: 'provider' })}
+                            className={`px-4 py-3 rounded-xl border-2 font-medium transition-all ${
+                                signupData.accountType === 'provider'
+                                    ? 'border-blue-600 bg-blue-50 text-blue-700'
+                                    : 'border-gray-200 text-gray-700 hover:border-gray-300'
+                            }`}
+                        >
+                            Provider
+                        </button>
+                    </div>
+                    {signupData.accountType === 'provider' && (
+                        <p className="mt-2 text-xs text-gray-500">
+                            Providers will need to complete additional information after signup
+                        </p>
+                    )}
                 </div>
 
                 <div className="space-y-4 mb-6">
