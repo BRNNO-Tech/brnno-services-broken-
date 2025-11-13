@@ -76,18 +76,20 @@ export default function PaymentForm({ amount, serviceAddress, onClose, onComplet
     };
 
     return (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
-            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-6">
-                <div className="flex items-center justify-between mb-4">
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50 overflow-y-auto">
+            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md max-h-[90vh] my-auto flex flex-col p-6">
+                <div className="flex items-center justify-between mb-4 flex-shrink-0">
                     <h3 className="text-lg font-semibold text-gray-900">Checkout</h3>
                     <button onClick={onClose} className="text-gray-400 hover:text-gray-600">✕</button>
                 </div>
-                <p className="text-sm text-gray-600 mb-4">
-                    Subtotal: <span className="font-semibold">${amount?.toFixed?.(2) || amount}</span>
-                    <br />
-                    <span className="text-xs text-gray-500">Tax will be calculated automatically based on service location</span>
-                </p>
-                <form onSubmit={handleSubmit} className="space-y-4">
+                <div className="flex-shrink-0 mb-4">
+                    <p className="text-sm text-gray-600">
+                        Subtotal: <span className="font-semibold">${amount?.toFixed?.(2) || amount}</span>
+                        <br />
+                        <span className="text-xs text-gray-500">Tax will be calculated automatically based on service location</span>
+                    </p>
+                </div>
+                <form onSubmit={handleSubmit} className="space-y-4 overflow-y-auto flex-1 min-h-0">
                     {/* Billing Address */}
                     <div className="p-3 border-2 border-gray-200 rounded-lg">
                         <AddressElement 
@@ -113,14 +115,16 @@ export default function PaymentForm({ amount, serviceAddress, onClose, onComplet
                     {errorMessage && (
                         <div className="p-3 bg-red-50 border border-red-200 rounded text-red-700 text-sm">{errorMessage}</div>
                     )}
-                    <button
-                        type="submit"
-                        disabled={!stripe || isLoading}
-                        className="w-full bg-blue-600 text-white py-3 rounded-lg font-semibold hover:bg-blue-700 disabled:opacity-60"
-                    >
-                        {isLoading ? 'Processing…' : 'Pay'}
-                    </button>
-                    <p className="text-xs text-gray-500 text-center">Stripe Test Mode • Use 4242 4242 4242 4242</p>
+                    <div className="flex-shrink-0 pt-2">
+                        <button
+                            type="submit"
+                            disabled={!stripe || isLoading}
+                            className="w-full bg-blue-600 text-white py-3 rounded-lg font-semibold hover:bg-blue-700 disabled:opacity-60"
+                        >
+                            {isLoading ? 'Processing…' : 'Pay'}
+                        </button>
+                        <p className="text-xs text-gray-500 text-center mt-2">Stripe Test Mode • Use 4242 4242 4242 4242</p>
+                    </div>
                 </form>
             </div>
         </div>

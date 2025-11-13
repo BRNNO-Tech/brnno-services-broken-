@@ -29,6 +29,19 @@ import {
 import { auth, db } from './firebase';
 import { GoogleAuthProvider } from 'firebase/auth';
 import PaymentForm from './components/PaymentForm';
+import {
+    requestNotificationPermission,
+    saveFCMToken,
+    subscribeToNotifications,
+    subscribeToUnreadCount,
+    markNotificationAsRead,
+    markAllAsRead,
+    setupForegroundMessageHandler,
+    notifyNewBooking,
+    notifyBookingConfirmed,
+    notifyBookingCancelled,
+    notifyPaymentReceived
+} from './services/notificationService';
 
 // Use centralized Firebase config
 const googleProvider = new GoogleAuthProvider();
@@ -1503,6 +1516,20 @@ function BookingSidebar({
             };
 
             const bookingRef = await addDoc(collection(db, 'bookings'), finalBookingData);
+            const bookingId = bookingRef.id;
+
+            // Create notifications for provider
+            try {
+                const bookingWithId = { ...finalBookingData, id: bookingId };
+                // Notify provider of new booking
+                await notifyNewBooking(bookingData.providerUserId, bookingWithId);
+                // Notify provider of payment received
+                await notifyPaymentReceived(bookingData.providerUserId, bookingWithId);
+                // Notify provider of booking confirmed
+                await notifyBookingConfirmed(bookingData.providerUserId, bookingWithId);
+            } catch (notifError) {
+                console.warn('Failed to create notifications:', notifError);
+            }
 
             const serviceText = bookingData.services && bookingData.services.length > 0
                 ? (bookingData.services.length === 1 
@@ -3598,6 +3625,128 @@ function BookingHistory({ history }) {
     );
 }
 
+// ==================== NOTIFICATION CENTER ====================
+function NotificationCenter({ notifications, unreadCount, onMarkAsRead, onMarkAllAsRead }) {
+    const getNotificationIcon = (type) => {
+        switch (type) {
+            case 'new_booking':
+                return <Calendar className="w-5 h-5 text-blue-600" />;
+            case 'booking_confirmed':
+                return <CheckCircle className="w-5 h-5 text-green-600" />;
+            case 'booking_cancelled':
+                return <X className="w-5 h-5 text-red-600" />;
+            case 'payment_received':
+                return <DollarSign className="w-5 h-5 text-green-600" />;
+            case 'booking_reminder':
+                return <Clock className="w-5 h-5 text-yellow-600" />;
+            default:
+                return <Bell className="w-5 h-5 text-gray-600" />;
+        }
+    };
+
+    const getNotificationColor = (type) => {
+        switch (type) {
+            case 'new_booking':
+                return 'bg-blue-50 border-blue-200';
+            case 'booking_confirmed':
+                return 'bg-green-50 border-green-200';
+            case 'booking_cancelled':
+                return 'bg-red-50 border-red-200';
+            case 'payment_received':
+                return 'bg-green-50 border-green-200';
+            case 'booking_reminder':
+                return 'bg-yellow-50 border-yellow-200';
+            default:
+                return 'bg-gray-50 border-gray-200';
+        }
+    };
+
+    const formatDate = (timestamp) => {
+        if (!timestamp) return 'Just now';
+        const date = timestamp.toDate ? timestamp.toDate() : new Date(timestamp);
+        const now = new Date();
+        const diffMs = now - date;
+        const diffMins = Math.floor(diffMs / 60000);
+        const diffHours = Math.floor(diffMs / 3600000);
+        const diffDays = Math.floor(diffMs / 86400000);
+
+        if (diffMins < 1) return 'Just now';
+        if (diffMins < 60) return `${diffMins} minute${diffMins > 1 ? 's' : ''} ago`;
+        if (diffHours < 24) return `${diffHours} hour${diffHours > 1 ? 's' : ''} ago`;
+        if (diffDays < 7) return `${diffDays} day${diffDays > 1 ? 's' : ''} ago`;
+        return date.toLocaleDateString();
+    };
+
+    return (
+        <div>
+            <div className="flex items-center justify-between mb-6">
+                <div>
+                    <h2 className="text-2xl font-bold text-gray-900">Notifications</h2>
+                    {unreadCount > 0 && (
+                        <p className="text-sm text-gray-600 mt-1">
+                            {unreadCount} unread notification{unreadCount > 1 ? 's' : ''}
+                        </p>
+                    )}
+                </div>
+                {unreadCount > 0 && (
+                    <button
+                        onClick={onMarkAllAsRead}
+                        className="px-4 py-2 text-sm bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700"
+                    >
+                        Mark all as read
+                    </button>
+                )}
+            </div>
+
+            {notifications.length === 0 ? (
+                <div className="bg-white rounded-xl border border-gray-200 p-12 text-center">
+                    <Bell className="w-16 h-16 text-gray-300 mx-auto mb-4" />
+                    <h3 className="text-xl font-semibold text-gray-900 mb-2">No notifications</h3>
+                    <p className="text-gray-600">You'll see notifications about bookings, payments, and updates here</p>
+                </div>
+            ) : (
+                <div className="space-y-3">
+                    {notifications.map((notification) => (
+                        <div
+                            key={notification.id}
+                            className={`bg-white rounded-xl border-2 p-5 transition-all cursor-pointer hover:shadow-md ${
+                                notification.read ? 'opacity-75' : getNotificationColor(notification.type)
+                            }`}
+                            onClick={() => !notification.read && onMarkAsRead(notification.id)}
+                        >
+                            <div className="flex items-start gap-4">
+                                <div className="flex-shrink-0 mt-0.5">
+                                    {getNotificationIcon(notification.type)}
+                                </div>
+                                <div className="flex-1 min-w-0">
+                                    <div className="flex items-start justify-between gap-2">
+                                        <div className="flex-1">
+                                            <h3 className="font-semibold text-gray-900 mb-1">
+                                                {notification.title}
+                                            </h3>
+                                            <p className="text-gray-600 text-sm mb-2">
+                                                {notification.message}
+                                            </p>
+                                            <p className="text-xs text-gray-500">
+                                                {formatDate(notification.createdAt)}
+                                            </p>
+                                        </div>
+                                        {!notification.read && (
+                                            <div className="flex-shrink-0">
+                                                <div className="w-2 h-2 bg-blue-600 rounded-full"></div>
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            )}
+        </div>
+    );
+}
+
 // ==================== PROVIDER DASHBOARD ====================
 function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showProfileDropdown, setShowProfileDropdown }) {
     const [activeTab, setActiveTab] = useState('bookings');
@@ -3614,6 +3763,8 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
     const [showBlackoutModal, setShowBlackoutModal] = useState(false);
     const [pendingProviders, setPendingProviders] = useState([]);
     const [loadingPending, setLoadingPending] = useState(false);
+    const [notifications, setNotifications] = useState([]);
+    const [unreadCount, setUnreadCount] = useState(0);
     const profileDropdownRef = React.useRef(null);
 
     // Close dropdown when clicking outside
@@ -3660,8 +3811,43 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
     useEffect(() => {
         if (currentUser) {
             loadProviderData();
+            // Initialize FCM and request notification permission
+            initializeNotifications();
         }
     }, [currentUser]);
+
+    // Initialize notifications
+    async function initializeNotifications() {
+        if (!currentUser) return;
+        
+        try {
+            // Request notification permission and get token
+            const token = await requestNotificationPermission();
+            if (token) {
+                await saveFCMToken(currentUser.uid, token);
+            }
+            
+            // Set up foreground message handler
+            setupForegroundMessageHandler();
+            
+            // Subscribe to notifications
+            const unsubscribeNotifications = subscribeToNotifications(currentUser.uid, (notifs) => {
+                setNotifications(notifs);
+            });
+            
+            // Subscribe to unread count
+            const unsubscribeUnread = subscribeToUnreadCount(currentUser.uid, (count) => {
+                setUnreadCount(count);
+            });
+            
+            return () => {
+                unsubscribeNotifications();
+                unsubscribeUnread();
+            };
+        } catch (error) {
+            console.error('Error initializing notifications:', error);
+        }
+    }
 
     // Add separate useEffect for admin check after userData loads:
     useEffect(() => {
@@ -3864,6 +4050,22 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                 status: newStatus,
                 updatedAt: serverTimestamp()
             });
+            
+            // Create notification if booking is cancelled
+            if (newStatus === 'cancelled') {
+                try {
+                    const bookingDoc = await getDoc(doc(db, 'bookings', bookingId));
+                    if (bookingDoc.exists()) {
+                        const bookingData = { id: bookingId, ...bookingDoc.data() };
+                        if (bookingData.providerUserId) {
+                            await notifyBookingCancelled(bookingData.providerUserId, bookingData);
+                        }
+                    }
+                } catch (notifError) {
+                    console.warn('Failed to create cancellation notification:', notifError);
+                }
+            }
+            
             alert(`Booking ${newStatus} successfully`);
             loadBookings();
         } catch (error) {
@@ -4200,6 +4402,20 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                                 }`}
                         >
                             Profile
+                        </button>
+                        <button
+                            onClick={() => setActiveTab('notifications')}
+                            className={`py-4 border-b-2 font-semibold transition-colors relative ${activeTab === 'notifications'
+                                ? 'border-blue-600 text-blue-600'
+                                : 'border-transparent text-gray-600 hover:text-gray-900'
+                                }`}
+                        >
+                            Notifications
+                            {unreadCount > 0 && (
+                                <span className="absolute top-2 right-0 bg-red-500 text-white text-xs font-bold rounded-full w-5 h-5 flex items-center justify-center">
+                                    {unreadCount > 9 ? '9+' : unreadCount}
+                                </span>
+                            )}
                         </button>
                         {userData?.role === 'admin' && (  // Change to userData
                             <button
@@ -4927,6 +5143,14 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                     </div>
                 )}
 
+                {activeTab === 'notifications' && (
+                    <NotificationCenter
+                        notifications={notifications}
+                        unreadCount={unreadCount}
+                        onMarkAsRead={markNotificationAsRead}
+                        onMarkAllAsRead={() => markAllAsRead(currentUser.uid)}
+                    />
+                )}
                 {activeTab === 'profile' && (
                     <div>
                         <h2 className="text-2xl font-bold text-gray-900 mb-6">Provider Profile</h2>

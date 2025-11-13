@@ -1,6 +1,7 @@
 import { initializeApp } from 'firebase/app';
 import { getAuth } from 'firebase/auth';
 import { getFirestore } from 'firebase/firestore';
+import { getMessaging, getToken, onMessage, isSupported } from 'firebase/messaging';
 
 const firebaseConfig = {
     apiKey: process.env.REACT_APP_FIREBASE_API_KEY || '',
@@ -25,6 +26,20 @@ const app = initializeApp(firebaseConfig);
 
 export const auth = getAuth(app);
 export const db = getFirestore(app);
+
+// Initialize Firebase Cloud Messaging
+let messagingInstance = null;
+if (typeof window !== 'undefined') {
+    isSupported().then((supported) => {
+        if (supported) {
+            messagingInstance = getMessaging(app);
+        }
+    }).catch(() => {
+        // ignore messaging errors silently
+    });
+}
+
+export const messaging = messagingInstance;
 
 // Log Firebase initialization
 console.log('✅ Firebase initialized:', {
