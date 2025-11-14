@@ -4994,6 +4994,7 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
     const [selectedBlackoutDate, setSelectedBlackoutDate] = useState('');
     const [showBlackoutModal, setShowBlackoutModal] = useState(false);
     const [pendingProviders, setPendingProviders] = useState([]);
+    const [rejectedProviders, setRejectedProviders] = useState([]);
     const [loadingPending, setLoadingPending] = useState(false);
     const [notifications, setNotifications] = useState([]);
     const [unreadCount, setUnreadCount] = useState(0);
@@ -5049,6 +5050,28 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
             console.error('Error loading pending providers:', error);
         } finally {
             setLoadingPending(false);
+        }
+    }
+
+    async function loadRejectedProviders() {
+        if (userData?.role !== 'admin') return;
+
+        try {
+            // Query detailer collection for providers with rejected status
+            const rejectedQuery = query(
+                collection(db, 'detailer'),
+                where('status', '==', 'rejected')
+            );
+            const snapshot = await getDocs(rejectedQuery);
+
+            const rejected = snapshot.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data()
+            }));
+
+            setRejectedProviders(rejected);
+        } catch (error) {
+            console.error('Error loading rejected providers:', error);
         }
     }
 
@@ -5124,10 +5147,11 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
         }
     }, [userData]);
 
-    // Reload pending providers when admin tab is activated
+    // Reload pending and rejected providers when admin tab is activated
     useEffect(() => {
         if (activeTab === 'admin' && userData?.role === 'admin') {  // Change to userData
             loadPendingProviders();
+            loadRejectedProviders();
         }
     }, [activeTab, userData]);  // Add userData to dependencies
 
@@ -5607,9 +5631,27 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
             });
             alert('Provider rejected.');
             loadPendingProviders();
+            loadRejectedProviders(); // Also reload rejected providers list
         } catch (error) {
             console.error('Error rejecting provider:', error);
             alert('Failed to reject provider');
+        }
+    }
+
+    async function handleDeleteProvider(providerId) {
+        if (!confirm('Are you sure you want to permanently delete this provider account? This action cannot be undone.')) {
+            return;
+        }
+
+        try {
+            // Delete the detailer document
+            await deleteDoc(doc(db, 'detailer', providerId));
+            alert('Provider account deleted successfully.');
+            loadPendingProviders();
+            loadRejectedProviders(); // Reload rejected providers list
+        } catch (error) {
+            console.error('Error deleting provider:', error);
+            alert(`Failed to delete provider: ${error.message || 'Unknown error'}`);
         }
     }
 
@@ -6787,6 +6829,66 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                                                     className="flex-1 px-4 py-2 bg-red-600 text-white rounded-lg font-semibold hover:bg-red-700"
                                                 >
                                                     Reject
+                                                </button>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Rejected Providers Section */}
+                        <div className="mt-8">
+                            <div className="flex items-center justify-between mb-4">
+                                <h3 className="text-lg font-bold text-gray-900">Rejected Providers</h3>
+                                <button
+                                    onClick={loadRejectedProviders}
+                                    className="px-4 py-2 text-sm border-2 border-gray-200 rounded-lg font-semibold hover:bg-gray-50"
+                                >
+                                    Refresh
+                                </button>
+                            </div>
+                            {rejectedProviders.length === 0 ? (
+                                <div className="bg-white rounded-xl border border-gray-200 p-8 text-center">
+                                    <p className="text-gray-600">No rejected providers.</p>
+                                </div>
+                            ) : (
+                                <div className="space-y-4">
+                                    {rejectedProviders.map((provider) => (
+                                        <div key={provider.id} className="bg-white rounded-xl border-2 border-red-200 p-6">
+                                            <div className="flex items-start justify-between mb-4">
+                                                <div className="flex-1">
+                                                    <h4 className="text-lg font-bold text-gray-900 mb-2">
+                                                        {provider.businessName || provider.name || 'N/A'}
+                                                    </h4>
+                                                    <div className="space-y-1 text-sm text-gray-600">
+                                                        <div className="flex items-center gap-2">
+                                                            <Mail className="w-4 h-4" />
+                                                            <span>{provider.email}</span>
+                                                        </div>
+                                                        {provider.phone && (
+                                                            <div className="flex items-center gap-2">
+                                                                <Phone className="w-4 h-4" />
+                                                                <span>{provider.phone}</span>
+                                                            </div>
+                                                        )}
+                                                        {provider.rejectionReason && (
+                                                            <div className="mt-2 p-2 bg-red-50 rounded text-xs text-red-800">
+                                                                <strong>Reason:</strong> {provider.rejectionReason}
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                                <span className="px-3 py-1 bg-red-100 text-red-800 rounded-full text-sm font-medium">
+                                                    Rejected
+                                                </span>
+                                            </div>
+                                            <div className="flex gap-3 pt-4 border-t border-gray-200">
+                                                <button
+                                                    onClick={() => handleDeleteProvider(provider.id)}
+                                                    className="flex-1 px-4 py-2 bg-red-600 text-white rounded-lg font-semibold hover:bg-red-700"
+                                                >
+                                                    Delete Account
                                                 </button>
                                             </div>
                                         </div>

@@ -9,17 +9,32 @@ service cloud.firestore {
     }
     
     // CUSTOMER collection: Only the authenticated user can read or write their *own* customer document
+    // Prevent duplicate sign-ups: can't create if customer or detailer document already exists
     match /customer/{userId} {
-      allow read, write: if request.auth != null && request.auth.uid == userId;
+      allow read: if request.auth != null && request.auth.uid == userId;
+      allow create: if request.auth != null && 
+        request.auth.uid == userId &&
+        !exists(/databases/$(database)/documents/customer/$(userId)) &&
+        !exists(/databases/$(database)/documents/detailer/$(userId));
+      allow update: if request.auth != null && request.auth.uid == userId;
+      allow delete: if false; // Prevent deletes for safety
     }
 
     // DETAILER collection: *Anyone* can READ/LIST a detailer's public profile (including queries),
-    // but ONLY the detailer can create or update their own profile
+    // but ONLY the detailer can create or update their own profile (or admins can update any detailer)
+    // Prevent duplicate sign-ups: can't create if detailer or customer document already exists
     match /detailer/{detailerId} {
       allow read, list: if request.auth != null; // Anyone authenticated can read/list detailer profiles
-      allow create, update: if request.auth != null && request.auth.uid == detailerId;
-      // Deny deletes for safety
-      allow delete: if false;
+      allow create: if request.auth != null && 
+        request.auth.uid == detailerId &&
+        !exists(/databases/$(database)/documents/detailer/$(detailerId)) &&
+        !exists(/databases/$(database)/documents/customer/$(detailerId));
+      allow update: if request.auth != null && (
+        request.auth.uid == detailerId || 
+        isAdmin()
+      );
+      // Allow admins to delete detailer documents (for cleaning up rejected accounts)
+      allow delete: if isAdmin();
     }
 
     // Saved Addresses under a customer
