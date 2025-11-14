@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import config from './config';
 import {
     MapPin, Car, Calendar, Star, CheckCircle2, X, ChevronRight,
@@ -31,7 +31,6 @@ import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { auth, db, storage } from './firebase/config';
 import { GoogleAuthProvider } from 'firebase/auth';
 import PaymentForm from './components/PaymentForm';
-import { SERVICES_JSON, convertServices } from './firebaseService';
 import { PACKAGES_DATA, ADD_ONS, importPackagesToFirestore, initializePackagesIfEmpty } from './data/packages';
 import {
     requestNotificationPermission,
@@ -202,7 +201,6 @@ async function geocodeAddress(address) {
             zip: byType('postal_code')?.long_name || ''
         };
 
-        console.log('✅ Geocoding successful:', coords);
         return coords;
     } catch (error) {
         console.error('Geocoding error:', error);
@@ -388,7 +386,6 @@ export default function BrnnoMarketplace() {
                         }));
                         if (coords) {
                             setUserCoordinates(coords);
-                            console.log('✅ Coordinates set from Google Places Autocomplete:', coords);
                         }
                     } else {
                         // Address modal
@@ -421,13 +418,11 @@ export default function BrnnoMarketplace() {
             try {
                 const currentAuthUser = auth.currentUser;
                 if (currentAuthUser) {
-                    console.log('🔍 Checking for orphaned session on page load...');
                     // Check both customer and detailer collections
                     const customerDoc = await getDoc(doc(db, 'customer', currentAuthUser.uid));
                     const detailerDoc = await getDoc(doc(db, 'detailer', currentAuthUser.uid));
 
                     if (!customerDoc.exists() && !detailerDoc.exists()) {
-                        console.log('🧹 Found orphaned session - clearing it');
                         // Clear Firebase Auth storage
                         try {
                             if (window.indexedDB) {
@@ -443,9 +438,6 @@ export default function BrnnoMarketplace() {
                         }
                         // Sign out
                         await signOut(auth);
-                        console.log('✅ Orphaned session cleared');
-                    } else {
-                        console.log('✅ Valid session found');
                     }
                 }
             } catch (error) {
@@ -465,11 +457,8 @@ export default function BrnnoMarketplace() {
         const unsubscribe = onAuthStateChanged(auth, async (user) => {
             // Prevent infinite loop if we're already signing out
             if (isSigningOut) {
-                console.log('⏸️ Sign out in progress, skipping auth state change');
                 return;
             }
-
-            console.log('🔐 Auth state changed:', user ? `User logged in (${user.uid})` : 'User logged out');
             if (user) {
                 try {
                     // 1. Check if they exist as a CUSTOMER
@@ -483,7 +472,6 @@ export default function BrnnoMarketplace() {
                     // 3. Check if they are a NEW USER
                     if (!customerDoc.exists() && !detailerDoc.exists()) {
                         // This is a BRAND NEW user. They don't exist in either collection.
-                        console.log('🆕 New user detected, creating account...');
 
                         // 4. Get the role we saved from the button click
                         const role = localStorage.getItem('pendingUserRole') || 'customer'; // Default to 'customer'
@@ -532,7 +520,6 @@ export default function BrnnoMarketplace() {
                                 status: 'pending',
                                 onboarded: false
                             });
-                            console.log('✅ New DETAILER account created.');
 
                             // Set user info and route to detailer onboarding
                             const userInfo = {
@@ -558,7 +545,6 @@ export default function BrnnoMarketplace() {
                             // Clear the flag after a delay
                             setTimeout(() => {
                                 isCreatingAccountRef.current = false;
-                                console.log('✅ Account creation flag cleared');
                             }, 3000);
                         } else {
                             // Create a new CUSTOMER document
@@ -571,7 +557,6 @@ export default function BrnnoMarketplace() {
                                 preferences: {},
                                 onboarded: false
                             });
-                            console.log('✅ New CUSTOMER account created.');
 
                             // Set user info and route to address modal
                             const userInfo = {
@@ -590,7 +575,6 @@ export default function BrnnoMarketplace() {
                             // Clear the flag after a delay
                             setTimeout(() => {
                                 isCreatingAccountRef.current = false;
-                                console.log('✅ Account creation flag cleared');
                             }, 3000);
                         }
                     } else {
@@ -605,7 +589,6 @@ export default function BrnnoMarketplace() {
                         setCurrentUser(userInfo);
 
                         if (customerDoc.exists()) {
-                            console.log('✅ Existing CUSTOMER logged in.');
                             setUserAccountType('customer');
                             setIsProvider(false);
                             // Check onboarding will handle routing
@@ -613,7 +596,6 @@ export default function BrnnoMarketplace() {
                                 await checkUserOnboarding(user.uid, 'customer');
                             }
                         } else if (detailerDoc.exists()) {
-                            console.log('✅ Existing DETAILER logged in.');
                             setUserAccountType('detailer');
                             setIsProvider(true);
                             // Check onboarding will handle routing
@@ -639,7 +621,6 @@ export default function BrnnoMarketplace() {
                 }
             } else {
                 // User is not logged in - show landing page
-                console.log('👋 User logged out, resetting state');
                 setCurrentUser(null);
                 setUserAccountType(null);
                 setIsProvider(false);
@@ -662,17 +643,9 @@ export default function BrnnoMarketplace() {
     // Check if returning user has already completed onboarding
     async function checkUserOnboarding(uid, role) {
         try {
-            console.log('🔍 Checking user onboarding for UID:', uid);
-            console.log('🔐 Auth state in checkUserOnboarding:', {
-                isAuthenticated: !!auth.currentUser,
-                uid: auth.currentUser?.uid,
-                expectedUid: uid
-            });
-
             // Determine which collection to check based on role
             const collectionName = role === 'detailer' ? 'detailer' : 'customer';
             const userDocRef = doc(db, collectionName, uid);
-            console.log('📄 Attempting to read user document from:', collectionName);
 
             let userDoc;
             try {
@@ -688,7 +661,6 @@ export default function BrnnoMarketplace() {
             }
 
             if (!userDoc.exists()) {
-                console.log('⚠️ User document not found - signing out to clear orphaned session');
                 // User is authenticated but has no Firestore document - sign them out
                 // This happens when Firebase Auth session exists but Firestore document was deleted
                 await signOut(auth);
@@ -696,12 +668,10 @@ export default function BrnnoMarketplace() {
                 setCurrentUser(null);
                 setUserAccountType(null);
                 setIsProvider(false);
-                console.log('✅ Signed out - user can now sign up fresh');
                 return;
             }
 
             const userData = userDoc.data();
-            console.log('📋 User data retrieved for role:', role);
 
             if (role === 'detailer') {
                 // Detailer/Provider flow
@@ -720,21 +690,18 @@ export default function BrnnoMarketplace() {
 
                 // Check if detailer needs to complete onboarding
                 if (!userData.onboarded || !userData.businessName || !userData.businessAddress) {
-                    console.log('⚠️ Detailer needs to complete onboarding');
                     setCurrentPage('landing');
                     setModalType('providerOnboarding');
                     return;
                 }
 
                 setCurrentPage('dashboard');
-                console.log('✅ Routed to dashboard');
             } else {
                 // Customer flow
                 setIsProvider(false);
 
                 // Customers - check if they have an address
                 if (userData.address || userData.coordinates) {
-                    console.log('👤 User is customer with address, routing to marketplace');
                     setAddress(userData.coordinates?.formattedAddress || userData.address || '');
                     setUserCoordinates(userData.coordinates || null);
                     setAnswers({
@@ -744,10 +711,8 @@ export default function BrnnoMarketplace() {
                     });
 
                     setCurrentPage('marketplace');
-                    console.log('✅ Routed to marketplace');
                 } else {
                     // Customer exists but needs to enter address - show address modal
-                    console.log('⚠️ Customer needs to enter address, showing address modal');
                     setCurrentPage('landing');
                     setModalType('address');
                 }
@@ -781,7 +746,6 @@ export default function BrnnoMarketplace() {
     useEffect(() => {
         if (currentPage === 'marketplace') {
             // Always reload when navigating to marketplace to get latest data
-            console.log('🔄 Loading detailers for marketplace...');
             // Use a small delay to ensure Firebase is ready
             const loadTimeout = setTimeout(() => {
                 loadDetailers().catch(error => {
@@ -796,22 +760,16 @@ export default function BrnnoMarketplace() {
     // Real-time listener for provider updates - reloads detailers when providers change
     useEffect(() => {
         if (currentPage === 'marketplace') {
-            console.log('🔄 Setting up real-time listener for providers...');
             let isInitialLoad = true;
             let loadTimeout = null;
 
             // Listen for changes to users collection (providers) - unified structure
-            console.log('🔐 Setting up listener - Auth state:', {
-                isAuthenticated: !!auth.currentUser,
-                uid: auth.currentUser?.uid
-            });
 
             const unsubscribe = onSnapshot(
                 query(collection(db, 'detailer')),
                 async (snapshot) => {
                     // Skip the initial load - let the manual loadDetailers() handle it
                     if (isInitialLoad) {
-                        console.log('⏭️ Skipping initial snapshot (handled by manual load)');
                         isInitialLoad = false;
                         return;
                     }
@@ -822,7 +780,6 @@ export default function BrnnoMarketplace() {
                     }
 
                     loadTimeout = setTimeout(async () => {
-                        console.log('📡 Providers updated! Reloading detailers...');
                         try {
                             await loadDetailers();
                         } catch (error) {
@@ -858,7 +815,6 @@ export default function BrnnoMarketplace() {
 
             // Cleanup listener when leaving marketplace
             return () => {
-                console.log('🧹 Cleaning up real-time listener');
                 if (loadTimeout) {
                     clearTimeout(loadTimeout);
                 }
@@ -879,12 +835,7 @@ export default function BrnnoMarketplace() {
 
     async function loadDetailers() {
         try {
-            console.log('!!!!!!!!!! --- I AM INSIDE THE NEW loadDetailers FUNCTION --- !!!!!!!!!');
-            console.log('!!!!!!!!!! --- QUERYING detailer COLLECTION (NOT users) --- !!!!!!!!!');
-            console.log('🔄 Starting loadDetailers...');
-
             // Load packages from Firestore
-            console.log('📦 Loading packages from Firestore...');
             const packagesQuery = collection(db, 'packages');
             const packagesSnapshot = await getDocs(packagesQuery);
             const packagesMap = {};
@@ -894,7 +845,6 @@ export default function BrnnoMarketplace() {
 
             // Fallback to local packages if Firestore is empty
             if (Object.keys(packagesMap).length === 0) {
-                console.log('⚠️ No packages in Firestore, attempting to auto-create...');
 
                 // Try to auto-create packages
                 try {
@@ -905,11 +855,8 @@ export default function BrnnoMarketplace() {
                         packagesMap[doc.id] = { id: doc.id, ...doc.data() };
                     });
 
-                    if (Object.keys(packagesMap).length > 0) {
-                        console.log(`✅ Auto-created and loaded ${Object.keys(packagesMap).length} packages`);
-                    } else {
+                    if (Object.keys(packagesMap).length === 0) {
                         // Still empty, use local fallback
-                        console.log('⚠️ Using local packages as fallback');
                         PACKAGES_DATA.forEach(pkg => {
                             packagesMap[pkg.id] = pkg;
                         });
@@ -922,45 +869,20 @@ export default function BrnnoMarketplace() {
                     });
                 }
             }
-            console.log(`✅ Loaded ${Object.keys(packagesMap).length} packages`);
 
             // Query detailer collection
-            console.log('🔍 Querying detailers from detailer collection...');
-            console.log('🔐 Auth state:', {
-                isAuthenticated: !!auth.currentUser,
-                uid: auth.currentUser?.uid,
-                email: auth.currentUser?.email
-            });
 
             const providersQuery = query(
                 collection(db, 'detailer')
             );
 
-            console.log('📤 Executing Firestore query...');
             let snapshot;
             try {
                 snapshot = await getDocs(providersQuery);
-                console.log(`✅ Query successful, found ${snapshot.docs.length} provider documents`);
             } catch (queryError) {
-                console.error('❌ Firestore Query Error:', {
-                    code: queryError.code,
-                    message: queryError.message,
-                    stack: queryError.stack,
-                    name: queryError.name
-                });
-                console.error('🔍 Query Details:', {
-                    collection: 'detailer',
-                    whereClause: 'none (direct collection query)',
-                    isAuthenticated: !!auth.currentUser,
-                    uid: auth.currentUser?.uid
-                });
+                console.error('Firestore Query Error:', queryError);
                 throw queryError; // Re-throw to be caught by outer catch
             }
-
-            console.log('🔍 Loading detailers...', {
-                totalProviders: snapshot.docs.length,
-                packagesAvailable: Object.keys(packagesMap).length
-            });
 
             const loadedDetailers = await Promise.all(snapshot.docs.map(async (docSnapshot) => {
                 const data = docSnapshot.data();
@@ -968,12 +890,6 @@ export default function BrnnoMarketplace() {
                 // Load packages for this provider
                 const offeredPackages = data.offeredPackages || [];
                 const customPrices = data.packagePrices || {};
-
-                console.log(`📦 Provider: ${data.businessName || docSnapshot.id}`, {
-                    status: data.status,
-                    offeredPackagesCount: offeredPackages.length,
-                    offeredPackages: offeredPackages
-                });
 
                 const packages = offeredPackages
                     .map(pkgId => {
@@ -986,8 +902,7 @@ export default function BrnnoMarketplace() {
                         if (customPrices[pkgId]) {
                             return {
                                 ...pkg,
-                                priceMin: customPrices[pkgId].priceMin,
-                                priceMax: customPrices[pkgId].priceMax
+                                price: customPrices[pkgId].price
                             };
                         }
                         return pkg;
@@ -1072,37 +987,16 @@ export default function BrnnoMarketplace() {
             // Sort by distance (closest first) by default
             availableDetailers.sort((a, b) => a.distance - b.distance);
 
-            console.log('💾 Setting detailers array with', availableDetailers.length, 'detailers');
             setDetailers(availableDetailers);
-            console.log('✅ Detailers state updated!');
         } catch (error) {
             // Enhanced error logging
-            console.error('❌ Error loading detailers:', error);
-            console.error('📋 Error details:', {
-                message: error.message,
-                code: error.code,
-                stack: error.stack,
-                name: error.name,
-                toString: error.toString()
-            });
-
-            // Log authentication state
-            console.error('🔐 Auth state at error:', {
-                currentUser: auth.currentUser,
-                uid: auth.currentUser?.uid,
-                email: auth.currentUser?.email,
-                isAuthenticated: !!auth.currentUser
-            });
+            console.error('Error loading detailers:', error);
 
             // More specific error messages
             let errorMessage = 'Error loading detailers. ';
             if (error.code === 'permission-denied') {
                 errorMessage += 'Permission denied. Check Firestore rules.';
-                console.error('🚨 PERMISSION DENIED - Possible causes:');
-                console.error('   1. User not authenticated:', !auth.currentUser);
-                console.error('   2. Firestore rules may not allow queries');
-                console.error('   3. Check Firebase Console → Firestore → Rules');
-                console.error('   4. Current user UID:', auth.currentUser?.uid);
+                console.error('PERMISSION DENIED - Check Firestore rules and authentication');
             } else if (error.code === 'unavailable') {
                 errorMessage += 'Firebase is unavailable. Check your connection.';
             } else if (error.code === 'failed-precondition') {
@@ -1112,11 +1006,10 @@ export default function BrnnoMarketplace() {
             }
 
             // Always show alert and log to console
-            console.error('🚨 Showing error alert to user');
             alert(`${errorMessage}\n\nCheck console (F12) for details.`);
 
             // Fallback to mock data if error
-            console.warn('⚠️ Falling back to mock data');
+            console.warn('Falling back to mock data');
             setDetailers(getMockDetailers());
         }
     }
@@ -1129,7 +1022,7 @@ export default function BrnnoMarketplace() {
 
     function getStartingPriceFromPackages(packages) {
         if (!packages || packages.length === 0) return 150;
-        const prices = packages.map(pkg => pkg.priceMin || 0).filter(p => p > 0);
+        const prices = packages.map(pkg => pkg.price || 0).filter(p => p > 0);
         return prices.length > 0 ? Math.min(...prices) : 150;
     }
 
@@ -1316,19 +1209,14 @@ export default function BrnnoMarketplace() {
                 return;
             }
 
-            console.log('🔐 Starting email login...');
             const result = await signInWithEmailAndPassword(auth, loginData.email, loginData.password);
-            console.log('✅ Email login successful, UID:', result.user.uid);
 
             // Check if user exists in customer or detailer collection
             const customerDoc = await getDoc(doc(db, 'customer', result.user.uid));
             const detailerDoc = await getDoc(doc(db, 'detailer', result.user.uid));
-            console.log('📄 Customer document exists:', customerDoc.exists());
-            console.log('📄 Detailer document exists:', detailerDoc.exists());
 
             if (!customerDoc.exists() && !detailerDoc.exists()) {
                 // User doesn't exist - create a basic customer account automatically
-                console.log('⚠️ User document not found, creating new customer account...');
 
                 // Set flag to prevent auth listener from signing out during creation
                 isCreatingAccountRef.current = true;
@@ -1348,7 +1236,6 @@ export default function BrnnoMarketplace() {
                 };
 
                 await setDoc(doc(db, 'customer', result.user.uid), userData);
-                console.log('✅ Created new customer account');
 
                 // Clear the flag after a short delay to allow auth listener to process
                 setTimeout(() => {
@@ -1419,7 +1306,6 @@ export default function BrnnoMarketplace() {
 
     async function handleLogout() {
         try {
-            console.log('🚪 Logging out...');
             // Clear all local state first
             setCurrentUser(null);
             setUserAccountType(null);
@@ -1436,7 +1322,6 @@ export default function BrnnoMarketplace() {
 
             // Sign out from Firebase
             await signOut(auth);
-            console.log('✅ Logged out successfully');
 
             // Clear Firebase Auth storage from browser
             try {
@@ -1445,7 +1330,6 @@ export default function BrnnoMarketplace() {
                     // Clear IndexedDB Firebase Auth storage
                     const deleteReq = indexedDB.deleteDatabase('firebaseLocalStorageDb');
                     deleteReq.onsuccess = () => {
-                        console.log('✅ Cleared Firebase Auth storage');
                     };
                     deleteReq.onerror = () => {
                         console.warn('⚠️ Could not clear Firebase Auth storage');
@@ -1480,7 +1364,7 @@ export default function BrnnoMarketplace() {
     }
 
     // ==================== ONBOARDING FLOW ====================
-    function startOnboarding() {
+    const startOnboarding = useCallback(() => {
         // If user is already logged in but needs address, show address modal
         if (currentUser && userAccountType === 'customer' && !address) {
             setModalType('address');
@@ -1488,12 +1372,12 @@ export default function BrnnoMarketplace() {
             // Show signup modal first - users can choose customer or provider
             setModalType('signup');
         }
-    }
+    }, [currentUser, userAccountType, address]);
 
-    function startLogin() {
+    const startLogin = useCallback(() => {
         // Show login modal for returning users
         setModalType('login');
-    }
+    }, []);
 
     async function handleAddressSubmit() {
         if (!address.trim()) return;
@@ -1588,7 +1472,6 @@ export default function BrnnoMarketplace() {
                     coords.formattedAddress.includes(providerOnboardingData.businessAddress.split(',')[0]);
 
                 if (addressMatches) {
-                    console.log('✅ Using coordinates from Google Places Autocomplete');
                 } else {
                     console.warn('⚠️ Address mismatch, but using existing coordinates');
                     // Still use the coordinates but update the formatted address
@@ -1621,7 +1504,6 @@ export default function BrnnoMarketplace() {
                 updatedAt: serverTimestamp()
             });
 
-            console.log('✅ Provider onboarding completed');
 
             // Close modal and go to dashboard
             setModalType(null);
@@ -1784,22 +1666,6 @@ export default function BrnnoMarketplace() {
 
 // ==================== LANDING PAGE ====================
 function LandingPage({ onGetStarted, onLogin }) {
-    // Helper function to clear all browser storage (for debugging)
-    const clearAllStorage = () => {
-        try {
-            localStorage.clear();
-            sessionStorage.clear();
-            if (window.indexedDB) {
-                indexedDB.deleteDatabase('firebaseLocalStorageDb');
-            }
-            alert('Browser storage cleared! Page will reload.');
-            window.location.reload();
-        } catch (e) {
-            console.error('Error clearing storage:', e);
-            alert('Could not clear storage. Please clear manually in DevTools.');
-        }
-    };
-
     return (
         <div className="min-h-screen bg-gradient-to-br from-blue-600 via-blue-700 to-blue-900 text-white">
             <div className="max-w-6xl mx-auto px-4 py-12 sm:py-20">
@@ -1824,15 +1690,6 @@ function LandingPage({ onGetStarted, onLogin }) {
                             </button>
                         )}
                     </div>
-                    {/* Debug button - remove in production */}
-                    {process.env.NODE_ENV === 'development' && (
-                        <button
-                            onClick={clearAllStorage}
-                            className="mt-4 text-xs text-blue-200 hover:text-white underline"
-                        >
-                            Clear Browser Storage (Debug)
-                        </button>
-                    )}
                 </div>
 
                 <div className="grid sm:grid-cols-2 md:grid-cols-3 gap-6 sm:gap-8 mt-12 sm:mt-20 px-4">
@@ -2278,20 +2135,29 @@ function BookingSidebar({
     // Get current user from auth if not provided
     const currentUser = currentUserProp || auth.currentUser;
 
-    // Available packages from detailer
-    const availablePackages = detailer.packages || [];
+    // Available packages from detailer, sorted by price (low to high)
+    const availablePackages = useMemo(() => {
+        if (!detailer.packages || detailer.packages.length === 0) return [];
+        // Create a copy to avoid mutating the original array
+        const sorted = [...detailer.packages].sort((a, b) => {
+            const priceA = Number(a.price) || 0;
+            const priceB = Number(b.price) || 0;
+            return priceA - priceB; // Sort low to high
+        });
+        return sorted;
+    }, [detailer.packages]);
 
     // Available add-ons (from detailer or all add-ons)
     const availableAddOnsList = detailer.addOns
         ? ADD_ONS.filter(addon => detailer.addOns.includes(addon.id))
         : ADD_ONS;
 
-    // Calculate total price: package (use average of min/max) + add-ons
+    // Calculate total price: package price + add-ons
     const totalPrice = useMemo(() => {
         let price = 0;
         if (selectedPackage) {
-            // Use average of price range
-            price = Math.round((selectedPackage.priceMin + selectedPackage.priceMax) / 2);
+            // Use single price
+            price = selectedPackage.price;
         }
         // Add selected add-ons
         selectedAddOns.forEach(addOnId => {
@@ -2413,10 +2279,7 @@ function BookingSidebar({
             // Store package data
             packageId: selectedPackage.id,
             packageName: selectedPackage.name,
-            packagePriceRange: {
-                min: selectedPackage.priceMin,
-                max: selectedPackage.priceMax
-            },
+            packagePrice: selectedPackage.price,
             exteriorServices: selectedPackage.exteriorServices || [],
             interiorServices: selectedPackage.interiorServices || [],
             addOns: selectedAddOns.map(addOnId => {
@@ -2648,7 +2511,7 @@ function BookingSidebar({
                                     <div className="text-xs text-gray-500">{selectedPackage.estimatedHours} hours</div>
                                 </div>
                                 <div className="text-right">
-                                    <div className="font-bold text-gray-900">${selectedPackage.priceMin} - ${selectedPackage.priceMax}</div>
+                                    <div className="font-bold text-gray-900">${selectedPackage.price}</div>
                                 </div>
                             </div>
                             {selectedAddOns.length > 0 && (
@@ -2713,8 +2576,7 @@ function BookingSidebar({
                                                 </div>
                                             </div>
                                             <div className="text-right flex-shrink-0">
-                                                <div className="font-bold text-gray-900">${pkg.priceMin}</div>
-                                                <div className="text-xs text-gray-500">- ${pkg.priceMax}</div>
+                                                <div className="font-bold text-gray-900">${pkg.price}</div>
                                             </div>
                                         </div>
 
@@ -2846,7 +2708,7 @@ function BookingSidebar({
                         <div className="mb-2 space-y-1">
                             <div className="flex items-center justify-between text-sm">
                                 <span className="text-gray-600">{selectedPackage.name}:</span>
-                                <span className="text-gray-900 font-medium">${Math.round((selectedPackage.priceMin + selectedPackage.priceMax) / 2)}</span>
+                                <span className="text-gray-900 font-medium">${selectedPackage.price}</span>
                             </div>
                             {selectedAddOns.map(addOnId => {
                                 const addOn = ADD_ONS.find(a => a.id === addOnId);
@@ -2888,7 +2750,7 @@ function BookingSidebar({
                         <div className="mb-2 space-y-1">
                             <div className="flex items-center justify-between text-xs">
                                 <span className="text-gray-600 truncate pr-2">{selectedPackage.name}:</span>
-                                <span className="text-gray-900 font-medium">${Math.round((selectedPackage.priceMin + selectedPackage.priceMax) / 2)}</span>
+                                <span className="text-gray-900 font-medium">${selectedPackage.price}</span>
                             </div>
                             {selectedAddOns.map(addOnId => {
                                 const addOn = ADD_ONS.find(a => a.id === addOnId);
@@ -3115,7 +2977,6 @@ function MarketplacePage({
 
             {/* Detailer List */}
             <div className="max-w-6xl mx-auto px-4 py-8">
-                {console.log('🎨 Rendering marketplace - detailers count:', detailers.length, 'detailers:', detailers.map(d => d.name))}
                 {detailers.length === 0 ? (
                     <div className="text-center py-12">
                         <Search className="w-16 h-16 text-gray-300 mx-auto mb-4" />
@@ -3360,7 +3221,11 @@ function DetailerProfilePage({ detailer, answers, address, setAddress, setAnswer
                                     <h3 className="font-semibold text-gray-900 mb-4 text-lg">Packages</h3>
                                     {detailer.packages && detailer.packages.length > 0 ? (
                                         <div className="space-y-4">
-                                            {detailer.packages.map((pkg) => (
+                                            {[...detailer.packages].sort((a, b) => {
+                                                const priceA = a.price || 0;
+                                                const priceB = b.price || 0;
+                                                return priceA - priceB; // Sort low to high
+                                            }).map((pkg) => (
                                                 <div
                                                     key={pkg.id}
                                                     className="p-4 border-2 border-gray-200 rounded-lg hover:border-blue-300 hover:shadow-md transition-all"
@@ -3375,8 +3240,7 @@ function DetailerProfilePage({ detailer, answers, address, setAddress, setAnswer
                                                             </div>
                                                         </div>
                                                         <div className="text-right flex-shrink-0">
-                                                            <div className="text-lg font-bold text-blue-600">${pkg.priceMin}</div>
-                                                            <div className="text-xs text-gray-500">- ${pkg.priceMax}</div>
+                                                            <div className="text-lg font-bold text-blue-600">${pkg.price}</div>
                                                         </div>
                                                     </div>
                                                     <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3 pt-3 border-t border-gray-200">
@@ -4987,7 +4851,7 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
     const [availablePackages, setAvailablePackages] = useState([]);
     const [selectedPackages, setSelectedPackages] = useState([]);
     const [selectedAddOns, setSelectedAddOns] = useState([]);
-    const [packagePrices, setPackagePrices] = useState({}); // { "package-id": { priceMin: X, priceMax: Y } }
+    const [packagePrices, setPackagePrices] = useState({}); // { "package-id": { price: X } }
     const [savingPackages, setSavingPackages] = useState(false);
     const [weeklySchedule, setWeeklySchedule] = useState({});
     const [blackoutDates, setBlackoutDates] = useState([]);
@@ -5678,7 +5542,6 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
             });
 
             // Log to console
-            console.log('📋 All Providers in Database:');
             console.table(providersList);
 
             // Also show in alert with details
@@ -5940,9 +5803,9 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                                                         <div className="space-y-2 mb-2">
                                                             <div className="flex items-center justify-between">
                                                                 <p className="text-lg font-semibold text-gray-900">{booking.packageName}</p>
-                                                                {booking.packagePriceRange && (
+                                                                {booking.packagePrice && (
                                                                     <span className="text-sm font-medium text-gray-600">
-                                                                        ${booking.packagePriceRange.min} - ${booking.packagePriceRange.max}
+                                                                        ${booking.packagePrice}
                                                                     </span>
                                                                 )}
                                                             </div>
@@ -6098,9 +5961,9 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                                                 {booking.packageName ? (
                                                     <div className="mb-2">
                                                         <p className="text-gray-600 mb-1 font-semibold">{booking.packageName}</p>
-                                                        {booking.packagePriceRange && (
+                                                        {booking.packagePrice && (
                                                             <p className="text-gray-500 text-sm mb-1">
-                                                                ${booking.packagePriceRange.min} - ${booking.packagePriceRange.max}
+                                                                ${booking.packagePrice}
                                                             </p>
                                                         )}
                                                         {booking.addOns && booking.addOns.length > 0 && (
@@ -6180,13 +6043,11 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                                     });
 
                                     if (savingPackages) {
-                                        console.log('⏸️ Already saving, ignoring click');
                                         return;
                                     }
 
                                     try {
                                         setSavingPackages(true);
-                                        console.log('✅ Starting save process...');
 
                                         if (!currentUser || !currentUser.uid) {
                                             const errorMsg = 'Error: You must be logged in to save changes.';
@@ -6196,16 +6057,8 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                                             return;
                                         }
 
-                                        console.log('📦 Saving packages...', {
-                                            selectedPackages,
-                                            selectedAddOns,
-                                            packagePrices,
-                                            userId: currentUser.uid
-                                        });
-
                                         // Unified structure: document ID is the UID
                                         const docIdToUpdate = currentUser.uid;
-                                        console.log('✅ Using unified structure - document ID is UID:', docIdToUpdate);
 
                                         // Verify document exists
                                         const detailerDocRef = doc(db, 'detailer', currentUser.uid);
@@ -6228,13 +6081,10 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                                             updatedAt: serverTimestamp()
                                         });
 
-                                        console.log('✅ Packages saved successfully!');
                                         alert('Packages saved successfully!');
 
                                         // Reload provider data to reflect changes
-                                        console.log('🔄 Reloading provider data...');
                                         await loadProviderData();
-                                        console.log('✅ Reload complete!');
                                     } catch (error) {
                                         console.error('❌ Error saving packages:', error);
                                         console.error('Error details:', {
@@ -6302,7 +6152,7 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                                                                 <div className="flex items-center gap-2">
                                                                     <DollarSign className="w-4 h-4 text-gray-600" />
                                                                     <span className={`font-bold text-lg ${isSelected && packagePrices[pkg.id] ? 'text-blue-600' : 'text-gray-900'}`}>
-                                                                        ${packagePrices[pkg.id]?.priceMin ?? pkg.priceMin} - ${packagePrices[pkg.id]?.priceMax ?? pkg.priceMax}
+                                                                        ${packagePrices[pkg.id]?.price ?? pkg.price}
                                                                     </span>
                                                                     {isSelected && packagePrices[pkg.id] && (
                                                                         <span className="px-2 py-1 rounded-full text-xs bg-blue-100 text-blue-700 font-medium">Custom</span>
@@ -6317,8 +6167,7 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                                                                             setPackagePrices(prev => ({
                                                                                 ...prev,
                                                                                 [pkg.id]: {
-                                                                                    priceMin: pkg.priceMin,
-                                                                                    priceMax: pkg.priceMax
+                                                                                    price: pkg.price
                                                                                 }
                                                                             }));
                                                                         }
@@ -6353,58 +6202,32 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                                                                         Reset to Default
                                                                     </button>
                                                                 </div>
-                                                                <p className="text-xs text-gray-600 mb-3">Set your own prices for this package</p>
-                                                                <div className="grid grid-cols-2 gap-3">
-                                                                    <div>
-                                                                        <label className="block text-xs font-medium text-gray-700 mb-1">Minimum Price ($)</label>
-                                                                        <input
-                                                                            type="number"
-                                                                            min="0"
-                                                                            step="1"
-                                                                            value={packagePrices[pkg.id]?.priceMin ?? pkg.priceMin}
-                                                                            onChange={(e) => {
-                                                                                const value = parseInt(e.target.value) || pkg.priceMin;
-                                                                                setPackagePrices(prev => ({
-                                                                                    ...prev,
-                                                                                    [pkg.id]: {
-                                                                                        ...prev[pkg.id],
-                                                                                        priceMin: value,
-                                                                                        priceMax: prev[pkg.id]?.priceMax ?? pkg.priceMax
-                                                                                    }
-                                                                                }));
-                                                                            }}
-                                                                            className="w-full px-3 py-2 text-sm border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white font-medium"
-                                                                            placeholder={pkg.priceMin.toString()}
-                                                                        />
-                                                                    </div>
-                                                                    <div>
-                                                                        <label className="block text-xs font-medium text-gray-700 mb-1">Maximum Price ($)</label>
-                                                                        <input
-                                                                            type="number"
-                                                                            min="0"
-                                                                            step="1"
-                                                                            value={packagePrices[pkg.id]?.priceMax ?? pkg.priceMax}
-                                                                            onChange={(e) => {
-                                                                                const value = parseInt(e.target.value) || pkg.priceMax;
-                                                                                setPackagePrices(prev => ({
-                                                                                    ...prev,
-                                                                                    [pkg.id]: {
-                                                                                        ...prev[pkg.id],
-                                                                                        priceMin: prev[pkg.id]?.priceMin ?? pkg.priceMin,
-                                                                                        priceMax: value
-                                                                                    }
-                                                                                }));
-                                                                            }}
-                                                                            className="w-full px-3 py-2 text-sm border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white font-medium"
-                                                                            placeholder={pkg.priceMax.toString()}
-                                                                        />
-                                                                    </div>
+                                                                <p className="text-xs text-gray-600 mb-3">Set your price for this package</p>
+                                                                <div>
+                                                                    <label className="block text-xs font-medium text-gray-700 mb-1">Price ($)</label>
+                                                                    <input
+                                                                        type="number"
+                                                                        min="0"
+                                                                        step="1"
+                                                                        value={packagePrices[pkg.id]?.price ?? pkg.price}
+                                                                        onChange={(e) => {
+                                                                            const value = parseInt(e.target.value) || pkg.price;
+                                                                            setPackagePrices(prev => ({
+                                                                                ...prev,
+                                                                                [pkg.id]: {
+                                                                                    price: value
+                                                                                }
+                                                                            }));
+                                                                        }}
+                                                                        className="w-full px-3 py-2 text-sm border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white font-medium"
+                                                                        placeholder={pkg.price?.toString() || '0'}
+                                                                    />
                                                                 </div>
                                                                 <div className="mt-3 pt-3 border-t border-blue-200">
                                                                     <div className="flex items-center gap-2 text-sm">
                                                                         <DollarSign className="w-4 h-4 text-blue-600" />
                                                                         <span className="font-bold text-blue-700">
-                                                                            Your Price: ${packagePrices[pkg.id]?.priceMin ?? pkg.priceMin} - ${packagePrices[pkg.id]?.priceMax ?? pkg.priceMax}
+                                                                            Your Price: ${packagePrices[pkg.id]?.price ?? pkg.price}
                                                                         </span>
                                                                     </div>
                                                                 </div>

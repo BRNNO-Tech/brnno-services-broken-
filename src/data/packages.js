@@ -6,8 +6,7 @@ export const PACKAGES_DATA = [
     {
         id: "standard-full-detail",
         name: "Standard Full Detail",
-        priceMin: 150,
-        priceMax: 300,
+        price: 225,
         estimatedHours: 3,
         description: "Great for regular maintenance. Keeps your car clean and protected for 1–2 months.",
         exteriorServices: [
@@ -30,8 +29,7 @@ export const PACKAGES_DATA = [
     {
         id: "mid-range-detail",
         name: "Mid-Range Detail",
-        priceMin: 250,
-        priceMax: 500,
+        price: 375,
         estimatedHours: 5,
         description: "Deeper clean + enhanced protection. Ideal for monthly upkeep.",
         exteriorServices: [
@@ -57,8 +55,7 @@ export const PACKAGES_DATA = [
     {
         id: "premium-detail",
         name: "Premium Detail",
-        priceMin: 400,
-        priceMax: 1200,
+        price: 800,
         estimatedHours: 8,
         description: "Showroom-ready. Full correction, ceramic, and long-term protection.",
         exteriorServices: [
@@ -137,8 +134,7 @@ export async function initializePackagesIfEmpty() {
             const pkgRef = doc(collection(db, 'packages'), pkg.id);
             batch.push(setDoc(pkgRef, {
                 name: pkg.name,
-                priceMin: pkg.priceMin,
-                priceMax: pkg.priceMax,
+                price: pkg.price,
                 estimatedHours: pkg.estimatedHours,
                 description: pkg.description,
                 exteriorServices: pkg.exteriorServices,
@@ -189,8 +185,7 @@ export async function importPackagesToFirestore() {
             const pkgRef = doc(collection(db, 'packages'), pkg.id);
             batch.push(setDoc(pkgRef, {
                 name: pkg.name,
-                priceMin: pkg.priceMin,
-                priceMax: pkg.priceMax,
+                price: pkg.price,
                 estimatedHours: pkg.estimatedHours,
                 description: pkg.description,
                 exteriorServices: pkg.exteriorServices,
