@@ -31,6 +31,7 @@ import { auth, db } from './firebase';
 import { GoogleAuthProvider } from 'firebase/auth';
 import PaymentForm from './components/PaymentForm';
 import { SERVICES_JSON, convertServices } from './firebaseService';
+import { PACKAGES_DATA, ADD_ONS, importPackagesToFirestore } from './data/packages';
 import {
     requestNotificationPermission,
     saveFCMToken,
@@ -551,18 +552,46 @@ export default function BrnnoMarketplace() {
 
     async function loadDetailers() {
         try {
+            // Load packages from Firestore
+            const packagesQuery = collection(db, 'packages');
+            const packagesSnapshot = await getDocs(packagesQuery);
+            const packagesMap = {};
+            packagesSnapshot.docs.forEach(doc => {
+                packagesMap[doc.id] = { id: doc.id, ...doc.data() };
+            });
+            
+            // Fallback to local packages if Firestore is empty
+            if (Object.keys(packagesMap).length === 0) {
+                PACKAGES_DATA.forEach(pkg => {
+                    packagesMap[pkg.id] = pkg;
+                });
+            }
+
             // Query your Firebase 'providers' collection
             const providersQuery = collection(db, 'providers');
             const snapshot = await getDocs(providersQuery);
 
+            const loadedDetailers = await Promise.all(snapshot.docs.map(async (docSnapshot) => {
+                const data = docSnapshot.data();
 
-            const loadedDetailers = snapshot.docs.map(doc => {
-                const data = doc.data();
-
-                // Filter only active services
-                const activeServices = data.services
-                    ? data.services.filter(service => service.active !== false)
-                    : [];
+                // Load packages for this provider
+                const offeredPackages = data.offeredPackages || [];
+                const customPrices = data.packagePrices || {};
+                const packages = offeredPackages
+                    .map(pkgId => {
+                        const pkg = packagesMap[pkgId];
+                        if (!pkg) return undefined;
+                        // Merge custom prices if they exist
+                        if (customPrices[pkgId]) {
+                            return {
+                                ...pkg,
+                                priceMin: customPrices[pkgId].priceMin,
+                                priceMax: customPrices[pkgId].priceMax
+                            };
+                        }
+                        return pkg;
+                    })
+                    .filter(pkg => pkg !== undefined);
 
                 // Calculate real distance if both user and provider have coordinates
                 let distance = 999; // Default high value
@@ -589,18 +618,19 @@ export default function BrnnoMarketplace() {
                     'Professional mobile detailing service. Background checked and insured.';
 
                 return {
-                    id: doc.id,
+                    id: docSnapshot.id,
                     userId: data.userId, // Provider's user UID
                     name: data.businessName || 'Professional Detailer',
                     ownerName: data.ownerName,
                     rating: data.rating || 4.8,
                     reviews: data.reviewCount || 150,
                     distance: distance,
-                    available: data.status === 'approved' && activeServices.length > 0, // Must be approved and have active services!
-                    price: getStartingPrice(activeServices),
+                    available: data.status === 'approved' && packages.length > 0, // Must be approved and have packages!
+                    price: getStartingPriceFromPackages(packages),
                     image: data.image || null,
                     about: aboutText,
-                    services: activeServices,
+                    packages: packages, // New: packages array
+                    addOns: data.addOns || [], // Available add-ons
                     photos: data.portfolio || [],
                     availableTimes: availableTimes,
                     status: data.status,
@@ -612,13 +642,13 @@ export default function BrnnoMarketplace() {
                     defaultAvailability: data.defaultAvailability,
                     dateOverrides: data.dateOverrides || {},
                     coordinates: data.coordinates,
-                    hasActiveServices: activeServices.length > 0
+                    hasPackages: packages.length > 0
                 };
-            });
+            }));
 
-            // Only show providers that are APPROVED and have active services
+            // Only show providers that are APPROVED and have packages
             let availableDetailers = loadedDetailers.filter(d =>
-                d.hasActiveServices && d.status === 'approved'
+                d.hasPackages && d.status === 'approved'
             );
 
             // Sort by distance (closest first) by default
@@ -637,6 +667,12 @@ export default function BrnnoMarketplace() {
         if (!services || services.length === 0) return 65;
         const prices = services.map(s => s.price || 0).filter(p => p > 0);
         return prices.length > 0 ? Math.min(...prices) : 65;
+    }
+
+    function getStartingPriceFromPackages(packages) {
+        if (!packages || packages.length === 0) return 150;
+        const prices = packages.map(pkg => pkg.priceMin || 0).filter(p => p > 0);
+        return prices.length > 0 ? Math.min(...prices) : 150;
     }
 
     function generateAvailableTimes(availability) {
@@ -746,6 +782,8 @@ export default function BrnnoMarketplace() {
                     ownerName: signupData.name,
                     email: signupData.email,
                     status: 'pending', // Requires admin approval
+                    offeredPackages: [], // Will be initialized on approval
+                    addOns: [], // Will be initialized on approval
                     createdAt: serverTimestamp(),
                     updatedAt: serverTimestamp()
                 });
@@ -849,6 +887,8 @@ export default function BrnnoMarketplace() {
                         ownerName: result.user.displayName,
                         email: result.user.email,
                         status: 'pending',
+                        offeredPackages: [], // Will be initialized on approval
+                        addOns: [], // Will be initialized on approval
                         createdAt: serverTimestamp(),
                         updatedAt: serverTimestamp()
                     });
@@ -1361,8 +1401,10 @@ function SignupModal({ signupData, setSignupData, onEmailSignup, onGoogleSignup,
 // ==================== BOOKING SIDEBAR COMPONENT ====================
 function BookingSidebar({
     detailer,
-    selectedServices: selectedServicesProp,
-    setSelectedServices: setSelectedServicesProp,
+    selectedPackage: selectedPackageProp,
+    setSelectedPackage: setSelectedPackageProp,
+    selectedAddOns: selectedAddOnsProp,
+    setSelectedAddOns: setSelectedAddOnsProp,
     selectedDate: selectedDateProp,
     setSelectedDate: setSelectedDateProp,
     selectedTime: selectedTimeProp,
@@ -1377,19 +1419,19 @@ function BookingSidebar({
     onBook // backward compatibility
 }) {
     // Local state fallbacks if parent doesn't control these
-    const [selectedServicesState, setSelectedServicesState] = useState(selectedServicesProp || []);
+    const [selectedPackageState, setSelectedPackageState] = useState(selectedPackageProp || null);
+    const [selectedAddOnsState, setSelectedAddOnsState] = useState(selectedAddOnsProp || []);
     const [selectedTimeState, setSelectedTimeState] = useState(selectedTimeProp || '');
     const [selectedDateState, setSelectedDateState] = useState(selectedDateProp || '');
     const [isBookingState, setIsBookingState] = useState(!!isBookingProp);
-
-    const [serviceSearch, setServiceSearch] = useState('');
-    const [selectedCategory, setSelectedCategory] = useState('all');
-    const [servicesExpanded, setServicesExpanded] = useState(true);
+    const [packageExpanded, setPackageExpanded] = useState(true);
     const [showPayment, setShowPayment] = useState(false);
     const [bookingData, setBookingData] = useState(null);
 
-    const selectedServices = selectedServicesProp ?? selectedServicesState;
-    const setSelectedServices = setSelectedServicesProp ?? setSelectedServicesState;
+    const selectedPackage = selectedPackageProp ?? selectedPackageState;
+    const setSelectedPackage = setSelectedPackageProp ?? setSelectedPackageState;
+    const selectedAddOns = selectedAddOnsProp ?? selectedAddOnsState;
+    const setSelectedAddOns = setSelectedAddOnsProp ?? setSelectedAddOnsState;
     const selectedTime = selectedTimeProp ?? selectedTimeState;
     const setSelectedTime = setSelectedTimeProp ?? setSelectedTimeState;
     const selectedDate = selectedDateProp ?? selectedDateState;
@@ -1399,16 +1441,36 @@ function BookingSidebar({
     // Get current user from auth if not provided
     const currentUser = currentUserProp || auth.currentUser;
 
-    // Calculate total price from selected services
+    // Available packages from detailer
+    const availablePackages = detailer.packages || [];
+    
+    // Available add-ons (from detailer or all add-ons)
+    const availableAddOnsList = detailer.addOns 
+        ? ADD_ONS.filter(addon => detailer.addOns.includes(addon.id))
+        : ADD_ONS;
+
+    // Calculate total price: package (use average of min/max) + add-ons
     const totalPrice = useMemo(() => {
-        return selectedServices.reduce((sum, service) => sum + (service.price || 0), 0);
-    }, [selectedServices]);
+        let price = 0;
+        if (selectedPackage) {
+            // Use average of price range
+            price = Math.round((selectedPackage.priceMin + selectedPackage.priceMax) / 2);
+        }
+        // Add selected add-ons
+        selectedAddOns.forEach(addOnId => {
+            const addOn = ADD_ONS.find(a => a.id === addOnId);
+            if (addOn) {
+                price += addOn.price;
+            }
+        });
+        return price;
+    }, [selectedPackage, selectedAddOns]);
 
     useEffect(() => {
-        // Don't pre-select - let user choose services
-        setSelectedCategory('all');
-        setServiceSearch('');
-        setServicesExpanded(true);
+        // Reset selection when detailer changes
+        setSelectedPackage(null);
+        setSelectedAddOns([]);
+        setPackageExpanded(true);
     }, [detailer]);
 
     // Calculate available times based on selected date
@@ -1442,29 +1504,14 @@ function BookingSidebar({
         }
     }, [selectedDate, availableTimesForSelectedDate]);
 
-    const categories = useMemo(() => {
-        const unique = new Set((detailer.services || []).map(s => s.category || 'Other'));
-        return ['all', ...Array.from(unique)];
-    }, [detailer.services]);
-
-    const filteredServices = useMemo(() => {
-        if (!detailer.services) return [];
-        return detailer.services.filter((service) => {
-            const matchesCategory = selectedCategory === 'all' || service.category === selectedCategory;
-            const matchesSearch = service.name?.toLowerCase().includes(serviceSearch.toLowerCase())
-                || service.description?.toLowerCase().includes(serviceSearch.toLowerCase());
-            return matchesCategory && matchesSearch;
-        });
-    }, [detailer.services, selectedCategory, serviceSearch]);
-
-    const servicesGrouped = useMemo(() => {
-        return filteredServices.reduce((acc, service) => {
-            const category = service.category || 'Other';
-            if (!acc[category]) acc[category] = [];
-            acc[category].push(service);
-            return acc;
-        }, {});
-    }, [filteredServices]);
+    // Toggle add-on selection
+    const toggleAddOn = (addOnId) => {
+        setSelectedAddOns(prev => 
+            prev.includes(addOnId) 
+                ? prev.filter(id => id !== addOnId)
+                : [...prev, addOnId]
+        );
+    };
 
     async function handleBookNow() {
         if (!currentUser) {
@@ -1487,8 +1534,8 @@ function BookingSidebar({
             console.warn('Could not check if user is provider:', err);
         }
 
-        if (!selectedServices || selectedServices.length === 0) {
-            alert('Please select at least one service');
+        if (!selectedPackage) {
+            alert('Please select a package');
             return;
         }
 
@@ -1529,19 +1576,21 @@ function BookingSidebar({
             providerId: detailer.id,
             providerUserId: actualProviderUserId,
             providerName: detailer.name,
-            // Store services as array
-            services: selectedServices.map(s => ({
-                id: s.id,
-                slug: s.slug,
-                name: s.name,
-                price: s.price,
-                duration: s.duration,
-                category: s.category
-            })),
+            // Store package data
+            packageId: selectedPackage.id,
+            packageName: selectedPackage.name,
+            packagePriceRange: {
+                min: selectedPackage.priceMin,
+                max: selectedPackage.priceMax
+            },
+            exteriorServices: selectedPackage.exteriorServices || [],
+            interiorServices: selectedPackage.interiorServices || [],
+            addOns: selectedAddOns.map(addOnId => {
+                const addOn = ADD_ONS.find(a => a.id === addOnId);
+                return addOn ? { id: addOn.id, name: addOn.name, price: addOn.price } : null;
+            }).filter(Boolean),
             // Keep serviceName for backward compatibility
-            serviceName: selectedServices.length === 1 
-                ? selectedServices[0].name 
-                : `${selectedServices.length} Services`,
+            serviceName: selectedPackage.name,
             // Store total price
             price: totalPrice,
             date: selectedDate,
@@ -1591,12 +1640,8 @@ function BookingSidebar({
                 console.warn('Failed to create notifications:', notifError);
             }
 
-            const serviceText = bookingData.services && bookingData.services.length > 0
-                ? (bookingData.services.length === 1 
-                    ? bookingData.services[0].name 
-                    : `${bookingData.services.length} services`)
-                : bookingData.serviceName || 'service';
-            alert(`Booking confirmed! Your ${serviceText} ${bookingData.services?.length === 1 ? 'is' : 'are'} scheduled for ${bookingData.date} at ${bookingData.time}.`);
+            const serviceText = bookingData.packageName || bookingData.serviceName || 'service';
+            alert(`Booking confirmed! Your ${serviceText} is scheduled for ${bookingData.date} at ${bookingData.time}.`);
 
             setShowPayment(false);
             setBookingData(null);
@@ -1640,9 +1685,7 @@ function BookingSidebar({
     // Contact handlers
     const handleEmail = () => {
         if (!detailer?.email) return;
-        const serviceText = selectedServices.length > 0 
-            ? (selectedServices.length === 1 ? selectedServices[0].name : 'your services')
-            : 'your services';
+        const serviceText = selectedPackage ? selectedPackage.name : 'your booking';
         window.location.href = `mailto:${detailer.email}?subject=Question about ${serviceText}`;
     };
 
@@ -1741,36 +1784,45 @@ function BookingSidebar({
                 </div>
             </div>
 
-            {/* Select Service */}
+            {/* Select Package */}
             <div className="mb-6">
                 <div className="flex items-center justify-between mb-4">
-                    <h4 className="font-semibold text-gray-900">Select Services</h4>
-                    {selectedServices.length > 0 && (
+                    <h4 className="font-semibold text-gray-900">Select Package</h4>
+                    {selectedPackage && (
                         <button
-                            onClick={() => setServicesExpanded(!servicesExpanded)}
+                            onClick={() => setPackageExpanded(!packageExpanded)}
                             className="text-sm text-blue-600 hover:text-blue-700 font-medium"
                         >
-                            {servicesExpanded ? 'Hide' : 'Show'} Services
+                            {packageExpanded ? 'Hide' : 'Show'} Packages
                         </button>
                     )}
                 </div>
 
-                {/* Show selected services summary when collapsed */}
-                {selectedServices.length > 0 && !servicesExpanded && (
+                {/* Show selected package summary when collapsed */}
+                {selectedPackage && !packageExpanded && (
                     <div className="mb-4 space-y-2">
-                        {selectedServices.map((service, idx) => (
-                            <div key={service.slug || service.id || idx} className="p-3 bg-blue-50 border-2 border-blue-200 rounded-lg">
-                                <div className="flex items-center justify-between">
-                                    <div>
-                                        <div className="font-semibold text-gray-900 text-sm">{service.name}</div>
-                                        <div className="text-xs text-gray-500">{service.duration}</div>
-                                    </div>
-                                    <div className="text-right">
-                                        <div className="font-bold text-gray-900">${service.price}</div>
-                                    </div>
+                        <div className="p-4 bg-blue-50 border-2 border-blue-200 rounded-lg">
+                            <div className="flex items-center justify-between mb-2">
+                                <div>
+                                    <div className="font-semibold text-gray-900">{selectedPackage.name}</div>
+                                    <div className="text-xs text-gray-500">{selectedPackage.estimatedHours} hours</div>
+                                </div>
+                                <div className="text-right">
+                                    <div className="font-bold text-gray-900">${selectedPackage.priceMin} - ${selectedPackage.priceMax}</div>
                                 </div>
                             </div>
-                        ))}
+                            {selectedAddOns.length > 0 && (
+                                <div className="mt-2 pt-2 border-t border-blue-200">
+                                    <div className="text-xs text-gray-600 mb-1">Add-ons:</div>
+                                    {selectedAddOns.map(addOnId => {
+                                        const addOn = ADD_ONS.find(a => a.id === addOnId);
+                                        return addOn ? (
+                                            <div key={addOnId} className="text-xs text-gray-700">+ {addOn.name} (${addOn.price})</div>
+                                        ) : null;
+                                    })}
+                                </div>
+                            )}
+                        </div>
                         <div className="p-3 bg-gray-50 border-2 border-gray-200 rounded-lg">
                             <div className="flex items-center justify-between">
                                 <span className="font-semibold text-gray-900 text-sm">Total:</span>
@@ -1778,105 +1830,136 @@ function BookingSidebar({
                             </div>
                         </div>
                         <button
-                            onClick={() => setServicesExpanded(true)}
+                            onClick={() => setPackageExpanded(true)}
                             className="w-full text-xs text-blue-600 hover:text-blue-700 font-medium"
                         >
-                            Change Services
+                            Change Package
                         </button>
                     </div>
                 )}
 
-                {/* Services list - only show when expanded or no services selected */}
-                {(servicesExpanded || selectedServices.length === 0) && (
-                    <>
-                        <div className="flex flex-wrap items-center gap-2 mb-3">
-                            {categories.map((cat) => (
-                                <button
-                                    key={cat}
-                                    onClick={() => setSelectedCategory(cat)}
-                                    className={`px-3 py-1 rounded-full text-xs font-medium transition-colors ${selectedCategory === cat ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}
-                                >
-                                    {cat === 'all' ? 'All Services' : cat.replace(/-/g, ' ')}
-                                </button>
-                            ))}
-                        </div>
-
-                        <div className="mb-4">
-                            <div className="relative">
-                                <input
-                                    type="text"
-                                    value={serviceSearch}
-                                    onChange={(e) => setServiceSearch(e.target.value)}
-                                    placeholder="Search services..."
-                                    className="w-full px-4 py-2 border-2 border-gray-200 rounded-lg focus:border-blue-600 focus:outline-none text-sm"
-                                />
-                                <Search className="w-4 h-4 text-gray-400 absolute right-3 top-1/2 -translate-y-1/2" />
-                            </div>
-                        </div>
-
-                        <div className="space-y-3 max-h-60 overflow-y-auto pr-1">
-                            {Object.keys(servicesGrouped).length === 0 && (
-                                <p className="text-sm text-gray-500">No services match your filters.</p>
-                            )}
-                            {Object.entries(servicesGrouped).map(([category, services]) => (
-                                <div key={category}>
-                                    <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">
-                                        {category.replace(/-/g, ' ')}
-                                    </p>
-                                    <div className="space-y-2">
-                                        {services.map((service) => {
-                                            const isSelected = selectedServices.some(s => 
-                                                (s.slug && s.slug === service.slug) || 
-                                                (s.id && s.id === service.id) ||
-                                                (s.name && s.name === service.name)
-                                            );
-                                            return (
-                                                <div
-                                                    key={service.id || service.slug || service.name}
-                                                    onClick={() => {
-                                                        if (isSelected) {
-                                                            // Remove service
-                                                            setSelectedServices(prev => prev.filter(s => 
-                                                                (s.slug !== service.slug) && 
-                                                                (s.id !== service.id) &&
-                                                                (s.name !== service.name)
-                                                            ));
-                                                        } else {
-                                                            // Add service
-                                                            setSelectedServices(prev => [...prev, service]);
-                                                        }
-                                                    }}
-                                                    className={`w-full text-left px-3 py-2 border-2 rounded-lg transition-all cursor-pointer ${
-                                                        isSelected 
-                                                            ? 'border-blue-600 bg-blue-50' 
-                                                            : 'border-gray-200 hover:border-blue-300'
-                                                    }`}
-                                                >
-                                                    <div className="flex items-center justify-between gap-2">
-                                                        <div className="flex items-center gap-2 flex-1 min-w-0">
-                                                            <input
-                                                                type="checkbox"
-                                                                checked={isSelected}
-                                                                onChange={() => {}} // Handled by parent div onClick
-                                                                className="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500 flex-shrink-0"
-                                                            />
-                                                            <div className="flex-1 min-w-0">
-                                                                <div className="font-semibold text-gray-900 text-sm truncate">{service.name}</div>
-                                                                <div className="text-xs text-gray-500">{service.duration}</div>
-                                                            </div>
-                                                        </div>
-                                                        <div className="text-right flex-shrink-0">
-                                                            <div className="font-bold text-gray-900 text-sm">${service.price}</div>
-                                                        </div>
+                {/* Packages list - only show when expanded or no package selected */}
+                {(packageExpanded || !selectedPackage) && (
+                    <div className="space-y-3">
+                        {availablePackages.length === 0 ? (
+                            <p className="text-sm text-gray-500">No packages available.</p>
+                        ) : (
+                            availablePackages.map((pkg) => {
+                                const isSelected = selectedPackage?.id === pkg.id;
+                                return (
+                                    <div
+                                        key={pkg.id}
+                                        onClick={() => setSelectedPackage(pkg)}
+                                        className={`w-full text-left p-4 border-2 rounded-lg transition-all cursor-pointer ${
+                                            isSelected 
+                                                ? 'border-blue-600 bg-blue-50' 
+                                                : 'border-gray-200 hover:border-blue-300'
+                                        }`}
+                                    >
+                                        <div className="flex items-start justify-between gap-3 mb-2">
+                                            <div className="flex items-center gap-3 flex-1 min-w-0">
+                                                <input
+                                                    type="radio"
+                                                    checked={isSelected}
+                                                    onChange={() => setSelectedPackage(pkg)}
+                                                    className="w-4 h-4 text-blue-600 border-gray-300 focus:ring-blue-500 flex-shrink-0 mt-1"
+                                                />
+                                                <div className="flex-1 min-w-0">
+                                                    <div className="font-semibold text-gray-900 text-base mb-1">{pkg.name}</div>
+                                                    <div className="text-xs text-gray-500 mb-2">{pkg.description}</div>
+                                                    <div className="text-xs text-gray-600 mb-2">
+                                                        <Clock className="w-3 h-3 inline mr-1" />
+                                                        {pkg.estimatedHours} hours
                                                     </div>
                                                 </div>
-                                            );
-                                        })}
+                                            </div>
+                                            <div className="text-right flex-shrink-0">
+                                                <div className="font-bold text-gray-900">${pkg.priceMin}</div>
+                                                <div className="text-xs text-gray-500">- ${pkg.priceMax}</div>
+                                            </div>
+                                        </div>
+                                        
+                                        {/* Show services included when selected */}
+                                        {isSelected && (
+                                            <div className="mt-3 pt-3 border-t border-blue-200">
+                                                <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+                                                    <div>
+                                                        <div className="font-semibold text-gray-700 mb-1">Exterior:</div>
+                                                        <ul className="space-y-1 text-gray-600">
+                                                            {pkg.exteriorServices.slice(0, 4).map((svc, idx) => (
+                                                                <li key={idx} className="flex items-start">
+                                                                    <CheckCircle2 className="w-3 h-3 text-green-500 mr-1 mt-0.5 flex-shrink-0" />
+                                                                    <span>{svc}</span>
+                                                                </li>
+                                                            ))}
+                                                            {pkg.exteriorServices.length > 4 && (
+                                                                <li className="text-gray-500">+ {pkg.exteriorServices.length - 4} more</li>
+                                                            )}
+                                                        </ul>
+                                                    </div>
+                                                    <div>
+                                                        <div className="font-semibold text-gray-700 mb-1">Interior:</div>
+                                                        <ul className="space-y-1 text-gray-600">
+                                                            {pkg.interiorServices.slice(0, 4).map((svc, idx) => (
+                                                                <li key={idx} className="flex items-start">
+                                                                    <CheckCircle2 className="w-3 h-3 text-green-500 mr-1 mt-0.5 flex-shrink-0" />
+                                                                    <span>{svc}</span>
+                                                                </li>
+                                                            ))}
+                                                            {pkg.interiorServices.length > 4 && (
+                                                                <li className="text-gray-500">+ {pkg.interiorServices.length - 4} more</li>
+                                                            )}
+                                                        </ul>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        )}
                                     </div>
-                                </div>
-                            ))}
+                                );
+                            })
+                        )}
+                    </div>
+                )}
+
+                {/* Add-ons section - only show when package is selected */}
+                {selectedPackage && availableAddOnsList.length > 0 && (
+                    <div className="mt-4 pt-4 border-t border-gray-200">
+                        <h5 className="font-semibold text-gray-900 mb-3 text-sm">Add-ons (Optional)</h5>
+                        <div className="space-y-2">
+                            {availableAddOnsList.map((addOn) => {
+                                const isSelected = selectedAddOns.includes(addOn.id);
+                                return (
+                                    <div
+                                        key={addOn.id}
+                                        onClick={() => toggleAddOn(addOn.id)}
+                                        className={`w-full text-left px-3 py-2 border-2 rounded-lg transition-all cursor-pointer ${
+                                            isSelected 
+                                                ? 'border-blue-600 bg-blue-50' 
+                                                : 'border-gray-200 hover:border-blue-300'
+                                        }`}
+                                    >
+                                        <div className="flex items-center justify-between gap-2">
+                                            <div className="flex items-center gap-2 flex-1 min-w-0">
+                                                <input
+                                                    type="checkbox"
+                                                    checked={isSelected}
+                                                    onChange={() => toggleAddOn(addOn.id)}
+                                                    className="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500 flex-shrink-0"
+                                                />
+                                                <div className="flex-1 min-w-0">
+                                                    <div className="font-semibold text-gray-900 text-sm">{addOn.name}</div>
+                                                    <div className="text-xs text-gray-500">{addOn.description}</div>
+                                                </div>
+                                            </div>
+                                            <div className="text-right flex-shrink-0">
+                                                <div className="font-bold text-gray-900 text-sm">+${addOn.price}</div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                );
+                            })}
                         </div>
-                    </>
+                    </div>
                 )}
             </div>
 
@@ -1920,15 +2003,22 @@ function BookingSidebar({
                 </div>
 
                 {/* Total */}
-                {selectedServices.length > 0 && (
+                {selectedPackage && (
                     <div className="p-4 bg-gray-50 rounded-lg mb-4">
                         <div className="mb-2 space-y-1">
-                            {selectedServices.map((service, idx) => (
-                                <div key={service.slug || service.id || idx} className="flex items-center justify-between text-sm">
-                                    <span className="text-gray-600">{service.name}:</span>
-                                    <span className="text-gray-900 font-medium">${service.price}</span>
-                                </div>
-                            ))}
+                            <div className="flex items-center justify-between text-sm">
+                                <span className="text-gray-600">{selectedPackage.name}:</span>
+                                <span className="text-gray-900 font-medium">${Math.round((selectedPackage.priceMin + selectedPackage.priceMax) / 2)}</span>
+                            </div>
+                            {selectedAddOns.map(addOnId => {
+                                const addOn = ADD_ONS.find(a => a.id === addOnId);
+                                return addOn ? (
+                                    <div key={addOnId} className="flex items-center justify-between text-sm">
+                                        <span className="text-gray-600">+ {addOn.name}:</span>
+                                        <span className="text-gray-900 font-medium">${addOn.price}</span>
+                                    </div>
+                                ) : null;
+                            })}
                         </div>
                         <div className="flex items-center justify-between pt-2 border-t border-gray-300">
                             <span className="text-gray-600 font-medium">Total:</span>
@@ -1940,16 +2030,14 @@ function BookingSidebar({
                 {/* Book Button */}
                 <button
                     onClick={onBookNow || handleBookNow}
-                    disabled={isBooking || selectedServices.length === 0 || !selectedTime || !selectedDate}
+                    disabled={isBooking || !selectedPackage || !selectedTime || !selectedDate}
                     className="w-full bg-blue-600 text-white py-4 rounded-xl font-bold text-lg hover:bg-blue-700 transition-colors shadow-lg disabled:bg-gray-300 disabled:cursor-not-allowed mb-4"
                 >
                     {isBooking 
                         ? 'Booking...' 
-                        : selectedServices.length === 0 
-                            ? 'Select Services' 
-                            : selectedServices.length === 1
-                                ? `Book ${selectedServices[0].name}`
-                                : `Book ${selectedServices.length} Services`
+                        : !selectedPackage
+                            ? 'Select Package' 
+                            : `Book ${selectedPackage.name}`
                     }
                 </button>
             </div>
@@ -1957,15 +2045,22 @@ function BookingSidebar({
             {/* Mobile: Sticky footer with date/time and book button */}
             <div className="lg:hidden sticky bottom-0 bg-white border-t border-gray-200 p-4 -mx-6 -mb-6 mt-6 shadow-lg">
                 {/* Total */}
-                {selectedServices.length > 0 && (
+                {selectedPackage && (
                     <div className="mb-3 p-3 bg-gray-50 rounded-lg">
                         <div className="mb-2 space-y-1">
-                            {selectedServices.map((service, idx) => (
-                                <div key={service.slug || service.id || idx} className="flex items-center justify-between text-xs">
-                                    <span className="text-gray-600 truncate pr-2">{service.name}:</span>
-                                    <span className="text-gray-900 font-medium">${service.price}</span>
-                                </div>
-                            ))}
+                            <div className="flex items-center justify-between text-xs">
+                                <span className="text-gray-600 truncate pr-2">{selectedPackage.name}:</span>
+                                <span className="text-gray-900 font-medium">${Math.round((selectedPackage.priceMin + selectedPackage.priceMax) / 2)}</span>
+                            </div>
+                            {selectedAddOns.map(addOnId => {
+                                const addOn = ADD_ONS.find(a => a.id === addOnId);
+                                return addOn ? (
+                                    <div key={addOnId} className="flex items-center justify-between text-xs">
+                                        <span className="text-gray-600 truncate pr-2">+ {addOn.name}:</span>
+                                        <span className="text-gray-900 font-medium">${addOn.price}</span>
+                                    </div>
+                                ) : null;
+                            })}
                         </div>
                         <div className="flex items-center justify-between pt-2 border-t border-gray-300">
                             <span className="text-gray-600 font-medium text-sm">Total:</span>
@@ -2014,16 +2109,14 @@ function BookingSidebar({
                 {/* Book Button */}
                 <button
                     onClick={onBookNow || handleBookNow}
-                    disabled={isBooking || selectedServices.length === 0 || !selectedTime || !selectedDate}
+                    disabled={isBooking || !selectedPackage || !selectedTime || !selectedDate}
                     className="w-full bg-blue-600 text-white py-3 rounded-xl font-bold text-base hover:bg-blue-700 transition-colors shadow-lg disabled:bg-gray-300 disabled:cursor-not-allowed"
                 >
                     {isBooking 
                         ? 'Booking...' 
-                        : selectedServices.length === 0 
-                            ? 'Select Services' 
-                            : selectedServices.length === 1
-                                ? `Book ${selectedServices[0].name}`
-                                : `Book ${selectedServices.length} Services`
+                        : !selectedPackage
+                            ? 'Select Package' 
+                            : `Book ${selectedPackage.name}`
                     }
                 </button>
             </div>
@@ -2413,23 +2506,64 @@ function DetailerProfilePage({ detailer, answers, address, setAddress, setAnswer
 
                             {activeTab === 'services' && (
                                 <div>
-                                    <h3 className="font-semibold text-gray-900 mb-4 text-lg">Services</h3>
-                                    <div className="space-y-2 sm:space-y-3">
-                                        {detailer.services.map((service, idx) => (
-                                            <div
-                                                key={idx}
-                                                className="flex items-center justify-between p-3 sm:p-4 border border-gray-200 rounded-lg hover:border-blue-300 hover:shadow-sm transition-all"
-                                            >
-                                                <div className="flex-1 min-w-0 pr-2">
-                                                    <div className="font-semibold text-gray-900 text-sm sm:text-base truncate">{service.name}</div>
-                                                    <div className="text-xs sm:text-sm text-gray-500">{service.duration}</div>
+                                    <h3 className="font-semibold text-gray-900 mb-4 text-lg">Packages</h3>
+                                    {detailer.packages && detailer.packages.length > 0 ? (
+                                        <div className="space-y-4">
+                                            {detailer.packages.map((pkg) => (
+                                                <div
+                                                    key={pkg.id}
+                                                    className="p-4 border-2 border-gray-200 rounded-lg hover:border-blue-300 hover:shadow-md transition-all"
+                                                >
+                                                    <div className="flex items-start justify-between mb-3">
+                                                        <div className="flex-1 min-w-0 pr-2">
+                                                            <div className="font-semibold text-gray-900 text-base mb-1">{pkg.name}</div>
+                                                            <div className="text-xs text-gray-500 mb-2">{pkg.description}</div>
+                                                            <div className="text-xs text-gray-600 flex items-center gap-1">
+                                                                <Clock className="w-3 h-3" />
+                                                                {pkg.estimatedHours} hours
+                                                            </div>
+                                                        </div>
+                                                        <div className="text-right flex-shrink-0">
+                                                            <div className="text-lg font-bold text-blue-600">${pkg.priceMin}</div>
+                                                            <div className="text-xs text-gray-500">- ${pkg.priceMax}</div>
+                                                        </div>
+                                                    </div>
+                                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3 pt-3 border-t border-gray-200">
+                                                        <div>
+                                                            <div className="text-xs font-semibold text-gray-700 mb-1">Exterior Services:</div>
+                                                            <ul className="text-xs text-gray-600 space-y-1">
+                                                                {pkg.exteriorServices.slice(0, 3).map((svc, idx) => (
+                                                                    <li key={idx} className="flex items-start">
+                                                                        <CheckCircle2 className="w-3 h-3 text-green-500 mr-1 mt-0.5 flex-shrink-0" />
+                                                                        <span>{svc}</span>
+                                                                    </li>
+                                                                ))}
+                                                                {pkg.exteriorServices.length > 3 && (
+                                                                    <li className="text-gray-500">+ {pkg.exteriorServices.length - 3} more</li>
+                                                                )}
+                                                            </ul>
+                                                        </div>
+                                                        <div>
+                                                            <div className="text-xs font-semibold text-gray-700 mb-1">Interior Services:</div>
+                                                            <ul className="text-xs text-gray-600 space-y-1">
+                                                                {pkg.interiorServices.slice(0, 3).map((svc, idx) => (
+                                                                    <li key={idx} className="flex items-start">
+                                                                        <CheckCircle2 className="w-3 h-3 text-green-500 mr-1 mt-0.5 flex-shrink-0" />
+                                                                        <span>{svc}</span>
+                                                                    </li>
+                                                                ))}
+                                                                {pkg.interiorServices.length > 3 && (
+                                                                    <li className="text-gray-500">+ {pkg.interiorServices.length - 3} more</li>
+                                                                )}
+                                                            </ul>
+                                                        </div>
+                                                    </div>
                                                 </div>
-                                                <div className="text-right flex-shrink-0">
-                                                    <div className="text-xl sm:text-2xl font-bold text-blue-600">${service.price}</div>
-                                                </div>
-                                            </div>
-                                        ))}
-                                    </div>
+                                            ))}
+                                        </div>
+                                    ) : (
+                                        <p className="text-gray-500">No packages available.</p>
+                                    )}
                                 </div>
                             )}
 
@@ -3945,9 +4079,10 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
     const [bookings, setBookings] = useState([]);
     const [providerData, setProviderData] = useState(null);
     const [userData, setUserData] = useState(null);
-    const [services, setServices] = useState([]);
-    const [editingService, setEditingService] = useState(null);
-    const [showEditModal, setShowEditModal] = useState(false);
+    const [availablePackages, setAvailablePackages] = useState([]);
+    const [selectedPackages, setSelectedPackages] = useState([]);
+    const [selectedAddOns, setSelectedAddOns] = useState([]);
+    const [packagePrices, setPackagePrices] = useState({}); // { "package-id": { priceMin: X, priceMax: Y } }
     const [weeklySchedule, setWeeklySchedule] = useState({});
     const [blackoutDates, setBlackoutDates] = useState([]);
     const [selectedBlackoutDate, setSelectedBlackoutDate] = useState('');
@@ -4109,7 +4244,9 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
             if (!providerSnapshot.empty) {
                 const data = providerSnapshot.docs[0].data();
                 setProviderData(data);
-                setServices(data.services || []); // Load services
+                setSelectedPackages(data.offeredPackages || []); // Load offered packages
+                setSelectedAddOns(data.addOns || []); // Load add-ons
+                setPackagePrices(data.packagePrices || {}); // Load custom package prices
                 
                 // Initialize edited profile data
                 setEditedProviderProfile({
@@ -4144,6 +4281,17 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                     .filter(date => overrides[date]?.type === 'unavailable')
                     .map(date => ({ date, type: 'unavailable' }));
                 setBlackoutDates(blackouts);
+            }
+
+            // Load packages from Firestore
+            const packagesQuery = collection(db, 'packages');
+            const packagesSnapshot = await getDocs(packagesQuery);
+            if (!packagesSnapshot.empty) {
+                const packages = packagesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                setAvailablePackages(packages);
+            } else {
+                // Fallback to local packages
+                setAvailablePackages(PACKAGES_DATA);
             }
 
             // Load bookings for this provider
@@ -4551,10 +4699,9 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                 updatedAt: serverTimestamp()
             };
             
-            // If provider doesn't have services, initialize with default services
-            if (!providerData.services || providerData.services.length === 0) {
-                const defaultServices = convertServices(SERVICES_JSON);
-                updateData.services = defaultServices;
+            // If provider doesn't have packages, initialize with all packages
+            if (!providerData.offeredPackages || providerData.offeredPackages.length === 0) {
+                updateData.offeredPackages = PACKAGES_DATA.map(pkg => pkg.id);
             }
             
             // Perform the update
@@ -4664,13 +4811,13 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                             History ({completedBookings.length})
                         </button>
                         <button
-                            onClick={() => setActiveTab('services')}
-                            className={`py-4 border-b-2 font-semibold transition-colors ${activeTab === 'services'
+                            onClick={() => setActiveTab('packages')}
+                            className={`py-4 border-b-2 font-semibold transition-colors ${activeTab === 'packages'
                                 ? 'border-blue-600 text-blue-600'
                                 : 'border-transparent text-gray-600 hover:text-gray-900'
                                 }`}
                         >
-                            Services
+                            Packages
                         </button>
                         <button
                             onClick={() => setActiveTab('availability')}
@@ -4768,9 +4915,32 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                                                     )}
                                                 </div>
 
-                                                {/* Service & Vehicle */}
+                                                {/* Package/Service & Vehicle */}
                                                 <div className="mb-4">
-                                                    {booking.services && booking.services.length > 0 ? (
+                                                    {booking.packageName ? (
+                                                        <div className="space-y-2 mb-2">
+                                                            <div className="flex items-center justify-between">
+                                                                <p className="text-lg font-semibold text-gray-900">{booking.packageName}</p>
+                                                                {booking.packagePriceRange && (
+                                                                    <span className="text-sm font-medium text-gray-600">
+                                                                        ${booking.packagePriceRange.min} - ${booking.packagePriceRange.max}
+                                                                    </span>
+                                                                )}
+                                                            </div>
+                                                            {booking.addOns && booking.addOns.length > 0 && (
+                                                                <div className="ml-4 space-y-1">
+                                                                    {booking.addOns.map((addOn, idx) => (
+                                                                        <div key={idx} className="flex items-center justify-between text-sm">
+                                                                            <span className="text-gray-600">+ {addOn.name}</span>
+                                                                            {addOn.price && (
+                                                                                <span className="text-gray-600">${addOn.price}</span>
+                                                                            )}
+                                                                        </div>
+                                                                    ))}
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    ) : booking.services && booking.services.length > 0 ? (
                                                         <div className="space-y-2 mb-2">
                                                             {booking.services.map((service, idx) => (
                                                                 <div key={idx} className="flex items-center justify-between">
@@ -4782,7 +4952,7 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                                                             ))}
                                                         </div>
                                                     ) : (
-                                                        <p className="text-lg font-semibold text-gray-900 mb-2">{booking.service}</p>
+                                                        <p className="text-lg font-semibold text-gray-900 mb-2">{booking.service || booking.serviceName || 'Service'}</p>
                                                     )}
                                                     <div className="flex items-center gap-2 text-sm text-gray-600">
                                                         <Car className="w-4 h-4" />
@@ -4906,7 +5076,25 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                                                     </div>
                                                 )}
 
-                                                {booking.services && booking.services.length > 0 ? (
+                                                {booking.packageName ? (
+                                                    <div className="mb-2">
+                                                        <p className="text-gray-600 mb-1 font-semibold">{booking.packageName}</p>
+                                                        {booking.packagePriceRange && (
+                                                            <p className="text-gray-500 text-sm mb-1">
+                                                                ${booking.packagePriceRange.min} - ${booking.packagePriceRange.max}
+                                                            </p>
+                                                        )}
+                                                        {booking.addOns && booking.addOns.length > 0 && (
+                                                            <div className="ml-2 mt-1">
+                                                                {booking.addOns.map((addOn, idx) => (
+                                                                    <p key={idx} className="text-gray-500 text-sm">
+                                                                        + {addOn.name} {addOn.price ? `($${addOn.price})` : ''}
+                                                                    </p>
+                                                                ))}
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                ) : booking.services && booking.services.length > 0 ? (
                                                     <div className="mb-2">
                                                         {booking.services.map((service, idx) => (
                                                             <p key={idx} className="text-gray-600 mb-1">
@@ -4915,7 +5103,7 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                                                         ))}
                                                     </div>
                                                 ) : (
-                                                    <p className="text-gray-600 mb-1">{booking.service}</p>
+                                                    <p className="text-gray-600 mb-1">{booking.service || booking.serviceName || 'Service'}</p>
                                                 )}
                                                 <p className="text-sm text-gray-500 mb-2">
                                                     <span className="font-medium">Vehicle:</span> {booking.vehicleType || 'Not specified'}
@@ -4949,190 +5137,271 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                     </div>
                 )}
 
-                {activeTab === 'services' && (
+                {activeTab === 'packages' && (
                     <div>
                         <div className="flex items-center justify-between mb-6">
-                            <h2 className="text-2xl font-bold text-gray-900">Manage Services</h2>
-                            <p className="text-sm text-gray-500">
-                                {services.filter(s => s.active !== false).length} of {services.length} services active
-                            </p>
+                            <div>
+                                <h2 className="text-2xl font-bold text-gray-900">Manage Packages</h2>
+                                <p className="text-sm text-gray-500 mt-1">
+                                    Select which packages you want to offer to customers
+                                </p>
+                            </div>
+                            <button
+                                onClick={async () => {
+                                    try {
+                                        const providerQuery = query(
+                                            collection(db, 'providers'),
+                                            where('userId', '==', currentUser.uid)
+                                        );
+                                        const providerSnapshot = await getDocs(providerQuery);
+                                        if (!providerSnapshot.empty) {
+                                            await updateDoc(doc(db, 'providers', providerSnapshot.docs[0].id), {
+                                                offeredPackages: selectedPackages,
+                                                addOns: selectedAddOns,
+                                                packagePrices: packagePrices, // Save custom prices
+                                                updatedAt: serverTimestamp()
+                                            });
+                                            alert('Packages saved successfully!');
+                                            loadProviderData();
+                                        }
+                                    } catch (error) {
+                                        console.error('Error saving packages:', error);
+                                        alert('Failed to save packages');
+                                    }
+                                }}
+                                className="px-4 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700"
+                            >
+                                Save Changes
+                            </button>
                         </div>
 
-                        {services.length === 0 ? (
-                            <div className="bg-white rounded-xl border border-gray-200 p-12 text-center">
-                                <Package className="w-16 h-16 text-gray-300 mx-auto mb-4" />
-                                <h3 className="text-xl font-semibold text-gray-900 mb-2">No services found</h3>
-                                <p className="text-gray-600">Contact support to add services to your account.</p>
-                            </div>
-                        ) : (
-                            <div className="space-y-4">
-                                {services.map((service) => (
-                                    <div
-                                        key={service.id}
-                                        className={`bg-white rounded-xl border-2 p-6 ${service.active === false
-                                            ? 'border-gray-200 opacity-60'
-                                            : 'border-gray-200'
-                                            }`}
-                                    >
-                                        <div className="flex items-start justify-between">
-                                            <div className="flex-1">
-                                                <div className="flex items-center gap-3 mb-2">
-                                                    <h3 className="text-lg font-semibold text-gray-900">
-                                                        {service.name}
-                                                    </h3>
-                                                    <span className={`px-2 py-1 rounded-full text-xs font-medium ${service.active === false
-                                                        ? 'bg-gray-100 text-gray-600'
-                                                        : 'bg-green-100 text-green-800'
-                                                        }`}>
-                                                        {service.active === false ? 'Disabled' : 'Active'}
-                                                    </span>
-                                                </div>
-
-                                                {service.description && (
-                                                    <p className="text-sm text-gray-600 mb-3">{service.description}</p>
-                                                )}
-
-                                                <div className="flex flex-wrap gap-4 text-sm text-gray-500">
-                                                    <div className="flex items-center gap-1">
-                                                        <DollarSign className="w-4 h-4" />
-                                                        <span className="font-medium">${service.price || 0}</span>
-                                                    </div>
-                                                    {service.duration && (
-                                                        <div className="flex items-center gap-1">
-                                                            <Clock className="w-4 h-4" />
-                                                            <span>{service.duration}</span>
-                                                        </div>
-                                                    )}
-                                                    {service.category && (
-                                                        <span className="px-2 py-1 bg-gray-100 rounded text-xs">
-                                                            {service.category}
-                                                        </span>
-                                                    )}
-                                                </div>
-                                            </div>
-
-                                            <div className="flex items-center gap-3 ml-4">
-                                                {/* Toggle Switch */}
-                                                <label className="relative inline-flex items-center cursor-pointer">
-                                                    <input
-                                                        type="checkbox"
-                                                        checked={service.active !== false}
-                                                        onChange={() => handleToggleService(service.id)}
-                                                        className="sr-only peer"
-                                                    />
-                                                    <div className="w-11 h-6 bg-gray-200 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-blue-300 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
-                                                </label>
-
-                                                {/* Edit Button */}
-                                                <button
-                                                    onClick={() => handleEditService(service)}
-                                                    className="px-4 py-2 text-sm border-2 border-gray-200 rounded-lg font-medium hover:bg-gray-50 flex items-center gap-2"
-                                                >
-                                                    <Edit2 className="w-4 h-4" />
-                                                    Edit
-                                                </button>
-                                            </div>
-                                        </div>
-                                    </div>
-                                ))}
-                            </div>
-                        )}
-
-                        {/* Edit Service Modal */}
-                        {showEditModal && editingService && (
-                            <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
-                                <div className="bg-white rounded-xl max-w-2xl w-full max-h-[90vh] overflow-y-auto">
-                                    <div className="p-6 border-b border-gray-200">
-                                        <div className="flex items-center justify-between">
-                                            <h3 className="text-xl font-bold text-gray-900">Edit Service</h3>
-                                            <button
-                                                onClick={() => {
-                                                    setShowEditModal(false);
-                                                    setEditingService(null);
-                                                }}
-                                                className="text-gray-400 hover:text-gray-600"
-                                            >
-                                                <X className="w-6 h-6" />
-                                            </button>
-                                        </div>
-                                    </div>
-
-                                    <div className="p-6 space-y-4">
-                                        <div>
-                                            <label className="block text-sm font-medium text-gray-700 mb-1">
-                                                Service Name
-                                            </label>
-                                            <input
-                                                type="text"
-                                                value={editingService.name || ''}
-                                                onChange={(e) => setEditingService({ ...editingService, name: e.target.value })}
-                                                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                                            />
-                                        </div>
-
-                                        <div className="grid grid-cols-2 gap-4">
-                                            <div>
-                                                <label className="block text-sm font-medium text-gray-700 mb-1">
-                                                    Price ($)
-                                                </label>
-                                                <input
-                                                    type="number"
-                                                    min="0"
-                                                    step="0.01"
-                                                    value={editingService.price || 0}
-                                                    onChange={(e) => setEditingService({ ...editingService, price: parseFloat(e.target.value) || 0 })}
-                                                    className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                                                />
-                                            </div>
-
-                                            <div>
-                                                <label className="block text-sm font-medium text-gray-700 mb-1">
-                                                    Duration
-                                                </label>
-                                                <input
-                                                    type="text"
-                                                    value={editingService.duration || ''}
-                                                    onChange={(e) => setEditingService({ ...editingService, duration: e.target.value })}
-                                                    placeholder="e.g., 2-3 hours"
-                                                    className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                                                />
-                                            </div>
-                                        </div>
-
-                                        <div>
-                                            <label className="block text-sm font-medium text-gray-700 mb-1">
-                                                Description
-                                            </label>
-                                            <textarea
-                                                value={editingService.description || ''}
-                                                onChange={(e) => setEditingService({ ...editingService, description: e.target.value })}
-                                                rows="4"
-                                                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                                                placeholder="Describe what's included in this service..."
-                                            />
-                                        </div>
-                                    </div>
-
-                                    <div className="p-6 border-t border-gray-200 flex gap-3">
-                                        <button
-                                            onClick={() => handleSaveService(editingService)}
-                                            className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700"
-                                        >
-                                            Save Changes
-                                        </button>
-                                        <button
-                                            onClick={() => {
-                                                setShowEditModal(false);
-                                                setEditingService(null);
-                                            }}
-                                            className="px-6 py-2 border-2 border-gray-200 rounded-lg font-semibold hover:bg-gray-50"
-                                        >
-                                            Cancel
-                                        </button>
-                                    </div>
+                        {/* Packages Section */}
+                        <div className="mb-8">
+                            <h3 className="text-lg font-semibold text-gray-900 mb-4">Available Packages</h3>
+                            {availablePackages.length === 0 ? (
+                                <div className="bg-white rounded-xl border border-gray-200 p-12 text-center">
+                                    <Package className="w-16 h-16 text-gray-300 mx-auto mb-4" />
+                                    <h3 className="text-xl font-semibold text-gray-900 mb-2">No packages available</h3>
+                                    <p className="text-gray-600">Packages will appear here once they're added to the system.</p>
                                 </div>
+                            ) : (
+                                <div className="space-y-4">
+                                    {availablePackages.map((pkg) => {
+                                        const isSelected = selectedPackages.includes(pkg.id);
+                                        return (
+                                            <div
+                                                key={pkg.id}
+                                                className={`bg-white rounded-xl border-2 p-6 transition-all ${
+                                                    isSelected ? 'border-blue-600 bg-blue-50' : 'border-gray-200'
+                                                }`}
+                                            >
+                                                <div className="flex items-start justify-between">
+                                                    <div className="flex-1">
+                                                        <div className="flex items-center gap-3 mb-2">
+                                                            <h3 className="text-lg font-semibold text-gray-900">{pkg.name}</h3>
+                                                            {isSelected && (
+                                                                <span className="px-2 py-1 rounded-full text-xs font-medium bg-green-100 text-green-800">
+                                                                    Offered
+                                                                </span>
+                                                            )}
+                                                        </div>
+                                                        <p className="text-sm text-gray-600 mb-3">{pkg.description}</p>
+                                                        <div className="flex flex-wrap gap-4 text-sm text-gray-500 mb-3">
+                                                            <div className="flex items-center gap-1">
+                                                                <Clock className="w-4 h-4" />
+                                                                <span>{pkg.estimatedHours} hours</span>
+                                                            </div>
+                                                        </div>
+                                                        
+                                                        {/* Price editing section - only show if package is selected */}
+                                                        {isSelected && (
+                                                            <div className="mb-3 p-3 bg-blue-50 rounded-lg border border-blue-200">
+                                                                <label className="block text-xs font-semibold text-gray-700 mb-2">
+                                                                    Custom Pricing (Optional)
+                                                                </label>
+                                                                <div className="grid grid-cols-2 gap-3">
+                                                                    <div>
+                                                                        <label className="block text-xs text-gray-600 mb-1">Min Price ($)</label>
+                                                                        <input
+                                                                            type="number"
+                                                                            min="0"
+                                                                            step="1"
+                                                                            value={packagePrices[pkg.id]?.priceMin ?? pkg.priceMin}
+                                                                            onChange={(e) => {
+                                                                                const value = parseInt(e.target.value) || pkg.priceMin;
+                                                                                setPackagePrices(prev => ({
+                                                                                    ...prev,
+                                                                                    [pkg.id]: {
+                                                                                        ...prev[pkg.id],
+                                                                                        priceMin: value,
+                                                                                        priceMax: prev[pkg.id]?.priceMax ?? pkg.priceMax
+                                                                                    }
+                                                                                }));
+                                                                            }}
+                                                                            className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                                                                            placeholder={pkg.priceMin.toString()}
+                                                                        />
+                                                                    </div>
+                                                                    <div>
+                                                                        <label className="block text-xs text-gray-600 mb-1">Max Price ($)</label>
+                                                                        <input
+                                                                            type="number"
+                                                                            min="0"
+                                                                            step="1"
+                                                                            value={packagePrices[pkg.id]?.priceMax ?? pkg.priceMax}
+                                                                            onChange={(e) => {
+                                                                                const value = parseInt(e.target.value) || pkg.priceMax;
+                                                                                setPackagePrices(prev => ({
+                                                                                    ...prev,
+                                                                                    [pkg.id]: {
+                                                                                        ...prev[pkg.id],
+                                                                                        priceMin: prev[pkg.id]?.priceMin ?? pkg.priceMin,
+                                                                                        priceMax: value
+                                                                                    }
+                                                                                }));
+                                                                            }}
+                                                                            className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                                                                            placeholder={pkg.priceMax.toString()}
+                                                                        />
+                                                                    </div>
+                                                                </div>
+                                                                <div className="mt-2 flex items-center gap-2">
+                                                                    <DollarSign className="w-4 h-4 text-gray-600" />
+                                                                    <span className="text-sm font-medium text-gray-700">
+                                                                        ${packagePrices[pkg.id]?.priceMin ?? pkg.priceMin} - ${packagePrices[pkg.id]?.priceMax ?? pkg.priceMax}
+                                                                    </span>
+                                                                    {packagePrices[pkg.id] && (
+                                                                        <button
+                                                                            onClick={() => {
+                                                                                setPackagePrices(prev => {
+                                                                                    const updated = { ...prev };
+                                                                                    delete updated[pkg.id];
+                                                                                    return updated;
+                                                                                });
+                                                                            }}
+                                                                            className="ml-auto text-xs text-red-600 hover:text-red-700 font-medium"
+                                                                        >
+                                                                            Reset to Default
+                                                                        </button>
+                                                                    )}
+                                                                </div>
+                                                            </div>
+                                                        )}
+                                                        
+                                                        {/* Show default price if not selected */}
+                                                        {!isSelected && (
+                                                            <div className="flex items-center gap-1 text-sm text-gray-500 mb-3">
+                                                                <DollarSign className="w-4 h-4" />
+                                                                <span className="font-medium">${pkg.priceMin} - ${pkg.priceMax}</span>
+                                                            </div>
+                                                        )}
+                                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3 pt-3 border-t border-gray-200">
+                                                            <div>
+                                                                <div className="text-xs font-semibold text-gray-700 mb-1">Exterior Services:</div>
+                                                                <ul className="text-xs text-gray-600 space-y-1">
+                                                                    {pkg.exteriorServices.slice(0, 3).map((svc, idx) => (
+                                                                        <li key={idx} className="flex items-start">
+                                                                            <CheckCircle2 className="w-3 h-3 text-green-500 mr-1 mt-0.5 flex-shrink-0" />
+                                                                            <span>{svc}</span>
+                                                                        </li>
+                                                                    ))}
+                                                                    {pkg.exteriorServices.length > 3 && (
+                                                                        <li className="text-gray-500">+ {pkg.exteriorServices.length - 3} more</li>
+                                                                    )}
+                                                                </ul>
+                                                            </div>
+                                                            <div>
+                                                                <div className="text-xs font-semibold text-gray-700 mb-1">Interior Services:</div>
+                                                                <ul className="text-xs text-gray-600 space-y-1">
+                                                                    {pkg.interiorServices.slice(0, 3).map((svc, idx) => (
+                                                                        <li key={idx} className="flex items-start">
+                                                                            <CheckCircle2 className="w-3 h-3 text-green-500 mr-1 mt-0.5 flex-shrink-0" />
+                                                                            <span>{svc}</span>
+                                                                        </li>
+                                                                    ))}
+                                                                    {pkg.interiorServices.length > 3 && (
+                                                                        <li className="text-gray-500">+ {pkg.interiorServices.length - 3} more</li>
+                                                                    )}
+                                                                </ul>
+                                                            </div>
+                                                        </div>
+                                                    </div>
+                                                    <div className="ml-4">
+                                                        <label className="relative inline-flex items-center cursor-pointer">
+                                                            <input
+                                                                type="checkbox"
+                                                                checked={isSelected}
+                                                                onChange={() => {
+                                                                    if (isSelected) {
+                                                                        // Remove package and its custom prices
+                                                                        setSelectedPackages(prev => prev.filter(id => id !== pkg.id));
+                                                                        setPackagePrices(prev => {
+                                                                            const updated = { ...prev };
+                                                                            delete updated[pkg.id];
+                                                                            return updated;
+                                                                        });
+                                                                    } else {
+                                                                        setSelectedPackages(prev => [...prev, pkg.id]);
+                                                                    }
+                                                                }}
+                                                                className="sr-only peer"
+                                                            />
+                                                            <div className="w-11 h-6 bg-gray-200 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-blue-300 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
+                                                        </label>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Add-ons Section */}
+                        <div>
+                            <h3 className="text-lg font-semibold text-gray-900 mb-4">Available Add-ons</h3>
+                            <p className="text-sm text-gray-500 mb-4">Select which add-ons you want to offer with your packages</p>
+                            <div className="space-y-3">
+                                {ADD_ONS.map((addOn) => {
+                                    const isSelected = selectedAddOns.includes(addOn.id);
+                                    return (
+                                        <div
+                                            key={addOn.id}
+                                            className={`bg-white rounded-xl border-2 p-4 transition-all ${
+                                                isSelected ? 'border-blue-600 bg-blue-50' : 'border-gray-200'
+                                            }`}
+                                        >
+                                            <div className="flex items-center justify-between">
+                                                <div className="flex-1">
+                                                    <div className="flex items-center gap-3 mb-1">
+                                                        <h4 className="font-semibold text-gray-900">{addOn.name}</h4>
+                                                        <span className="text-sm font-medium text-gray-600">+${addOn.price}</span>
+                                                    </div>
+                                                    <p className="text-sm text-gray-600">{addOn.description}</p>
+                                                </div>
+                                                <div className="ml-4">
+                                                    <label className="relative inline-flex items-center cursor-pointer">
+                                                        <input
+                                                            type="checkbox"
+                                                            checked={isSelected}
+                                                            onChange={() => {
+                                                                if (isSelected) {
+                                                                    setSelectedAddOns(prev => prev.filter(id => id !== addOn.id));
+                                                                } else {
+                                                                    setSelectedAddOns(prev => [...prev, addOn.id]);
+                                                                }
+                                                            }}
+                                                            className="sr-only peer"
+                                                        />
+                                                        <div className="w-11 h-6 bg-gray-200 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-blue-300 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
+                                                    </label>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    );
+                                })}
                             </div>
-                        )}
+                        </div>
                     </div>
                 )}
 
@@ -5317,116 +5586,136 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                 {activeTab === 'admin' && userData?.role === 'admin' && (  // Change to userData
                     <div>
                         <div className="flex items-center justify-between mb-6">
-                            <h2 className="text-2xl font-bold text-gray-900">Provider Approvals</h2>
-                            <button
-                                onClick={loadPendingProviders}
-                                className="px-4 py-2 text-sm border-2 border-gray-200 rounded-lg font-medium hover:bg-gray-50"
-                            >
-                                Refresh
-                            </button>
+                            <h2 className="text-2xl font-bold text-gray-900">Admin Panel</h2>
+                            <div className="flex gap-2">
+                                <button
+                                    onClick={async () => {
+                                        if (confirm('This will import all packages to Firestore. Continue?')) {
+                                            try {
+                                                await importPackagesToFirestore();
+                                            } catch (error) {
+                                                console.error('Import error:', error);
+                                            }
+                                        }
+                                    }}
+                                    className="px-4 py-2 text-sm bg-green-600 text-white rounded-lg font-medium hover:bg-green-700"
+                                >
+                                    Import Packages
+                                </button>
+                                <button
+                                    onClick={loadPendingProviders}
+                                    className="px-4 py-2 text-sm border-2 border-gray-200 rounded-lg font-medium hover:bg-gray-50"
+                                >
+                                    Refresh
+                                </button>
+                            </div>
                         </div>
 
-                        {loadingPending ? (
-                            <div className="text-center py-8">
-                                <p className="text-gray-600">Loading pending applications...</p>
-                            </div>
-                        ) : pendingProviders.length === 0 ? (
-                            <div className="bg-white rounded-xl border border-gray-200 p-12 text-center">
-                                <CheckCircle2 className="w-16 h-16 text-green-300 mx-auto mb-4" />
-                                <h3 className="text-xl font-semibold text-gray-900 mb-2">No pending applications</h3>
-                                <p className="text-gray-600">All provider applications have been reviewed.</p>
-                            </div>
-                        ) : (
-                            <div className="space-y-4">
-                                {pendingProviders.map((provider) => (
-                                    <div key={provider.id} className="bg-white rounded-xl border-2 border-yellow-200 p-6">
-                                        <div className="flex items-start justify-between mb-4">
-                                            <div className="flex-1">
-                                                <h3 className="text-xl font-bold text-gray-900 mb-2">
-                                                    {provider.businessName}
-                                                </h3>
-                                                <div className="space-y-2 text-sm text-gray-600">
-                                                    <div className="flex items-center gap-2">
-                                                        <Mail className="w-4 h-4" />
-                                                        <span>{provider.email}</span>
+                        <div className="mb-6">
+                            <h3 className="text-lg font-semibold text-gray-900 mb-4">Provider Approvals</h3>
+
+                            {loadingPending ? (
+                                <div className="text-center py-8">
+                                    <p className="text-gray-600">Loading pending applications...</p>
+                                </div>
+                            ) : pendingProviders.length === 0 ? (
+                                <div className="bg-white rounded-xl border border-gray-200 p-12 text-center">
+                                    <CheckCircle2 className="w-16 h-16 text-green-300 mx-auto mb-4" />
+                                    <h3 className="text-xl font-semibold text-gray-900 mb-2">No pending applications</h3>
+                                    <p className="text-gray-600">All provider applications have been reviewed.</p>
+                                </div>
+                            ) : (
+                                <div className="space-y-4">
+                                    {pendingProviders.map((provider) => (
+                                        <div key={provider.id} className="bg-white rounded-xl border-2 border-yellow-200 p-6">
+                                            <div className="flex items-start justify-between mb-4">
+                                                <div className="flex-1">
+                                                    <h3 className="text-xl font-bold text-gray-900 mb-2">
+                                                        {provider.businessName}
+                                                    </h3>
+                                                    <div className="space-y-2 text-sm text-gray-600">
+                                                        <div className="flex items-center gap-2">
+                                                            <Mail className="w-4 h-4" />
+                                                            <span>{provider.email}</span>
+                                                        </div>
+                                                        <div className="flex items-center gap-2">
+                                                            <Phone className="w-4 h-4" />
+                                                            <span>{provider.phone}</span>
+                                                        </div>
+                                                        {provider.ownerName && (
+                                                            <div className="flex items-center gap-2">
+                                                                <User className="w-4 h-4" />
+                                                                <span>Owner: {provider.ownerName}</span>
+                                                            </div>
+                                                        )}
+                                                        {provider.address && (
+                                                            <div className="flex items-center gap-2">
+                                                                <MapPin className="w-4 h-4" />
+                                                                <span>{provider.address}</span>
+                                                            </div>
+                                                        )}
+                                                        {provider.serviceArea && (
+                                                            <div className="flex items-center gap-2">
+                                                                <MapPin className="w-4 h-4" />
+                                                                <span>Service Area: {provider.serviceArea}</span>
+                                                            </div>
+                                                        )}
                                                     </div>
-                                                    <div className="flex items-center gap-2">
-                                                        <Phone className="w-4 h-4" />
-                                                        <span>{provider.phone}</span>
+                                                </div>
+                                                <span className="px-3 py-1 bg-yellow-100 text-yellow-800 rounded-full text-sm font-medium">
+                                                    Pending
+                                                </span>
+                                            </div>
+
+                                            {/* Business Details */}
+                                            <div className="grid grid-cols-2 gap-4 mb-4 p-4 bg-gray-50 rounded-lg">
+                                                <div>
+                                                    <label className="text-xs font-medium text-gray-500">Business License</label>
+                                                    <p className="text-sm font-semibold text-gray-900">{provider.businessLicenseNumber || 'N/A'}</p>
+                                                </div>
+                                                {provider.ein && (
+                                                    <div>
+                                                        <label className="text-xs font-medium text-gray-500">EIN</label>
+                                                        <p className="text-sm font-semibold text-gray-900">{provider.ein}</p>
                                                     </div>
-                                                    {provider.ownerName && (
-                                                        <div className="flex items-center gap-2">
-                                                            <User className="w-4 h-4" />
-                                                            <span>Owner: {provider.ownerName}</span>
-                                                        </div>
-                                                    )}
-                                                    {provider.address && (
-                                                        <div className="flex items-center gap-2">
-                                                            <MapPin className="w-4 h-4" />
-                                                            <span>{provider.address}</span>
-                                                        </div>
-                                                    )}
-                                                    {provider.serviceArea && (
-                                                        <div className="flex items-center gap-2">
-                                                            <MapPin className="w-4 h-4" />
-                                                            <span>Service Area: {provider.serviceArea}</span>
-                                                        </div>
-                                                    )}
+                                                )}
+                                                <div>
+                                                    <label className="text-xs font-medium text-gray-500">Insurance Provider</label>
+                                                    <p className="text-sm font-semibold text-gray-900">{provider.insuranceProvider || 'N/A'}</p>
+                                                </div>
+                                                <div>
+                                                    <label className="text-xs font-medium text-gray-500">Insurance Number</label>
+                                                    <p className="text-sm font-semibold text-gray-900">{provider.insuranceNumber || 'N/A'}</p>
                                                 </div>
                                             </div>
-                                            <span className="px-3 py-1 bg-yellow-100 text-yellow-800 rounded-full text-sm font-medium">
-                                                Pending
-                                            </span>
-                                        </div>
 
-                                        {/* Business Details */}
-                                        <div className="grid grid-cols-2 gap-4 mb-4 p-4 bg-gray-50 rounded-lg">
-                                            <div>
-                                                <label className="text-xs font-medium text-gray-500">Business License</label>
-                                                <p className="text-sm font-semibold text-gray-900">{provider.businessLicenseNumber || 'N/A'}</p>
-                                            </div>
-                                            {provider.ein && (
-                                                <div>
-                                                    <label className="text-xs font-medium text-gray-500">EIN</label>
-                                                    <p className="text-sm font-semibold text-gray-900">{provider.ein}</p>
+                                            {provider.about && (
+                                                <div className="mb-4">
+                                                    <label className="text-xs font-medium text-gray-500">About</label>
+                                                    <p className="text-sm text-gray-700 mt-1">{provider.about}</p>
                                                 </div>
                                             )}
-                                            <div>
-                                                <label className="text-xs font-medium text-gray-500">Insurance Provider</label>
-                                                <p className="text-sm font-semibold text-gray-900">{provider.insuranceProvider || 'N/A'}</p>
-                                            </div>
-                                            <div>
-                                                <label className="text-xs font-medium text-gray-500">Insurance Number</label>
-                                                <p className="text-sm font-semibold text-gray-900">{provider.insuranceNumber || 'N/A'}</p>
+
+                                            {/* Action Buttons */}
+                                            <div className="flex gap-3 pt-4 border-t border-gray-200">
+                                                <button
+                                                    onClick={() => handleApproveProvider(provider.id)}
+                                                    className="flex-1 px-4 py-2 bg-green-600 text-white rounded-lg font-semibold hover:bg-green-700"
+                                                >
+                                                    Approve
+                                                </button>
+                                                <button
+                                                    onClick={() => handleRejectProvider(provider.id)}
+                                                    className="flex-1 px-4 py-2 bg-red-600 text-white rounded-lg font-semibold hover:bg-red-700"
+                                                >
+                                                    Reject
+                                                </button>
                                             </div>
                                         </div>
-
-                                        {provider.about && (
-                                            <div className="mb-4">
-                                                <label className="text-xs font-medium text-gray-500">About</label>
-                                                <p className="text-sm text-gray-700 mt-1">{provider.about}</p>
-                                            </div>
-                                        )}
-
-                                        {/* Action Buttons */}
-                                        <div className="flex gap-3 pt-4 border-t border-gray-200">
-                                            <button
-                                                onClick={() => handleApproveProvider(provider.id)}
-                                                className="flex-1 px-4 py-2 bg-green-600 text-white rounded-lg font-semibold hover:bg-green-700"
-                                            >
-                                                Approve
-                                            </button>
-                                            <button
-                                                onClick={() => handleRejectProvider(provider.id)}
-                                                className="flex-1 px-4 py-2 bg-red-600 text-white rounded-lg font-semibold hover:bg-red-700"
-                                            >
-                                                Reject
-                                            </button>
-                                        </div>
-                                    </div>
-                                ))}
-                            </div>
-                        )}
+                                    ))}
+                                </div>
+                            )}
+                        </div>
                     </div>
                 )}
 
