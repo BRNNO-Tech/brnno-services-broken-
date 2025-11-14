@@ -116,7 +116,56 @@ export const ADD_ONS = [
     }
 ];
 
-// Function to import packages to Firestore
+// Function to auto-create packages if they don't exist (silent, no alerts)
+export async function initializePackagesIfEmpty() {
+    try {
+        // Check if packages already exist
+        const existingQuery = collection(db, 'packages');
+        const existingSnapshot = await getDocs(existingQuery);
+        
+        if (!existingSnapshot.empty) {
+            console.log(`✅ Packages already exist (${existingSnapshot.size} packages)`);
+            return false; // Already exists
+        }
+        
+        console.log('📦 No packages found, attempting to auto-create default packages...');
+        console.log('⚠️ Note: Packages require admin permissions. If this fails, packages will be created manually or via admin dashboard.');
+        
+        // Import new packages silently (no alerts)
+        const batch = [];
+        for (const pkg of PACKAGES_DATA) {
+            const pkgRef = doc(collection(db, 'packages'), pkg.id);
+            batch.push(setDoc(pkgRef, {
+                name: pkg.name,
+                priceMin: pkg.priceMin,
+                priceMax: pkg.priceMax,
+                estimatedHours: pkg.estimatedHours,
+                description: pkg.description,
+                exteriorServices: pkg.exteriorServices,
+                interiorServices: pkg.interiorServices,
+                createdAt: serverTimestamp(),
+                updatedAt: serverTimestamp()
+            }));
+        }
+        
+        // Execute all writes
+        await Promise.all(batch);
+        console.log(`✅ Auto-created ${PACKAGES_DATA.length} packages in Firestore`);
+        return true; // Successfully initialized
+    } catch (error) {
+        // Check if it's a permissions error
+        if (error.code === 'permission-denied') {
+            console.warn('⚠️ Cannot auto-create packages: Permission denied. Packages require admin permissions.');
+            console.warn('💡 Solution: Create packages manually via admin dashboard or update Firestore rules to allow initial creation.');
+        } else {
+            console.error('❌ Error auto-initializing packages:', error);
+        }
+        // Don't throw - fail silently so app can still run (will use local packages as fallback)
+        return false;
+    }
+}
+
+// Function to import packages to Firestore (with user confirmation)
 export async function importPackagesToFirestore() {
     try {
         // Check if packages already exist

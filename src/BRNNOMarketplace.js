@@ -27,11 +27,12 @@ import {
     serverTimestamp,
     onSnapshot
 } from 'firebase/firestore';
-import { auth, db } from './firebase';
+import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
+import { auth, db, storage } from './firebase/config';
 import { GoogleAuthProvider } from 'firebase/auth';
 import PaymentForm from './components/PaymentForm';
 import { SERVICES_JSON, convertServices } from './firebaseService';
-import { PACKAGES_DATA, ADD_ONS, importPackagesToFirestore } from './data/packages';
+import { PACKAGES_DATA, ADD_ONS, importPackagesToFirestore, initializePackagesIfEmpty } from './data/packages';
 import {
     requestNotificationPermission,
     saveFCMToken,
@@ -165,14 +166,34 @@ function isDateAvailable(dateOverrides, dateString) {
 // Geocode address to coordinates using Google Maps API
 async function geocodeAddress(address) {
     try {
+        if (!address || !address.trim()) {
+            console.error('Geocoding error: Empty address provided');
+            return null;
+        }
+
         await loadGoogleMapsApi();
+
+        if (!window.google || !window.google.maps || !window.google.maps.Geocoder) {
+            console.error('Geocoding error: Google Maps API not loaded');
+            return null;
+        }
+
         const geocoder = new window.google.maps.Geocoder();
         const response = await geocoder.geocode({ address });
-        const result = response.results && response.results[0];
-        if (!result) return null;
 
-        const byType = (type) => result.address_components.find(c => c.types.includes(type));
-        return {
+        if (!response || !response.results || response.results.length === 0) {
+            console.error('Geocoding error: No results found for address:', address);
+            return null;
+        }
+
+        const result = response.results[0];
+        if (!result || !result.geometry || !result.geometry.location) {
+            console.error('Geocoding error: Invalid result structure');
+            return null;
+        }
+
+        const byType = (type) => result.address_components?.find(c => c.types.includes(type));
+        const coords = {
             lat: result.geometry.location.lat(),
             lng: result.geometry.location.lng(),
             formattedAddress: result.formatted_address,
@@ -180,8 +201,16 @@ async function geocodeAddress(address) {
             state: byType('administrative_area_level_1')?.short_name || '',
             zip: byType('postal_code')?.long_name || ''
         };
+
+        console.log('✅ Geocoding successful:', coords);
+        return coords;
     } catch (error) {
         console.error('Geocoding error:', error);
+        console.error('Error details:', {
+            message: error.message,
+            stack: error.stack,
+            address: address
+        });
         return null;
     }
 }
@@ -211,6 +240,7 @@ export default function BrnnoMarketplace() {
     const [loading, setLoading] = useState(true);
     const [userAccountType, setUserAccountType] = useState(null);
     const [isProvider, setIsProvider] = useState(false);
+    const isCreatingAccountRef = React.useRef(false); // Flag to prevent auth listener from signing out during account creation
 
     // User location
     const [userCoordinates, setUserCoordinates] = useState(null);
@@ -224,8 +254,13 @@ export default function BrnnoMarketplace() {
     const [currentPage, setCurrentPage] = useState('landing'); // landing, marketplace, detailerProfile, dashboard
 
     // Modal/flow state
-    const [modalType, setModalType] = useState(null); // 'address', 'questions', 'signup'
-    const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
+    const [modalType, setModalType] = useState(null); // 'address', 'signup', 'login', 'providerOnboarding'
+
+    // Login form state
+    const [loginData, setLoginData] = useState({
+        email: '',
+        password: ''
+    });
 
     // Form data
     const [address, setAddress] = useState('');
@@ -239,6 +274,15 @@ export default function BrnnoMarketplace() {
         email: '',
         password: '',
         accountType: 'customer'
+    });
+
+    // Provider onboarding form state
+    const [providerOnboardingData, setProviderOnboardingData] = useState({
+        businessName: '',
+        businessAddress: '',
+        serviceArea: '',
+        phone: '',
+        email: ''
     });
 
     // Reference for address input and autocomplete
@@ -307,9 +351,9 @@ export default function BrnnoMarketplace() {
         return () => { isActive = false; };
     }, []);
 
-    // Initialize Google Places Autocomplete on the address input
+    // Initialize Google Places Autocomplete on the address input (for both address and provider onboarding modals)
     useEffect(() => {
-        if (modalType !== 'address' || !googleMapsLoaded) return;
+        if ((modalType !== 'address' && modalType !== 'providerOnboarding') || !googleMapsLoaded) return;
 
         let listener = null;
         try {
@@ -324,13 +368,34 @@ export default function BrnnoMarketplace() {
             listener = ac.addListener('place_changed', () => {
                 const place = ac.getPlace();
                 if (place?.formatted_address) {
-                    setAddress(place.formatted_address);
-                    if (place.geometry) {
-                        setUserCoordinates({
-                            lat: place.geometry.location.lat(),
-                            lng: place.geometry.location.lng(),
-                            formattedAddress: place.formatted_address
-                        });
+                    const formattedAddr = place.formatted_address;
+                    // Get full coordinate details from Places API (includes city, state, zip)
+                    const byType = (type) => place.address_components?.find(c => c.types.includes(type));
+                    const coords = place.geometry ? {
+                        lat: place.geometry.location.lat(),
+                        lng: place.geometry.location.lng(),
+                        formattedAddress: formattedAddr,
+                        city: byType('locality')?.long_name || '',
+                        state: byType('administrative_area_level_1')?.short_name || '',
+                        zip: byType('postal_code')?.long_name || ''
+                    } : null;
+
+                    // Update based on which modal is open
+                    if (modalType === 'providerOnboarding') {
+                        setProviderOnboardingData(prev => ({
+                            ...prev,
+                            businessAddress: formattedAddr
+                        }));
+                        if (coords) {
+                            setUserCoordinates(coords);
+                            console.log('✅ Coordinates set from Google Places Autocomplete:', coords);
+                        }
+                    } else {
+                        // Address modal
+                        setAddress(formattedAddr);
+                        if (coords) {
+                            setUserCoordinates(coords);
+                        }
                     }
                 }
             });
@@ -342,51 +407,239 @@ export default function BrnnoMarketplace() {
             if (listener && listener.remove) listener.remove();
             autocompleteRef.current = null;
         };
-    }, [modalType, googleMapsLoaded]);
+    }, [modalType, googleMapsLoaded]); // Don't include providerOnboardingData to avoid recreating autocomplete
 
     // Profile dropdown
     const [showProfileDropdown, setShowProfileDropdown] = useState(false);
 
-    // Questions for onboarding
-    const questions = [
-        {
-            id: 'vehicleType',
-            question: 'What type of vehicle do you have?',
-            icon: Car,
-            options: ['Sedan', 'SUV', 'Truck', 'Sports Car', 'Van', 'Motorcycle']
-        },
-        {
-            id: 'serviceType',
-            question: 'What service are you looking for?',
-            icon: Package,
-            options: ['Full Detail', 'Exterior Only', 'Interior Only', 'Paint Correction', 'Ceramic Coating', 'Basic Wash']
-        },
-        {
-            id: 'timeSlot',
-            question: 'When do you need service?',
-            icon: Calendar,
-            options: ['Morning (8am-12pm)', 'Afternoon (12pm-4pm)', 'Evening (4pm-8pm)', 'Flexible']
-        }
-    ];
+    // Questions removed - users go directly from address to signup
+
+    // ==================== CLEAR ORPHANED SESSIONS ON LOAD ====================
+    // Check and clear any orphaned Firebase Auth sessions on page load
+    useEffect(() => {
+        const checkAndClearOrphanedSession = async () => {
+            try {
+                const currentAuthUser = auth.currentUser;
+                if (currentAuthUser) {
+                    console.log('🔍 Checking for orphaned session on page load...');
+                    // Check both customer and detailer collections
+                    const customerDoc = await getDoc(doc(db, 'customer', currentAuthUser.uid));
+                    const detailerDoc = await getDoc(doc(db, 'detailer', currentAuthUser.uid));
+
+                    if (!customerDoc.exists() && !detailerDoc.exists()) {
+                        console.log('🧹 Found orphaned session - clearing it');
+                        // Clear Firebase Auth storage
+                        try {
+                            if (window.indexedDB) {
+                                indexedDB.deleteDatabase('firebaseLocalStorageDb');
+                            }
+                            Object.keys(localStorage).forEach(key => {
+                                if (key.startsWith('firebase:authUser:')) {
+                                    localStorage.removeItem(key);
+                                }
+                            });
+                        } catch (e) {
+                            console.warn('Could not clear storage:', e);
+                        }
+                        // Sign out
+                        await signOut(auth);
+                        console.log('✅ Orphaned session cleared');
+                    } else {
+                        console.log('✅ Valid session found');
+                    }
+                }
+            } catch (error) {
+                console.error('Error checking orphaned session:', error);
+            }
+        };
+
+        // Run check after a short delay to ensure Firebase is initialized
+        const timeout = setTimeout(checkAndClearOrphanedSession, 500);
+        return () => clearTimeout(timeout);
+    }, []);
 
     // ==================== AUTH LISTENER ====================
     useEffect(() => {
+        let isSigningOut = false; // Flag to prevent infinite loop
+
         const unsubscribe = onAuthStateChanged(auth, async (user) => {
+            // Prevent infinite loop if we're already signing out
+            if (isSigningOut) {
+                console.log('⏸️ Sign out in progress, skipping auth state change');
+                return;
+            }
+
+            console.log('🔐 Auth state changed:', user ? `User logged in (${user.uid})` : 'User logged out');
             if (user) {
-                const userInfo = {
-                    uid: user.uid,
-                    email: user.email,
-                    name: user.displayName || signupData.name || user.email.split('@')[0],
-                    photoURL: user.photoURL,
-                    initials: getInitials(user.displayName || signupData.name || user.email)
-                };
+                try {
+                    // 1. Check if they exist as a CUSTOMER
+                    const customerRef = doc(db, 'customer', user.uid);
+                    const customerDoc = await getDoc(customerRef);
 
-                setCurrentUser(userInfo);
+                    // 2. Check if they exist as a DETAILER
+                    const detailerRef = doc(db, 'detailer', user.uid);
+                    const detailerDoc = await getDoc(detailerRef);
 
-                // Check if user has completed onboarding before
-                await checkUserOnboarding(user.uid);
+                    // 3. Check if they are a NEW USER
+                    if (!customerDoc.exists() && !detailerDoc.exists()) {
+                        // This is a BRAND NEW user. They don't exist in either collection.
+                        console.log('🆕 New user detected, creating account...');
+
+                        // 4. Get the role we saved from the button click
+                        const role = localStorage.getItem('pendingUserRole') || 'customer'; // Default to 'customer'
+
+                        // 5. IMPORTANT: Clear the note
+                        localStorage.removeItem('pendingUserRole');
+
+                        // 6. Set flag to prevent auth listener from signing out during creation
+                        isCreatingAccountRef.current = true;
+
+                        // 7. Create their document in the correct collection
+                        const userData = {
+                            uid: user.uid,
+                            email: user.email,
+                            displayName: user.displayName,
+                            photoURL: user.photoURL,
+                            createdAt: serverTimestamp(),
+                        };
+
+                        if (role === 'detailer') {
+                            // Create a new DETAILER document
+                            await setDoc(detailerRef, {
+                                ...userData,
+                                businessName: user.displayName || 'New Business',
+                                businessAddress: '',
+                                serviceArea: '',
+                                phone: '',
+                                services: [],
+                                offeredPackages: [],
+                                addOns: [],
+                                packagePrices: {},
+                                defaultAvailability: {
+                                    monday: { enabled: false, start: '09:00', end: '17:00' },
+                                    tuesday: { enabled: false, start: '09:00', end: '17:00' },
+                                    wednesday: { enabled: false, start: '09:00', end: '17:00' },
+                                    thursday: { enabled: false, start: '09:00', end: '17:00' },
+                                    friday: { enabled: false, start: '09:00', end: '17:00' },
+                                    saturday: { enabled: false, start: '09:00', end: '17:00' },
+                                    sunday: { enabled: false, start: '09:00', end: '17:00' }
+                                },
+                                dateOverrides: {},
+                                rating: 0,
+                                reviewCount: 0,
+                                employeeCount: 1,
+                                backgroundCheck: false,
+                                status: 'pending',
+                                onboarded: false
+                            });
+                            console.log('✅ New DETAILER account created.');
+
+                            // Set user info and route to detailer onboarding
+                            const userInfo = {
+                                uid: user.uid,
+                                email: user.email,
+                                name: user.displayName || user.email.split('@')[0],
+                                photoURL: user.photoURL,
+                                initials: getInitials(user.displayName || user.email)
+                            };
+                            setCurrentUser(userInfo);
+                            setUserAccountType('detailer');
+                            setIsProvider(true);
+                            setCurrentPage('landing');
+                            setProviderOnboardingData({
+                                businessName: '',
+                                businessAddress: '',
+                                serviceArea: '',
+                                phone: '',
+                                email: user.email || ''
+                            });
+                            setModalType('providerOnboarding');
+
+                            // Clear the flag after a delay
+                            setTimeout(() => {
+                                isCreatingAccountRef.current = false;
+                                console.log('✅ Account creation flag cleared');
+                            }, 3000);
+                        } else {
+                            // Create a new CUSTOMER document
+                            await setDoc(customerRef, {
+                                ...userData,
+                                savedAddresses: [],
+                                favoriteProviders: [],
+                                address: '',
+                                coordinates: null,
+                                preferences: {},
+                                onboarded: false
+                            });
+                            console.log('✅ New CUSTOMER account created.');
+
+                            // Set user info and route to address modal
+                            const userInfo = {
+                                uid: user.uid,
+                                email: user.email,
+                                name: user.displayName || user.email.split('@')[0],
+                                photoURL: user.photoURL,
+                                initials: getInitials(user.displayName || user.email)
+                            };
+                            setCurrentUser(userInfo);
+                            setUserAccountType('customer');
+                            setIsProvider(false);
+                            setCurrentPage('landing');
+                            setModalType('address');
+
+                            // Clear the flag after a delay
+                            setTimeout(() => {
+                                isCreatingAccountRef.current = false;
+                                console.log('✅ Account creation flag cleared');
+                            }, 3000);
+                        }
+                    } else {
+                        // This is an EXISTING user.
+                        const userInfo = {
+                            uid: user.uid,
+                            email: user.email,
+                            name: user.displayName || user.email.split('@')[0],
+                            photoURL: user.photoURL,
+                            initials: getInitials(user.displayName || user.email)
+                        };
+                        setCurrentUser(userInfo);
+
+                        if (customerDoc.exists()) {
+                            console.log('✅ Existing CUSTOMER logged in.');
+                            setUserAccountType('customer');
+                            setIsProvider(false);
+                            // Check onboarding will handle routing
+                            if (!isCreatingAccountRef.current) {
+                                await checkUserOnboarding(user.uid, 'customer');
+                            }
+                        } else if (detailerDoc.exists()) {
+                            console.log('✅ Existing DETAILER logged in.');
+                            setUserAccountType('detailer');
+                            setIsProvider(true);
+                            // Check onboarding will handle routing
+                            if (!isCreatingAccountRef.current) {
+                                await checkUserOnboarding(user.uid, 'detailer');
+                            }
+                        }
+                    }
+                } catch (error) {
+                    console.error('❌ Error checking user documents on auth:', error);
+                    // Set flag to prevent loop
+                    isSigningOut = true;
+                    // If we can't check, sign out to be safe
+                    await signOut(auth);
+                    setCurrentUser(null);
+                    setUserAccountType(null);
+                    setIsProvider(false);
+                    setCurrentPage('landing');
+                    setLoading(false);
+                    // Reset flag after a delay
+                    setTimeout(() => { isSigningOut = false; }, 2000);
+                    return;
+                }
             } else {
                 // User is not logged in - show landing page
+                console.log('👋 User logged out, resetting state');
                 setCurrentUser(null);
                 setUserAccountType(null);
                 setIsProvider(false);
@@ -398,80 +651,127 @@ export default function BrnnoMarketplace() {
         return () => unsubscribe();
     }, []);
 
-    // Check if returning user has already completed onboarding
-    async function checkUserOnboarding(uid) {
-        try {
-            const userQuery = query(
-                collection(db, 'users'),
-                where('uid', '==', uid)
-            );
-            const userSnapshot = await getDocs(userQuery);
+    // ==================== AUTO-INITIALIZE PACKAGES ====================
+    useEffect(() => {
+        // Auto-create packages if they don't exist (runs once on app load)
+        initializePackagesIfEmpty().catch(error => {
+            console.error('Failed to auto-initialize packages:', error);
+        });
+    }, []);
 
-            if (userSnapshot.empty) {
-                // User is logged in but no profile - they need to complete onboarding
+    // Check if returning user has already completed onboarding
+    async function checkUserOnboarding(uid, role) {
+        try {
+            console.log('🔍 Checking user onboarding for UID:', uid);
+            console.log('🔐 Auth state in checkUserOnboarding:', {
+                isAuthenticated: !!auth.currentUser,
+                uid: auth.currentUser?.uid,
+                expectedUid: uid
+            });
+
+            // Determine which collection to check based on role
+            const collectionName = role === 'detailer' ? 'detailer' : 'customer';
+            const userDocRef = doc(db, collectionName, uid);
+            console.log('📄 Attempting to read user document from:', collectionName);
+
+            let userDoc;
+            try {
+                userDoc = await getDoc(userDocRef);
+            } catch (docError) {
+                console.error('❌ Error reading user document:', docError);
+                console.error('Document read error details:', {
+                    code: docError.code,
+                    message: docError.message,
+                    stack: docError.stack
+                });
+                throw docError;
+            }
+
+            if (!userDoc.exists()) {
+                console.log('⚠️ User document not found - signing out to clear orphaned session');
+                // User is authenticated but has no Firestore document - sign them out
+                // This happens when Firebase Auth session exists but Firestore document was deleted
+                await signOut(auth);
                 setCurrentPage('landing');
+                setCurrentUser(null);
+                setUserAccountType(null);
+                setIsProvider(false);
+                console.log('✅ Signed out - user can now sign up fresh');
                 return;
             }
 
-            const userData = userSnapshot.docs[0].data();
-            const accountType = userData.accountType || 'customer';
+            const userData = userDoc.data();
+            console.log('📋 User data retrieved for role:', role);
 
-            // Store account type for conditional rendering
-            setUserAccountType(accountType);
-
-            // Providers/Admins should go straight to their dashboard
-            if (accountType === 'provider' || userData.role === 'admin') {
+            if (role === 'detailer') {
+                // Detailer/Provider flow
                 setIsProvider(true);
+                setAddress(
+                    userData.businessAddress ||
+                    userData.serviceArea ||
+                    ''
+                );
+                setUserCoordinates(userData.coordinates || null);
+                setAnswers({
+                    vehicleType: userData.vehicleSpecialty || 'All Vehicles',
+                    serviceType: userData.primaryService || 'Multiple Services',
+                    timeSlot: 'Flexible'
+                });
 
-                try {
-                    const providerSnapshot = await getDocs(
-                        query(collection(db, 'providers'), where('userId', '==', uid))
-                    );
-
-                    if (!providerSnapshot.empty) {
-                        const providerData = providerSnapshot.docs[0].data();
-
-                        setAddress(
-                            providerData.businessAddress ||
-                            providerData.serviceArea ||
-                            providerData.address ||
-                            ''
-                        );
-                        setUserCoordinates(providerData.coordinates || null);
-                        setAnswers({
-                            vehicleType: providerData.vehicleSpecialty || 'All Vehicles',
-                            serviceType: providerData.primaryService || 'Multiple Services',
-                            timeSlot: 'Flexible'
-                        });
-                    }
-                } catch (err) {
-                    console.warn('Unable to load provider profile for dashboard:', err?.message || err);
+                // Check if detailer needs to complete onboarding
+                if (!userData.onboarded || !userData.businessName || !userData.businessAddress) {
+                    console.log('⚠️ Detailer needs to complete onboarding');
+                    setCurrentPage('landing');
+                    setModalType('providerOnboarding');
+                    return;
                 }
 
                 setCurrentPage('dashboard');
-                return;
+                console.log('✅ Routed to dashboard');
             } else {
+                // Customer flow
                 setIsProvider(false);
-            }
 
-            // Customers - treat presence of profile as onboarded, even if address/preferences missing
-            if (userData.onboarded || userData.address || userData.preferences) {
+                // Customers - check if they have an address
+                if (userData.address || userData.coordinates) {
+                    console.log('👤 User is customer with address, routing to marketplace');
+                    setAddress(userData.coordinates?.formattedAddress || userData.address || '');
+                    setUserCoordinates(userData.coordinates || null);
+                    setAnswers({
+                        vehicleType: userData.preferences?.vehicleType || 'Sedan',
+                        serviceType: userData.preferences?.serviceType || 'Full Detail',
+                        timeSlot: userData.preferences?.timeSlot || 'Flexible'
+                    });
 
-                setAddress(userData.coordinates?.formattedAddress || userData.address || '');
-                setUserCoordinates(userData.coordinates || null);
-                setAnswers({
-                    vehicleType: userData.preferences?.vehicleType || 'Sedan',
-                    serviceType: userData.preferences?.serviceType || 'Full Detail',
-                    timeSlot: userData.preferences?.timeSlot || 'Flexible'
-                });
-
-                setCurrentPage('marketplace');
-            } else {
-                // Profile exists but incomplete - show landing to complete onboarding
-                setCurrentPage('landing');
+                    setCurrentPage('marketplace');
+                    console.log('✅ Routed to marketplace');
+                } else {
+                    // Customer exists but needs to enter address - show address modal
+                    console.log('⚠️ Customer needs to enter address, showing address modal');
+                    setCurrentPage('landing');
+                    setModalType('address');
+                }
             }
         } catch (error) {
-            console.error('Error checking user onboarding:', error);
+            console.error('❌ Error checking user onboarding:', error);
+            console.error('Onboarding error details:', {
+                code: error.code,
+                message: error.message,
+                stack: error.stack,
+                name: error.name
+            });
+            console.error('🔐 Auth state at error:', {
+                isAuthenticated: !!auth.currentUser,
+                uid: auth.currentUser?.uid,
+                email: auth.currentUser?.email
+            });
+
+            if (error.code === 'permission-denied') {
+                console.error('🚨 PERMISSION DENIED when reading own user document!');
+                console.error('This suggests Firestore rules may not be deployed or are incorrect.');
+                console.error('Please deploy the updated firestore.rules file to Firebase Console.');
+            }
+
             // On error, default to landing page
             setCurrentPage('landing');
         }
@@ -479,66 +779,93 @@ export default function BrnnoMarketplace() {
 
     // Load detailers when marketplace opens (and when coordinates become available)
     useEffect(() => {
-        if (currentPage === 'marketplace' && detailers.length === 0) {
-            loadDetailers();
+        if (currentPage === 'marketplace') {
+            // Always reload when navigating to marketplace to get latest data
+            console.log('🔄 Loading detailers for marketplace...');
+            // Use a small delay to ensure Firebase is ready
+            const loadTimeout = setTimeout(() => {
+                loadDetailers().catch(error => {
+                    console.error('Error loading detailers:', error);
+                });
+            }, 100);
+
+            return () => clearTimeout(loadTimeout);
         }
     }, [currentPage, userCoordinates]);
 
-    // Real-time listener for provider updates (optional but recommended)
+    // Real-time listener for provider updates - reloads detailers when providers change
     useEffect(() => {
         if (currentPage === 'marketplace') {
-            // Listen for changes to providers collection
-            const unsubscribe = onSnapshot(collection(db, 'providers'),
-                (snapshot) => {
-                    const loadedDetailers = snapshot.docs.map(doc => {
-                        const data = doc.data();
+            console.log('🔄 Setting up real-time listener for providers...');
+            let isInitialLoad = true;
+            let loadTimeout = null;
 
-                        // Filter only active services
-                        const activeServices = data.services
-                            ? data.services.filter(service => service.active !== false)
-                            : [];
+            // Listen for changes to users collection (providers) - unified structure
+            console.log('🔐 Setting up listener - Auth state:', {
+                isAuthenticated: !!auth.currentUser,
+                uid: auth.currentUser?.uid
+            });
 
-                        // Generate available times based on defaultAvailability
-                        const availableTimes = generateAvailableTimes(data.defaultAvailability);
+            const unsubscribe = onSnapshot(
+                query(collection(db, 'detailer')),
+                async (snapshot) => {
+                    // Skip the initial load - let the manual loadDetailers() handle it
+                    if (isInitialLoad) {
+                        console.log('⏭️ Skipping initial snapshot (handled by manual load)');
+                        isInitialLoad = false;
+                        return;
+                    }
 
-                        return {
-                            id: doc.id,
-                            name: data.businessName || 'Professional Detailer',
-                            ownerName: data.ownerName,
-                            rating: data.rating || 4.8,
-                            reviews: data.reviewCount || 150,
-                            distance: calculateDistance(address, data.serviceArea),
-                            available: data.status !== 'inactive',
-                            price: getStartingPrice(activeServices),
-                            image: data.image || null,
-                            about: data.about || 'Professional mobile detailing service. Background checked and insured.',
-                            services: activeServices,
-                            photos: data.portfolio || [],
-                            availableTimes: availableTimes,
-                            status: data.status,
-                            phone: data.phone,
-                            email: data.email,
-                            serviceArea: data.serviceArea,
-                            employeeCount: data.employeeCount || 1,
-                            backgroundCheck: data.backgroundCheck,
-                            defaultAvailability: data.defaultAvailability,
-                            dateOverrides: data.dateOverrides || {}
-                        };
-                    });
+                    // Debounce rapid updates
+                    if (loadTimeout) {
+                        clearTimeout(loadTimeout);
+                    }
 
-                    setDetailers(loadedDetailers);
+                    loadTimeout = setTimeout(async () => {
+                        console.log('📡 Providers updated! Reloading detailers...');
+                        try {
+                            await loadDetailers();
+                        } catch (error) {
+                            console.error('❌ Error reloading detailers from listener:', error);
+                            console.error('Error details:', {
+                                code: error.code,
+                                message: error.message,
+                                stack: error.stack
+                            });
+                        }
+                    }, 500); // Wait 500ms before reloading
                 },
                 (error) => {
-                    console.error('Error in real-time listener:', error);
+                    console.error('❌ Error in real-time listener:', error);
+                    console.error('Listener error details:', {
+                        code: error.code,
+                        message: error.message,
+                        stack: error.stack,
+                        name: error.name
+                    });
+                    console.error('🔐 Auth state at listener error:', {
+                        isAuthenticated: !!auth.currentUser,
+                        uid: auth.currentUser?.uid
+                    });
+                    // Don't reload on error - let manual load handle it
                 }
             );
 
+            // Mark initial load as complete after a short delay
+            setTimeout(() => {
+                isInitialLoad = false;
+            }, 1000);
+
             // Cleanup listener when leaving marketplace
             return () => {
+                console.log('🧹 Cleaning up real-time listener');
+                if (loadTimeout) {
+                    clearTimeout(loadTimeout);
+                }
                 unsubscribe();
             };
         }
-    }, [currentPage, address]);
+    }, [currentPage, address, userCoordinates]);
 
     // ==================== HELPER FUNCTIONS ====================
     function getInitials(name) {
@@ -552,24 +879,88 @@ export default function BrnnoMarketplace() {
 
     async function loadDetailers() {
         try {
+            console.log('!!!!!!!!!! --- I AM INSIDE THE NEW loadDetailers FUNCTION --- !!!!!!!!!');
+            console.log('!!!!!!!!!! --- QUERYING detailer COLLECTION (NOT users) --- !!!!!!!!!');
+            console.log('🔄 Starting loadDetailers...');
+
             // Load packages from Firestore
+            console.log('📦 Loading packages from Firestore...');
             const packagesQuery = collection(db, 'packages');
             const packagesSnapshot = await getDocs(packagesQuery);
             const packagesMap = {};
             packagesSnapshot.docs.forEach(doc => {
                 packagesMap[doc.id] = { id: doc.id, ...doc.data() };
             });
-            
+
             // Fallback to local packages if Firestore is empty
             if (Object.keys(packagesMap).length === 0) {
-                PACKAGES_DATA.forEach(pkg => {
-                    packagesMap[pkg.id] = pkg;
+                console.log('⚠️ No packages in Firestore, attempting to auto-create...');
+
+                // Try to auto-create packages
+                try {
+                    await initializePackagesIfEmpty();
+                    // Reload packages after creation
+                    const retrySnapshot = await getDocs(collection(db, 'packages'));
+                    retrySnapshot.docs.forEach(doc => {
+                        packagesMap[doc.id] = { id: doc.id, ...doc.data() };
+                    });
+
+                    if (Object.keys(packagesMap).length > 0) {
+                        console.log(`✅ Auto-created and loaded ${Object.keys(packagesMap).length} packages`);
+                    } else {
+                        // Still empty, use local fallback
+                        console.log('⚠️ Using local packages as fallback');
+                        PACKAGES_DATA.forEach(pkg => {
+                            packagesMap[pkg.id] = pkg;
+                        });
+                    }
+                } catch (error) {
+                    console.error('Error auto-creating packages:', error);
+                    // Fallback to local packages
+                    PACKAGES_DATA.forEach(pkg => {
+                        packagesMap[pkg.id] = pkg;
+                    });
+                }
+            }
+            console.log(`✅ Loaded ${Object.keys(packagesMap).length} packages`);
+
+            // Query detailer collection
+            console.log('🔍 Querying detailers from detailer collection...');
+            console.log('🔐 Auth state:', {
+                isAuthenticated: !!auth.currentUser,
+                uid: auth.currentUser?.uid,
+                email: auth.currentUser?.email
+            });
+
+            const providersQuery = query(
+                collection(db, 'detailer')
+            );
+
+            console.log('📤 Executing Firestore query...');
+            let snapshot;
+            try {
+                snapshot = await getDocs(providersQuery);
+                console.log(`✅ Query successful, found ${snapshot.docs.length} provider documents`);
+            } catch (queryError) {
+                console.error('❌ Firestore Query Error:', {
+                    code: queryError.code,
+                    message: queryError.message,
+                    stack: queryError.stack,
+                    name: queryError.name
                 });
+                console.error('🔍 Query Details:', {
+                    collection: 'detailer',
+                    whereClause: 'none (direct collection query)',
+                    isAuthenticated: !!auth.currentUser,
+                    uid: auth.currentUser?.uid
+                });
+                throw queryError; // Re-throw to be caught by outer catch
             }
 
-            // Query your Firebase 'providers' collection
-            const providersQuery = collection(db, 'providers');
-            const snapshot = await getDocs(providersQuery);
+            console.log('🔍 Loading detailers...', {
+                totalProviders: snapshot.docs.length,
+                packagesAvailable: Object.keys(packagesMap).length
+            });
 
             const loadedDetailers = await Promise.all(snapshot.docs.map(async (docSnapshot) => {
                 const data = docSnapshot.data();
@@ -577,10 +968,20 @@ export default function BrnnoMarketplace() {
                 // Load packages for this provider
                 const offeredPackages = data.offeredPackages || [];
                 const customPrices = data.packagePrices || {};
+
+                console.log(`📦 Provider: ${data.businessName || docSnapshot.id}`, {
+                    status: data.status,
+                    offeredPackagesCount: offeredPackages.length,
+                    offeredPackages: offeredPackages
+                });
+
                 const packages = offeredPackages
                     .map(pkgId => {
                         const pkg = packagesMap[pkgId];
-                        if (!pkg) return undefined;
+                        if (!pkg) {
+                            console.warn(`⚠️ Package ${pkgId} not found in packagesMap for provider ${data.businessName}`);
+                            return undefined;
+                        }
                         // Merge custom prices if they exist
                         if (customPrices[pkgId]) {
                             return {
@@ -619,11 +1020,11 @@ export default function BrnnoMarketplace() {
 
                 return {
                     id: docSnapshot.id,
-                    userId: data.userId, // Provider's user UID
-                    name: data.businessName || 'Professional Detailer',
-                    ownerName: data.ownerName,
-                    rating: data.rating || 4.8,
-                    reviews: data.reviewCount || 150,
+                    userId: data.uid, // Provider's user UID (now same as document ID)
+                    name: data.businessName || data.name || 'Professional Detailer',
+                    ownerName: data.name,
+                    rating: (data.reviewCount && data.reviewCount > 0) ? (data.rating || null) : null,
+                    reviews: data.reviewCount || 0,
                     distance: distance,
                     available: data.status === 'approved' && packages.length > 0, // Must be approved and have packages!
                     price: getStartingPriceFromPackages(packages),
@@ -646,19 +1047,76 @@ export default function BrnnoMarketplace() {
                 };
             }));
 
-            // Only show providers that are APPROVED and have packages
-            let availableDetailers = loadedDetailers.filter(d =>
-                d.hasPackages && d.status === 'approved'
-            );
+            // Show providers that are APPROVED
+            // Note: We'll show approved providers even if they don't have packages yet
+            // (they can add packages in their dashboard)
+            let availableDetailers = loadedDetailers.filter(d => {
+                const isApproved = d.status === 'approved';
+                if (!isApproved) {
+                    console.log(`❌ Filtered out: ${d.name} - Status: ${d.status}`);
+                } else if (!d.hasPackages) {
+                    console.warn(`⚠️ Approved provider ${d.name} has no packages yet`);
+                }
+                return isApproved;
+            });
+
+            console.log('✅ Filtered detailers:', {
+                total: loadedDetailers.length,
+                approved: availableDetailers.length,
+                withPackages: availableDetailers.filter(d => d.hasPackages).length,
+                withoutPackages: availableDetailers.filter(d => !d.hasPackages).length,
+                detailerNames: availableDetailers.map(d => d.name),
+                detailerIds: availableDetailers.map(d => d.id)
+            });
 
             // Sort by distance (closest first) by default
             availableDetailers.sort((a, b) => a.distance - b.distance);
 
+            console.log('💾 Setting detailers array with', availableDetailers.length, 'detailers');
             setDetailers(availableDetailers);
+            console.log('✅ Detailers state updated!');
         } catch (error) {
-            console.error('Error loading detailers:', error);
-            alert('Error loading detailers. Check console for details.');
+            // Enhanced error logging
+            console.error('❌ Error loading detailers:', error);
+            console.error('📋 Error details:', {
+                message: error.message,
+                code: error.code,
+                stack: error.stack,
+                name: error.name,
+                toString: error.toString()
+            });
+
+            // Log authentication state
+            console.error('🔐 Auth state at error:', {
+                currentUser: auth.currentUser,
+                uid: auth.currentUser?.uid,
+                email: auth.currentUser?.email,
+                isAuthenticated: !!auth.currentUser
+            });
+
+            // More specific error messages
+            let errorMessage = 'Error loading detailers. ';
+            if (error.code === 'permission-denied') {
+                errorMessage += 'Permission denied. Check Firestore rules.';
+                console.error('🚨 PERMISSION DENIED - Possible causes:');
+                console.error('   1. User not authenticated:', !auth.currentUser);
+                console.error('   2. Firestore rules may not allow queries');
+                console.error('   3. Check Firebase Console → Firestore → Rules');
+                console.error('   4. Current user UID:', auth.currentUser?.uid);
+            } else if (error.code === 'unavailable') {
+                errorMessage += 'Firebase is unavailable. Check your connection.';
+            } else if (error.code === 'failed-precondition') {
+                errorMessage += 'Query requires an index. Check Firebase Console.';
+            } else {
+                errorMessage += `Error: ${error.message}`;
+            }
+
+            // Always show alert and log to console
+            console.error('🚨 Showing error alert to user');
+            alert(`${errorMessage}\n\nCheck console (F12) for details.`);
+
             // Fallback to mock data if error
+            console.warn('⚠️ Falling back to mock data');
             setDetailers(getMockDetailers());
         }
     }
@@ -714,8 +1172,8 @@ export default function BrnnoMarketplace() {
             {
                 id: '1',
                 name: 'Premium Auto Spa',
-                rating: 4.9,
-                reviews: 183,
+                rating: null,
+                reviews: 0,
                 distance: '2.3',
                 available: true,
                 price: 75,
@@ -732,8 +1190,8 @@ export default function BrnnoMarketplace() {
             {
                 id: '2',
                 name: 'Elite Mobile Detail',
-                rating: 4.8,
-                reviews: 156,
+                rating: null,
+                reviews: 0,
                 distance: '3.1',
                 available: true,
                 price: 65,
@@ -759,57 +1217,90 @@ export default function BrnnoMarketplace() {
                 signupData.password
             );
 
-            // Save additional user info to Firestore
-            const userDocRef = await addDoc(collection(db, 'users'), {
-                uid: userCredential.user.uid,
-                name: signupData.name,
-                email: signupData.email,
-                firstName: signupData.name.split(' ')[0],
-                lastName: signupData.name.split(' ').slice(1).join(' '),
-                accountType: signupData.accountType || 'customer',
-                createdAt: serverTimestamp(),
-                updatedAt: serverTimestamp(),
-                address: address,
-                coordinates: userCoordinates || null, // Save geocoded coordinates
-                preferences: answers,
-                onboarded: signupData.accountType === 'provider' ? false : true
-            });
+            // Determine which collection to use based on account type
+            const accountType = signupData.accountType || 'customer';
+            const collectionName = accountType === 'provider' ? 'detailer' : 'customer';
 
-            // If provider, create provider document with pending status
-            if (signupData.accountType === 'provider') {
-                await addDoc(collection(db, 'providers'), {
-                    userId: userCredential.user.uid,
-                    ownerName: signupData.name,
-                    email: signupData.email,
-                    status: 'pending', // Requires admin approval
-                    offeredPackages: [], // Will be initialized on approval
-                    addOns: [], // Will be initialized on approval
-                    createdAt: serverTimestamp(),
-                    updatedAt: serverTimestamp()
+            // Create user document data
+            const userData = {
+                uid: userCredential.user.uid,
+                email: userCredential.user.email,
+                displayName: signupData.name,
+                photoURL: userCredential.user.photoURL,
+                createdAt: serverTimestamp(),
+            };
+
+            // Create document in the appropriate collection
+            if (accountType === 'provider') {
+                // Create detailer document
+                await setDoc(doc(db, 'detailer', userCredential.user.uid), {
+                    ...userData,
+                    businessName: signupData.name || 'New Business',
+                    businessAddress: '',
+                    serviceArea: '',
+                    phone: '',
+                    services: [],
+                    offeredPackages: [],
+                    addOns: [],
+                    packagePrices: {},
+                    defaultAvailability: {
+                        monday: { enabled: false, start: '09:00', end: '17:00' },
+                        tuesday: { enabled: false, start: '09:00', end: '17:00' },
+                        wednesday: { enabled: false, start: '09:00', end: '17:00' },
+                        thursday: { enabled: false, start: '09:00', end: '17:00' },
+                        friday: { enabled: false, start: '09:00', end: '17:00' },
+                        saturday: { enabled: false, start: '09:00', end: '17:00' },
+                        sunday: { enabled: false, start: '09:00', end: '17:00' }
+                    },
+                    dateOverrides: {},
+                    rating: 0,
+                    reviewCount: 0,
+                    employeeCount: 1,
+                    backgroundCheck: false,
+                    status: 'pending',
+                    onboarded: false
                 });
-                // Set account type immediately so dashboard routing works
-                setUserAccountType('provider');
-                setIsProvider(true);
-                setModalType(null);
-                setCurrentPage('dashboard');
             } else {
-                // Customer flow - save address and go to marketplace
-                try {
-                    if (address && address.trim()) {
-                        const addrDoc = doc(collection(db, 'users', userDocRef.id, 'addresses'));
-                        await setDoc(addrDoc, {
-                            label: 'Home',
-                            address: address,
-                            coordinates: userCoordinates || null,
-                            createdAt: serverTimestamp(),
-                            updatedAt: serverTimestamp()
-                        });
-                    }
-                } catch (e) {
-                    console.warn('Could not save saved address (email signup):', e?.message || e);
-                }
-                setModalType(null);
-                setCurrentPage('marketplace');
+                // Create customer document
+                await setDoc(doc(db, 'customer', userCredential.user.uid), {
+                    ...userData,
+                    savedAddresses: [],
+                    favoriteProviders: [],
+                    address: address || '',
+                    coordinates: userCoordinates || null,
+                    preferences: answers || {},
+                    onboarded: false
+                });
+            }
+
+            // Set user info immediately
+            const userInfo = {
+                uid: userCredential.user.uid,
+                email: userCredential.user.email,
+                name: signupData.name || userCredential.user.email.split('@')[0],
+                photoURL: userCredential.user.photoURL,
+                initials: getInitials(signupData.name || userCredential.user.email)
+            };
+            setCurrentUser(userInfo);
+
+            // Set account type for routing
+            setUserAccountType(signupData.accountType || 'customer');
+            if (signupData.accountType === 'provider') {
+                // Providers need to complete onboarding (business credentials)
+                setIsProvider(true);
+                setCurrentPage('landing');
+                // Pre-fill email in onboarding form
+                setProviderOnboardingData({
+                    businessName: '',
+                    businessAddress: '',
+                    serviceArea: '',
+                    phone: '',
+                    email: signupData.email || userCredential.user.email || ''
+                });
+                setModalType('providerOnboarding');
+            } else {
+                // Customers need to enter address after signup
+                setModalType('address');
             }
         } catch (error) {
             console.error('Signup error:', error);
@@ -817,128 +1308,191 @@ export default function BrnnoMarketplace() {
         }
     }
 
-    // Login function - only for existing users
-    async function handleGoogleLogin() {
+    // Email/password login function
+    async function handleEmailLogin() {
         try {
-            const result = await signInWithPopup(auth, googleProvider);
-
-            // Check if user already exists
-            const userQueryRef = query(
-                collection(db, 'users'),
-                where('uid', '==', result.user.uid)
-            );
-            const existingUser = await getDocs(userQueryRef);
-
-            if (existingUser.empty) {
-                // User doesn't exist - sign them out and tell them to use "Get Started"
-                await signOut(auth);
-                alert('No account found. Please use "Get Started" to create a new account and complete onboarding.');
+            if (!loginData.email || !loginData.password) {
+                alert('Please enter your email and password');
                 return;
             }
 
-            // User exists - the auth listener will handle routing them to the right page
+            console.log('🔐 Starting email login...');
+            const result = await signInWithEmailAndPassword(auth, loginData.email, loginData.password);
+            console.log('✅ Email login successful, UID:', result.user.uid);
+
+            // Check if user exists in customer or detailer collection
+            const customerDoc = await getDoc(doc(db, 'customer', result.user.uid));
+            const detailerDoc = await getDoc(doc(db, 'detailer', result.user.uid));
+            console.log('📄 Customer document exists:', customerDoc.exists());
+            console.log('📄 Detailer document exists:', detailerDoc.exists());
+
+            if (!customerDoc.exists() && !detailerDoc.exists()) {
+                // User doesn't exist - create a basic customer account automatically
+                console.log('⚠️ User document not found, creating new customer account...');
+
+                // Set flag to prevent auth listener from signing out during creation
+                isCreatingAccountRef.current = true;
+
+                const userData = {
+                    uid: result.user.uid,
+                    email: result.user.email,
+                    displayName: result.user.displayName || loginData.email.split('@')[0],
+                    photoURL: result.user.photoURL,
+                    createdAt: serverTimestamp(),
+                    savedAddresses: [],
+                    favoriteProviders: [],
+                    address: '',
+                    coordinates: null,
+                    preferences: {},
+                    onboarded: false
+                };
+
+                await setDoc(doc(db, 'customer', result.user.uid), userData);
+                console.log('✅ Created new customer account');
+
+                // Clear the flag after a short delay to allow auth listener to process
+                setTimeout(() => {
+                    isCreatingAccountRef.current = false;
+                }, 2000);
+
+                // Set account type and show address modal (same flow as signup)
+                setUserAccountType('customer');
+                setModalType('address');
+                setLoginData({ email: '', password: '' });
+                return;
+            }
+
+            // Close login modal - auth listener will handle routing
+            setModalType(null);
+            setLoginData({ email: '', password: '' });
         } catch (error) {
-            console.error('Google login error:', error.code, error.message);
+            console.error('❌ Email login error:', error.code, error.message);
+
+            if (error.code === 'auth/user-not-found') {
+                // No account found - redirect to signup with email pre-filled
+                setSignupData({ ...signupData, email: loginData.email });
+                setModalType('signup');
+                // Clear password from login data for security
+                setLoginData({ email: loginData.email, password: '' });
+            } else {
+                // Other errors - show alert
+                let errorMessage = 'Login failed. ';
+                if (error.code === 'auth/wrong-password') {
+                    errorMessage += 'Incorrect password.';
+                } else if (error.code === 'auth/invalid-email') {
+                    errorMessage += 'Invalid email address.';
+                } else {
+                    errorMessage += error.message;
+                }
+                alert(errorMessage);
+            }
+        }
+    }
+
+    // Generic Google sign-in function
+    const startGoogleSignIn = async () => {
+        try {
+            await signInWithPopup(auth, googleProvider);
+        } catch (error) {
+            console.error('Google Popup Error', error);
             if (error.code === 'permission-denied') {
                 alert('Permission error. Please check Firestore rules.');
             } else {
                 alert(`Sign-in failed: ${error.message}`);
             }
         }
+    };
+
+    // Login function - for existing users
+    async function handleGoogleLogin() {
+        // Clear any pending role (login doesn't create new accounts)
+        localStorage.removeItem('pendingUserRole');
+        await startGoogleSignIn();
     }
 
     // Signup function - for new users going through onboarding
     async function handleGoogleSignup() {
-        try {
-            // Capture account type BEFORE OAuth popup to ensure it's preserved
-            const selectedAccountType = signupData.accountType || 'customer';
-            
-            const result = await signInWithPopup(auth, googleProvider);
-
-            // Check if user already exists
-            const userQueryRef = query(
-                collection(db, 'users'),
-                where('uid', '==', result.user.uid)
-            );
-            const existingUser = await getDocs(userQueryRef);
-
-            if (existingUser.empty) {
-                // Only create if user doesn't exist
-                const newUserRef = await addDoc(collection(db, 'users'), {
-                    uid: result.user.uid,
-                    name: result.user.displayName,
-                    email: result.user.email,
-                    firstName: result.user.displayName?.split(' ')[0] || '',
-                    lastName: result.user.displayName?.split(' ').slice(1).join(' ') || '',
-                    photoURL: result.user.photoURL,
-                    accountType: selectedAccountType, // Use captured value
-                    createdAt: serverTimestamp(),
-                    updatedAt: serverTimestamp(),
-                    address: address,
-                    coordinates: userCoordinates || null,
-                    preferences: answers,
-                    onboarded: selectedAccountType === 'provider' ? false : true
-                });
-
-                // If provider, create provider document
-                if (selectedAccountType === 'provider') { // Use captured value
-                    await addDoc(collection(db, 'providers'), {
-                        userId: result.user.uid,
-                        ownerName: result.user.displayName,
-                        email: result.user.email,
-                        status: 'pending',
-                        offeredPackages: [], // Will be initialized on approval
-                        addOns: [], // Will be initialized on approval
-                        createdAt: serverTimestamp(),
-                        updatedAt: serverTimestamp()
-                    });
-                    // Set account type immediately so dashboard routing works
-                    setUserAccountType('provider');
-                    setModalType(null);
-                    setCurrentPage('dashboard');
-                } else {
-                    // Customer flow - save address into subcollection for new user
-                    try {
-                        if (address && address.trim()) {
-                            const addrDoc = doc(collection(db, 'users', newUserRef.id, 'addresses'));
-                            await setDoc(addrDoc, {
-                                label: 'Home',
-                                address: address,
-                                coordinates: userCoordinates || null,
-                                createdAt: serverTimestamp(),
-                                updatedAt: serverTimestamp()
-                            });
-                        }
-                    } catch (e) {
-                        console.warn('Could not save saved address (google new):', e?.message || e);
-                    }
-                    setModalType(null);
-                    setCurrentPage('marketplace');
-                }
-            } else {
-                // User already exists - sign them out and tell them to log in
-                await signOut(auth);
-                alert('Account already exists. Please log in instead.');
-            }
-        } catch (error) {
-            console.error('Google signup error:', error.code, error.message);
-            if (error.code === 'permission-denied') {
-                alert('Permission error. Please check Firestore rules.');
-            } else {
-                alert(`Sign-in failed: ${error.message}`);
-            }
-        }
+        // Role is already stored in localStorage by SignupModal
+        // Just trigger Google sign-in, auth listener will handle account creation
+        await startGoogleSignIn();
     }
 
     async function handleLogout() {
-        await signOut(auth);
-        setCurrentPage('landing');
-        setShowProfileDropdown(false);
+        try {
+            console.log('🚪 Logging out...');
+            // Clear all local state first
+            setCurrentUser(null);
+            setUserAccountType(null);
+            setIsProvider(false);
+            setShowProfileDropdown(false);
+            setAddress('');
+            setAnswers({
+                vehicleType: '',
+                serviceType: '',
+                timeSlot: ''
+            });
+            setUserCoordinates(null);
+            setDetailers([]);
+
+            // Sign out from Firebase
+            await signOut(auth);
+            console.log('✅ Logged out successfully');
+
+            // Clear Firebase Auth storage from browser
+            try {
+                // Clear Firebase Auth persistence
+                if (typeof window !== 'undefined' && window.indexedDB) {
+                    // Clear IndexedDB Firebase Auth storage
+                    const deleteReq = indexedDB.deleteDatabase('firebaseLocalStorageDb');
+                    deleteReq.onsuccess = () => {
+                        console.log('✅ Cleared Firebase Auth storage');
+                    };
+                    deleteReq.onerror = () => {
+                        console.warn('⚠️ Could not clear Firebase Auth storage');
+                    };
+                }
+                // Also clear localStorage Firebase keys
+                Object.keys(localStorage).forEach(key => {
+                    if (key.startsWith('firebase:authUser:')) {
+                        localStorage.removeItem(key);
+                    }
+                });
+            } catch (storageError) {
+                console.warn('⚠️ Could not clear browser storage:', storageError);
+            }
+
+            // Navigate to landing page
+            setCurrentPage('landing');
+
+            // Clear any modals
+            setModalType(null);
+
+            // Force page reload to clear any cached state
+            window.location.reload();
+        } catch (error) {
+            console.error('❌ Error during logout:', error);
+            // Still navigate to landing page even if signOut fails
+            setCurrentPage('landing');
+            setCurrentUser(null);
+            // Force reload to clear state
+            window.location.reload();
+        }
     }
 
     // ==================== ONBOARDING FLOW ====================
     function startOnboarding() {
-        setModalType('address');
+        // If user is already logged in but needs address, show address modal
+        if (currentUser && userAccountType === 'customer' && !address) {
+            setModalType('address');
+        } else {
+            // Show signup modal first - users can choose customer or provider
+            setModalType('signup');
+        }
+    }
+
+    function startLogin() {
+        // Show login modal for returning users
+        setModalType('login');
     }
 
     async function handleAddressSubmit() {
@@ -969,9 +1523,37 @@ export default function BrnnoMarketplace() {
                 setAddress(coords.formattedAddress);
             }
 
-            // Continue to questions
-            setModalType('questions');
-            setCurrentQuestionIndex(0);
+            // Save address to customer's document and subcollection if user is logged in
+            if (currentUser && currentUser.uid) {
+                try {
+                    // Update customer document with address (customers only, detailers don't need this)
+                    const customerDocRef = doc(db, 'customer', currentUser.uid);
+                    const customerDoc = await getDoc(customerDocRef);
+                    if (customerDoc.exists()) {
+                        await updateDoc(customerDocRef, {
+                            address: coords.formattedAddress || address,
+                            coordinates: coords,
+                            updatedAt: serverTimestamp()
+                        });
+
+                        // Save to addresses subcollection
+                        const addrDoc = doc(collection(db, 'customer', currentUser.uid, 'addresses'));
+                        await setDoc(addrDoc, {
+                            label: 'Home',
+                            address: coords.formattedAddress || address,
+                            coordinates: coords,
+                            createdAt: serverTimestamp(),
+                            updatedAt: serverTimestamp()
+                        });
+                    }
+                } catch (e) {
+                    console.warn('Could not save address:', e?.message || e);
+                }
+            }
+
+            // Close modal and go to marketplace
+            setModalType(null);
+            setCurrentPage('marketplace');
         } catch (error) {
             console.error('Error geocoding address:', error);
             alert('Error validating address. Please try again.');
@@ -979,23 +1561,78 @@ export default function BrnnoMarketplace() {
         }
     }
 
-    function handleAnswerSelect(answer) {
-        const currentQ = questions[currentQuestionIndex];
-        setAnswers(prev => ({ ...prev, [currentQ.id]: answer }));
+    // Question handlers removed - questions flow removed
 
-        if (currentQuestionIndex < questions.length - 1) {
-            setCurrentQuestionIndex(prev => prev + 1);
-        } else {
-            // All questions answered
-            setModalType('signup');
+    // ==================== PROVIDER ONBOARDING ====================
+    async function handleProviderOnboarding() {
+        if (!currentUser || !currentUser.uid) {
+            alert('You must be logged in to complete provider onboarding');
+            return;
         }
-    }
 
-    function handleBackQuestion() {
-        if (currentQuestionIndex > 0) {
-            setCurrentQuestionIndex(prev => prev - 1);
-        } else {
-            setModalType('address');
+        if (!providerOnboardingData.businessName || !providerOnboardingData.businessAddress) {
+            alert('Please fill in all required fields (Business Name and Business Address)');
+            return;
+        }
+
+        try {
+            // Use coordinates from Google Places Autocomplete if available
+            let coords = userCoordinates;
+
+            // Check if we already have coordinates from Google Places Autocomplete
+            // The coordinates should match the business address if user selected from autocomplete
+            if (coords && coords.lat && coords.lng && coords.formattedAddress) {
+                // Verify the address matches (allowing for slight variations)
+                const addressMatches = coords.formattedAddress === providerOnboardingData.businessAddress ||
+                    providerOnboardingData.businessAddress.includes(coords.formattedAddress.split(',')[0]) ||
+                    coords.formattedAddress.includes(providerOnboardingData.businessAddress.split(',')[0]);
+
+                if (addressMatches) {
+                    console.log('✅ Using coordinates from Google Places Autocomplete');
+                } else {
+                    console.warn('⚠️ Address mismatch, but using existing coordinates');
+                    // Still use the coordinates but update the formatted address
+                    coords = {
+                        ...coords,
+                        formattedAddress: providerOnboardingData.businessAddress
+                    };
+                }
+            } else {
+                // No coordinates available - user must select from autocomplete
+                if (!providerOnboardingData.businessAddress || !providerOnboardingData.businessAddress.trim()) {
+                    alert('Please enter a valid business address.');
+                    return;
+                }
+
+                alert('Please select an address from the suggestions dropdown. This ensures accurate location data.');
+                return;
+            }
+
+            // Update detailer document with provider business information
+            const detailerDocRef = doc(db, 'detailer', currentUser.uid);
+            await updateDoc(detailerDocRef, {
+                businessName: providerOnboardingData.businessName,
+                businessAddress: providerOnboardingData.businessAddress,
+                serviceArea: providerOnboardingData.serviceArea || providerOnboardingData.businessAddress,
+                phone: providerOnboardingData.phone || '',
+                email: providerOnboardingData.email || currentUser.email,
+                coordinates: coords,
+                onboarded: true,
+                updatedAt: serverTimestamp()
+            });
+
+            console.log('✅ Provider onboarding completed');
+
+            // Close modal and go to dashboard
+            setModalType(null);
+            setCurrentPage('dashboard');
+
+            // Update local state
+            setAddress(providerOnboardingData.businessAddress);
+            setUserCoordinates(coords);
+        } catch (error) {
+            console.error('Error completing provider onboarding:', error);
+            alert(`Error saving business information: ${error.message}`);
         }
     }
 
@@ -1017,7 +1654,7 @@ export default function BrnnoMarketplace() {
             {currentPage === 'landing' && (
                 <LandingPage
                     onGetStarted={startOnboarding}
-                    onLogin={handleGoogleLogin}
+                    onLogin={startLogin}
                 />
             )}
 
@@ -1097,15 +1734,20 @@ export default function BrnnoMarketplace() {
                 />
             )}
 
-            {modalType === 'questions' && (
-                <QuestionsModal
-                    question={questions[currentQuestionIndex]}
-                    currentIndex={currentQuestionIndex}
-                    totalQuestions={questions.length}
-                    selectedAnswer={answers[questions[currentQuestionIndex].id]}
-                    onSelectAnswer={handleAnswerSelect}
-                    onBack={handleBackQuestion}
+            {modalType === 'login' && (
+                <LoginModal
+                    loginData={loginData}
+                    setLoginData={setLoginData}
+                    onEmailLogin={handleEmailLogin}
+                    onGoogleLogin={handleGoogleLogin}
                     onClose={() => setModalType(null)}
+                    onSwitchToSignup={() => {
+                        setModalType('signup');
+                        // Pre-fill email if they entered it
+                        if (loginData.email) {
+                            setSignupData({ ...signupData, email: loginData.email });
+                        }
+                    }}
                 />
             )}
 
@@ -1115,7 +1757,24 @@ export default function BrnnoMarketplace() {
                     setSignupData={setSignupData}
                     onEmailSignup={handleEmailSignup}
                     onGoogleSignup={handleGoogleSignup}
-                    onBack={() => setModalType('questions')}
+                    onBack={null}
+                    onClose={() => setModalType(null)}
+                    onSwitchToLogin={() => {
+                        setModalType('login');
+                        // Pre-fill email if they entered it
+                        if (signupData.email) {
+                            setLoginData({ ...loginData, email: signupData.email });
+                        }
+                    }}
+                />
+            )}
+
+            {modalType === 'providerOnboarding' && (
+                <ProviderOnboardingModal
+                    providerOnboardingData={providerOnboardingData}
+                    setProviderOnboardingData={setProviderOnboardingData}
+                    addressInputRef={addressInputRef}
+                    onSubmit={handleProviderOnboarding}
                     onClose={() => setModalType(null)}
                 />
             )}
@@ -1125,6 +1784,22 @@ export default function BrnnoMarketplace() {
 
 // ==================== LANDING PAGE ====================
 function LandingPage({ onGetStarted, onLogin }) {
+    // Helper function to clear all browser storage (for debugging)
+    const clearAllStorage = () => {
+        try {
+            localStorage.clear();
+            sessionStorage.clear();
+            if (window.indexedDB) {
+                indexedDB.deleteDatabase('firebaseLocalStorageDb');
+            }
+            alert('Browser storage cleared! Page will reload.');
+            window.location.reload();
+        } catch (e) {
+            console.error('Error clearing storage:', e);
+            alert('Could not clear storage. Please clear manually in DevTools.');
+        }
+    };
+
     return (
         <div className="min-h-screen bg-gradient-to-br from-blue-600 via-blue-700 to-blue-900 text-white">
             <div className="max-w-6xl mx-auto px-4 py-12 sm:py-20">
@@ -1140,13 +1815,24 @@ function LandingPage({ onGetStarted, onLogin }) {
                         >
                             Get Started
                         </button>
-                        <button
-                            onClick={onLogin}
-                            className="w-full sm:w-auto bg-blue-500 text-white px-8 sm:px-12 py-3 sm:py-4 rounded-xl text-lg sm:text-xl font-semibold hover:bg-blue-400 transition-all transform hover:scale-105 shadow-2xl border-2 border-blue-400"
-                        >
-                            Login
-                        </button>
+                        {onLogin && (
+                            <button
+                                onClick={onLogin}
+                                className="w-full sm:w-auto bg-transparent border-2 border-white text-white px-8 sm:px-12 py-3 sm:py-4 rounded-xl text-lg sm:text-xl font-semibold hover:bg-white/10 transition-all transform hover:scale-105"
+                            >
+                                Sign In
+                            </button>
+                        )}
                     </div>
+                    {/* Debug button - remove in production */}
+                    {process.env.NODE_ENV === 'development' && (
+                        <button
+                            onClick={clearAllStorage}
+                            className="mt-4 text-xs text-blue-200 hover:text-white underline"
+                        >
+                            Clear Browser Storage (Debug)
+                        </button>
+                    )}
                 </div>
 
                 <div className="grid sm:grid-cols-2 md:grid-cols-3 gap-6 sm:gap-8 mt-12 sm:mt-20 px-4">
@@ -1224,12 +1910,13 @@ function AddressModal({ address, setAddress, addressInputRef, onSubmit, onClose 
     );
 }
 
-function QuestionsModal({ question, currentIndex, totalQuestions, selectedAnswer, onSelectAnswer, onBack, onClose }) {
-    const Icon = question.icon;
+// QuestionsModal component removed - questions flow removed
 
+// ==================== LOGIN MODAL ====================
+function LoginModal({ loginData, setLoginData, onEmailLogin, onGoogleLogin, onClose, onSwitchToSignup }) {
     return (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
-            <div className="bg-white rounded-2xl max-w-2xl w-full p-8 relative animate-fadeIn">
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50 overflow-y-auto">
+            <div className="bg-white rounded-2xl max-w-md w-full p-8 relative my-8 animate-fadeIn">
                 <button
                     onClick={onClose}
                     className="absolute top-4 right-4 text-gray-400 hover:text-gray-600"
@@ -1237,47 +1924,190 @@ function QuestionsModal({ question, currentIndex, totalQuestions, selectedAnswer
                     <X className="w-6 h-6" />
                 </button>
 
-                <div className="mb-8">
-                    <div className="flex items-center justify-between mb-4">
-                        <Icon className="w-10 h-10 text-blue-600" />
-                        <span className="text-sm text-gray-500">
-                            Question {currentIndex + 1} of {totalQuestions}
-                        </span>
-                    </div>
+                <div className="mb-6">
                     <h2 className="text-2xl font-bold text-gray-900 mb-2">
-                        {question.question}
+                        Welcome back
                     </h2>
+                    <p className="text-gray-600">
+                        Sign in to your account
+                    </p>
                 </div>
 
-                <div className="grid grid-cols-2 gap-3 mb-6">
-                    {question.options.map((option) => (
-                        <button
-                            key={option}
-                            onClick={() => onSelectAnswer(option)}
-                            className={`p-4 rounded-xl border-2 font-medium transition-all ${selectedAnswer === option
-                                ? 'border-blue-600 bg-blue-50 text-blue-600'
-                                : 'border-gray-200 hover:border-blue-300 text-gray-700'
-                                }`}
-                        >
-                            {option}
-                        </button>
-                    ))}
+                <div className="space-y-4 mb-6">
+                    <input
+                        type="email"
+                        value={loginData.email}
+                        onChange={(e) => setLoginData({ ...loginData, email: e.target.value })}
+                        placeholder="Email"
+                        className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                        onKeyPress={(e) => {
+                            if (e.key === 'Enter' && loginData.email && loginData.password) {
+                                onEmailLogin();
+                            }
+                        }}
+                    />
+                    <input
+                        type="password"
+                        value={loginData.password}
+                        onChange={(e) => setLoginData({ ...loginData, password: e.target.value })}
+                        placeholder="Password"
+                        className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                        onKeyPress={(e) => {
+                            if (e.key === 'Enter' && loginData.email && loginData.password) {
+                                onEmailLogin();
+                            }
+                        }}
+                    />
                 </div>
 
-                {currentIndex > 0 && (
+                <button
+                    onClick={onEmailLogin}
+                    disabled={!loginData.email || !loginData.password}
+                    className="w-full bg-blue-600 text-white py-3 rounded-xl font-semibold hover:bg-blue-700 transition-colors mb-4 disabled:bg-gray-300 disabled:cursor-not-allowed"
+                >
+                    Sign In
+                </button>
+
+                <div className="relative my-6">
+                    <div className="absolute inset-0 flex items-center">
+                        <div className="w-full border-t border-gray-200"></div>
+                    </div>
+                    <div className="relative flex justify-center text-sm">
+                        <span className="px-4 bg-white text-gray-500">or</span>
+                    </div>
+                </div>
+
+                <button
+                    onClick={onGoogleLogin}
+                    className="w-full bg-white border-2 border-gray-200 text-gray-700 py-3 rounded-xl font-semibold hover:bg-gray-50 transition-colors flex items-center justify-center gap-2 mb-4"
+                >
+                    <svg className="w-5 h-5" viewBox="0 0 24 24">
+                        <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
+                        <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" />
+                        <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" />
+                        <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" />
+                    </svg>
+                    Continue with Google
+                </button>
+
+                <div className="text-center">
                     <button
-                        onClick={onBack}
+                        onClick={onSwitchToSignup}
                         className="text-blue-600 font-medium hover:text-blue-700"
                     >
-                        ← Back
+                        Don't have an account? Sign up
                     </button>
-                )}
+                </div>
             </div>
         </div>
     );
 }
 
-function SignupModal({ signupData, setSignupData, onEmailSignup, onGoogleSignup, onBack, onClose }) {
+// ==================== PROVIDER ONBOARDING MODAL ====================
+function ProviderOnboardingModal({ providerOnboardingData, setProviderOnboardingData, addressInputRef, onSubmit, onClose }) {
+    return (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50 overflow-y-auto">
+            <div className="bg-white rounded-2xl max-w-2xl w-full p-8 relative my-8 animate-fadeIn">
+                <button
+                    onClick={onClose}
+                    className="absolute top-4 right-4 text-gray-400 hover:text-gray-600"
+                >
+                    <X className="w-6 h-6" />
+                </button>
+
+                <div className="mb-6">
+                    <h2 className="text-2xl font-bold text-gray-900 mb-2">
+                        Complete Your Provider Profile
+                    </h2>
+                    <p className="text-gray-600">
+                        Please provide your business information to get started
+                    </p>
+                </div>
+
+                <div className="space-y-4 mb-6">
+                    <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                            Business Name <span className="text-red-500">*</span>
+                        </label>
+                        <input
+                            type="text"
+                            value={providerOnboardingData.businessName}
+                            onChange={(e) => setProviderOnboardingData({ ...providerOnboardingData, businessName: e.target.value })}
+                            placeholder="Your Business Name"
+                            className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                        />
+                    </div>
+
+                    <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                            Business Address <span className="text-red-500">*</span>
+                        </label>
+                        <input
+                            ref={addressInputRef}
+                            type="text"
+                            value={providerOnboardingData.businessAddress}
+                            onChange={(e) => setProviderOnboardingData({ ...providerOnboardingData, businessAddress: e.target.value })}
+                            placeholder="Start typing your business address..."
+                            className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                        />
+                        <p className="mt-1 text-xs text-gray-500">
+                            This address will be used to help customers find you
+                        </p>
+                    </div>
+
+                    <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                            Service Area (Optional)
+                        </label>
+                        <input
+                            type="text"
+                            value={providerOnboardingData.serviceArea}
+                            onChange={(e) => setProviderOnboardingData({ ...providerOnboardingData, serviceArea: e.target.value })}
+                            placeholder="e.g., Los Angeles, CA or 25 miles radius"
+                            className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                        />
+                    </div>
+
+                    <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                            Business Phone (Optional)
+                        </label>
+                        <input
+                            type="tel"
+                            value={providerOnboardingData.phone}
+                            onChange={(e) => setProviderOnboardingData({ ...providerOnboardingData, phone: e.target.value })}
+                            placeholder="(555) 123-4567"
+                            className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                        />
+                    </div>
+
+                    <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                            Business Email (Optional)
+                        </label>
+                        <input
+                            type="email"
+                            value={providerOnboardingData.email}
+                            onChange={(e) => setProviderOnboardingData({ ...providerOnboardingData, email: e.target.value })}
+                            placeholder="business@example.com"
+                            className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                        />
+                    </div>
+                </div>
+
+                <button
+                    onClick={onSubmit}
+                    disabled={!providerOnboardingData.businessName || !providerOnboardingData.businessAddress}
+                    className="w-full bg-blue-600 text-white py-3 rounded-xl font-semibold hover:bg-blue-700 transition-colors disabled:bg-gray-300 disabled:cursor-not-allowed"
+                >
+                    Complete Setup
+                </button>
+            </div>
+        </div>
+    );
+}
+
+function SignupModal({ signupData, setSignupData, onEmailSignup, onGoogleSignup, onBack, onClose, onSwitchToLogin }) {
     return (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50 overflow-y-auto">
             <div className="bg-white rounded-2xl max-w-md w-full p-8 relative my-8 animate-fadeIn">
@@ -1306,22 +2136,20 @@ function SignupModal({ signupData, setSignupData, onEmailSignup, onGoogleSignup,
                         <button
                             type="button"
                             onClick={() => setSignupData({ ...signupData, accountType: 'customer' })}
-                            className={`px-4 py-3 rounded-xl border-2 font-medium transition-all ${
-                                signupData.accountType === 'customer'
-                                    ? 'border-blue-600 bg-blue-50 text-blue-700'
-                                    : 'border-gray-200 text-gray-700 hover:border-gray-300'
-                            }`}
+                            className={`px-4 py-3 rounded-xl border-2 font-medium transition-all ${signupData.accountType === 'customer'
+                                ? 'border-blue-600 bg-blue-50 text-blue-700'
+                                : 'border-gray-200 text-gray-700 hover:border-gray-300'
+                                }`}
                         >
                             Customer
                         </button>
                         <button
                             type="button"
                             onClick={() => setSignupData({ ...signupData, accountType: 'provider' })}
-                            className={`px-4 py-3 rounded-xl border-2 font-medium transition-all ${
-                                signupData.accountType === 'provider'
-                                    ? 'border-blue-600 bg-blue-50 text-blue-700'
-                                    : 'border-gray-200 text-gray-700 hover:border-gray-300'
-                            }`}
+                            className={`px-4 py-3 rounded-xl border-2 font-medium transition-all ${signupData.accountType === 'provider'
+                                ? 'border-blue-600 bg-blue-50 text-blue-700'
+                                : 'border-gray-200 text-gray-700 hover:border-gray-300'
+                                }`}
                         >
                             Provider
                         </button>
@@ -1375,7 +2203,12 @@ function SignupModal({ signupData, setSignupData, onEmailSignup, onGoogleSignup,
                 </div>
 
                 <button
-                    onClick={onGoogleSignup}
+                    onClick={() => {
+                        // Store role in localStorage before Google sign-in
+                        const role = signupData.accountType === 'provider' ? 'detailer' : 'customer';
+                        localStorage.setItem('pendingUserRole', role);
+                        onGoogleSignup();
+                    }}
                     className="w-full bg-white border-2 border-gray-200 text-gray-700 py-3 rounded-xl font-semibold hover:bg-gray-50 transition-colors flex items-center justify-center gap-2"
                 >
                     <svg className="w-5 h-5" viewBox="0 0 24 24">
@@ -1387,12 +2220,16 @@ function SignupModal({ signupData, setSignupData, onEmailSignup, onGoogleSignup,
                     Continue with Google
                 </button>
 
-                <button
-                    onClick={onBack}
-                    className="w-full mt-4 text-blue-600 font-medium hover:text-blue-700"
-                >
-                    ← Back
-                </button>
+                <div className="flex items-center justify-center mt-4">
+                    {onSwitchToLogin && (
+                        <button
+                            onClick={onSwitchToLogin}
+                            className="text-blue-600 font-medium hover:text-blue-700"
+                        >
+                            Already have an account? Sign in
+                        </button>
+                    )}
+                </div>
             </div>
         </div>
     );
@@ -1443,9 +2280,9 @@ function BookingSidebar({
 
     // Available packages from detailer
     const availablePackages = detailer.packages || [];
-    
+
     // Available add-ons (from detailer or all add-ons)
-    const availableAddOnsList = detailer.addOns 
+    const availableAddOnsList = detailer.addOns
         ? ADD_ONS.filter(addon => detailer.addOns.includes(addon.id))
         : ADD_ONS;
 
@@ -1506,8 +2343,8 @@ function BookingSidebar({
 
     // Toggle add-on selection
     const toggleAddOn = (addOnId) => {
-        setSelectedAddOns(prev => 
-            prev.includes(addOnId) 
+        setSelectedAddOns(prev =>
+            prev.includes(addOnId)
                 ? prev.filter(id => id !== addOnId)
                 : [...prev, addOnId]
         );
@@ -1521,12 +2358,9 @@ function BookingSidebar({
 
         // Prevent providers from booking services
         try {
-            const providerQuery = query(
-                collection(db, 'providers'),
-                where('userId', '==', currentUser.uid)
-            );
-            const providerSnapshot = await getDocs(providerQuery);
-            if (!providerSnapshot.empty) {
+            // Check if user is a detailer
+            const detailerDoc = await getDoc(doc(db, 'detailer', currentUser.uid));
+            if (detailerDoc.exists()) {
                 alert('Providers cannot book services. Please use your provider dashboard to manage bookings.');
                 return;
             }
@@ -1709,9 +2543,15 @@ function BookingSidebar({
                     <div>
                         <h3 className="font-bold text-lg">{detailer.name}</h3>
                         <div className="flex items-center gap-1 text-sm">
-                            <Star className="w-4 h-4 fill-yellow-400 text-yellow-400" />
-                            <span className="font-semibold">{detailer.rating}</span>
-                            <span className="text-gray-500">({detailer.reviews})</span>
+                            <Star className={`w-4 h-4 ${detailer.reviews > 0 ? 'fill-yellow-400 text-yellow-400' : 'fill-gray-300 text-gray-300'}`} />
+                            {detailer.rating && detailer.reviews > 0 ? (
+                                <>
+                                    <span className="font-semibold">{detailer.rating}</span>
+                                    <span className="text-gray-500">({detailer.reviews})</span>
+                                </>
+                            ) : (
+                                <span className="text-gray-500">No reviews yet</span>
+                            )}
                         </div>
                     </div>
                 </div>
@@ -1850,11 +2690,10 @@ function BookingSidebar({
                                     <div
                                         key={pkg.id}
                                         onClick={() => setSelectedPackage(pkg)}
-                                        className={`w-full text-left p-4 border-2 rounded-lg transition-all cursor-pointer ${
-                                            isSelected 
-                                                ? 'border-blue-600 bg-blue-50' 
-                                                : 'border-gray-200 hover:border-blue-300'
-                                        }`}
+                                        className={`w-full text-left p-4 border-2 rounded-lg transition-all cursor-pointer ${isSelected
+                                            ? 'border-blue-600 bg-blue-50'
+                                            : 'border-gray-200 hover:border-blue-300'
+                                            }`}
                                     >
                                         <div className="flex items-start justify-between gap-3 mb-2">
                                             <div className="flex items-center gap-3 flex-1 min-w-0">
@@ -1878,7 +2717,7 @@ function BookingSidebar({
                                                 <div className="text-xs text-gray-500">- ${pkg.priceMax}</div>
                                             </div>
                                         </div>
-                                        
+
                                         {/* Show services included when selected */}
                                         {isSelected && (
                                             <div className="mt-3 pt-3 border-t border-blue-200">
@@ -1932,11 +2771,10 @@ function BookingSidebar({
                                     <div
                                         key={addOn.id}
                                         onClick={() => toggleAddOn(addOn.id)}
-                                        className={`w-full text-left px-3 py-2 border-2 rounded-lg transition-all cursor-pointer ${
-                                            isSelected 
-                                                ? 'border-blue-600 bg-blue-50' 
-                                                : 'border-gray-200 hover:border-blue-300'
-                                        }`}
+                                        className={`w-full text-left px-3 py-2 border-2 rounded-lg transition-all cursor-pointer ${isSelected
+                                            ? 'border-blue-600 bg-blue-50'
+                                            : 'border-gray-200 hover:border-blue-300'
+                                            }`}
                                     >
                                         <div className="flex items-center justify-between gap-2">
                                             <div className="flex items-center gap-2 flex-1 min-w-0">
@@ -2033,10 +2871,10 @@ function BookingSidebar({
                     disabled={isBooking || !selectedPackage || !selectedTime || !selectedDate}
                     className="w-full bg-blue-600 text-white py-4 rounded-xl font-bold text-lg hover:bg-blue-700 transition-colors shadow-lg disabled:bg-gray-300 disabled:cursor-not-allowed mb-4"
                 >
-                    {isBooking 
-                        ? 'Booking...' 
+                    {isBooking
+                        ? 'Booking...'
                         : !selectedPackage
-                            ? 'Select Package' 
+                            ? 'Select Package'
                             : `Book ${selectedPackage.name}`
                     }
                 </button>
@@ -2112,10 +2950,10 @@ function BookingSidebar({
                     disabled={isBooking || !selectedPackage || !selectedTime || !selectedDate}
                     className="w-full bg-blue-600 text-white py-3 rounded-xl font-bold text-base hover:bg-blue-700 transition-colors shadow-lg disabled:bg-gray-300 disabled:cursor-not-allowed"
                 >
-                    {isBooking 
-                        ? 'Booking...' 
+                    {isBooking
+                        ? 'Booking...'
                         : !selectedPackage
-                            ? 'Select Package' 
+                            ? 'Select Package'
                             : `Book ${selectedPackage.name}`
                     }
                 </button>
@@ -2277,6 +3115,7 @@ function MarketplacePage({
 
             {/* Detailer List */}
             <div className="max-w-6xl mx-auto px-4 py-8">
+                {console.log('🎨 Rendering marketplace - detailers count:', detailers.length, 'detailers:', detailers.map(d => d.name))}
                 {detailers.length === 0 ? (
                     <div className="text-center py-12">
                         <Search className="w-16 h-16 text-gray-300 mx-auto mb-4" />
@@ -2343,10 +3182,16 @@ function DetailerCard({ detailer, onClick }) {
 
                 <div className="flex items-center gap-2 mb-2">
                     <div className="flex items-center gap-1">
-                        <Star className="w-4 h-4 fill-yellow-400 text-yellow-400" />
-                        <span className="font-semibold">{detailer.rating}</span>
+                        <Star className={`w-4 h-4 ${detailer.reviews > 0 ? 'fill-yellow-400 text-yellow-400' : 'fill-gray-300 text-gray-300'}`} />
+                        {detailer.rating && detailer.reviews > 0 ? (
+                            <>
+                                <span className="font-semibold">{detailer.rating}</span>
+                                <span className="text-sm text-gray-500">({detailer.reviews})</span>
+                            </>
+                        ) : (
+                            <span className="text-sm text-gray-500">No reviews yet</span>
+                        )}
                     </div>
-                    <span className="text-sm text-gray-500">({detailer.reviews})</span>
                 </div>
                 <div className="space-y-1 text-sm text-gray-600 mb-3">
                     <div className="flex items-center gap-1">
@@ -2439,9 +3284,15 @@ function DetailerProfilePage({ detailer, answers, address, setAddress, setAnswer
                             </h1>
                             <div className="flex flex-col sm:flex-row items-start sm:items-center gap-2 sm:gap-4 text-sm mb-3">
                                 <div className="flex items-center gap-1">
-                                    <Star className="w-4 h-4 sm:w-5 sm:h-5 text-yellow-500 fill-current" />
-                                    <span className="font-semibold text-base sm:text-lg">{detailer.rating}</span>
-                                    <span className="text-gray-500">({detailer.reviews} reviews)</span>
+                                    <Star className={`w-4 h-4 sm:w-5 sm:h-5 ${detailer.reviews > 0 ? 'text-yellow-500 fill-current' : 'text-gray-300 fill-gray-300'}`} />
+                                    {detailer.rating && detailer.reviews > 0 ? (
+                                        <>
+                                            <span className="font-semibold text-base sm:text-lg">{detailer.rating}</span>
+                                            <span className="text-gray-500">({detailer.reviews} reviews)</span>
+                                        </>
+                                    ) : (
+                                        <span className="text-gray-500 text-sm sm:text-base">No reviews yet</span>
+                                    )}
                                 </div>
                                 <span className="hidden sm:inline text-gray-400">•</span>
                                 <div className="flex items-center gap-1 text-gray-600">
@@ -2644,21 +3495,77 @@ function CustomerDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
         }
     }, [currentUser]);
 
+    // Initialize notifications for customers
+    useEffect(() => {
+        if (!currentUser) return;
+
+        let unsubscribeNotifications = null;
+        let unsubscribeUnread = null;
+
+        async function initializeNotifications() {
+            try {
+                // Request notification permission and get token
+                const token = await requestNotificationPermission();
+                if (token) {
+                    await saveFCMToken(currentUser.uid, token);
+                }
+
+                // Set up foreground message handler
+                setupForegroundMessageHandler();
+
+                // Subscribe to notifications with error handling
+                try {
+                    unsubscribeNotifications = subscribeToNotifications(currentUser.uid, (notifs) => {
+                        try {
+                            // Handle customer notifications if needed
+                            // You can add state management here if needed
+                        } catch (error) {
+                            console.error('Error handling customer notifications:', error);
+                        }
+                    });
+
+                    unsubscribeUnread = subscribeToUnreadCount(currentUser.uid, (count) => {
+                        try {
+                            // Handle unread count if needed
+                        } catch (error) {
+                            console.error('Error handling unread count:', error);
+                        }
+                    });
+                } catch (subscriptionError) {
+                    console.error('Error setting up notification subscriptions:', subscriptionError);
+                }
+            } catch (error) {
+                console.error('Error initializing customer notifications:', error);
+            }
+        }
+
+        initializeNotifications();
+
+        // Cleanup function
+        return () => {
+            try {
+                if (typeof unsubscribeNotifications === 'function') unsubscribeNotifications();
+                if (typeof unsubscribeUnread === 'function') unsubscribeUnread();
+            } catch (error) {
+                console.warn('Error unsubscribing from notifications:', error);
+            }
+        };
+    }, [currentUser]);
+
     async function loadDashboardData() {
         setLoading(true);
         try {
-            // Load user profile data
-            const userQuery = query(
-                collection(db, 'users'),
-                where('uid', '==', currentUser.uid)
-            );
-            const userSnapshot = await getDocs(userQuery);
+            // Load user profile data - check both customer and detailer collections
+            const customerDoc = await getDoc(doc(db, 'customer', currentUser.uid));
+            const detailerDoc = await getDoc(doc(db, 'detailer', currentUser.uid));
 
             let userId = null;
-            if (!userSnapshot.empty) {
-                const userDoc = userSnapshot.docs[0];
-                userId = userDoc.id;
-                setUserData({ id: userDoc.id, ...userDoc.data() });
+            if (customerDoc.exists()) {
+                userId = customerDoc.id;
+                setUserData({ id: customerDoc.id, ...customerDoc.data() });
+            } else if (detailerDoc.exists()) {
+                userId = detailerDoc.id;
+                setUserData({ id: detailerDoc.id, ...detailerDoc.data() });
             }
 
             // Load upcoming bookings
@@ -2699,14 +3606,12 @@ function CustomerDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                 bookingsSnapshot.docs.map(async (bookingDoc) => {
                     const booking = bookingDoc.data();
 
-                    // Get provider details
+                    // Get provider details (unified structure)
                     let providerName = 'Unknown Provider';
-                    if (booking.providerId) {
-                        const providerDoc = await getDocs(
-                            query(collection(db, 'providers'), where('userId', '==', booking.providerId))
-                        );
-                        if (!providerDoc.empty) {
-                            providerName = providerDoc.docs[0].data().businessName;
+                    if (booking.providerUserId) {
+                        const providerDoc = await getDoc(doc(db, 'detailer', booking.providerUserId));
+                        if (providerDoc.exists()) {
+                            providerName = providerDoc.data().businessName || providerDoc.data().displayName || 'Unknown Provider';
                         }
                     }
 
@@ -2741,7 +3646,7 @@ function CustomerDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
         try {
             // Check if vehicles subcollection exists
             const vehiclesSnapshot = await getDocs(
-                collection(db, 'users', userId, 'vehicles')
+                collection(db, 'customer', userId, 'vehicles')
             );
 
             const vehicles = vehiclesSnapshot.docs.map(doc => ({
@@ -2764,7 +3669,7 @@ function CustomerDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
         try {
             // Check if addresses subcollection exists
             const addressesSnapshot = await getDocs(
-                collection(db, 'users', userId, 'addresses')
+                collection(db, 'customer', userId, 'addresses')
             );
 
             const addresses = addressesSnapshot.docs.map(doc => ({
@@ -3063,14 +3968,14 @@ function SavedVehicles({ vehicles, userData, onRefresh }) {
             if (editingVehicle) {
                 // Update existing vehicle
                 await updateDoc(
-                    doc(db, 'users', userData.id, 'vehicles', editingVehicle.id),
+                    doc(db, 'customer', userData.id, 'vehicles', editingVehicle.id),
                     vehicleData
                 );
                 alert('Vehicle updated successfully!');
             } else {
                 // Add new vehicle
                 await addDoc(
-                    collection(db, 'users', userData.id, 'vehicles'),
+                    collection(db, 'customer', userData.id, 'vehicles'),
                     {
                         ...vehicleData,
                         createdAt: serverTimestamp()
@@ -3093,7 +3998,7 @@ function SavedVehicles({ vehicles, userData, onRefresh }) {
         if (!confirm('Are you sure you want to delete this vehicle?')) return;
 
         try {
-            await deleteDoc(doc(db, 'users', userData.id, 'vehicles', vehicleId));
+            await deleteDoc(doc(db, 'customer', userData.id, 'vehicles', vehicleId));
             alert('Vehicle deleted successfully!');
             onRefresh();
         } catch (error) {
@@ -3333,13 +4238,13 @@ function SavedAddresses({ addresses, userData, onRefresh }) {
         try {
             if (editingAddress) {
                 await updateDoc(
-                    doc(db, 'users', userData.id, 'addresses', editingAddress.id),
+                    doc(db, 'customer', userData.id, 'addresses', editingAddress.id),
                     addressData
                 );
                 alert('Address updated successfully!');
             } else {
                 await addDoc(
-                    collection(db, 'users', userData.id, 'addresses'),
+                    collection(db, 'customer', userData.id, 'addresses'),
                     {
                         ...addressData,
                         createdAt: serverTimestamp()
@@ -3362,7 +4267,7 @@ function SavedAddresses({ addresses, userData, onRefresh }) {
         if (!confirm('Are you sure you want to delete this address?')) return;
 
         try {
-            await deleteDoc(doc(db, 'users', userData.id, 'addresses', addressId));
+            await deleteDoc(doc(db, 'customer', userData.id, 'addresses', addressId));
             alert('Address deleted successfully!');
             onRefresh();
         } catch (error) {
@@ -3536,11 +4441,11 @@ function UserProfile({ userData, currentUser, address, answers, userCoordinates 
         if (!userData?.id) return;
 
         try {
-            const userDocRef = doc(db, 'users', userData.id);
+            const userDocRef = doc(db, 'customer', userData.id);
             await updateDoc(userDocRef, {
                 firstName: editedProfile.firstName,
                 lastName: editedProfile.lastName,
-                name: `${editedProfile.firstName} ${editedProfile.lastName}`.trim(),
+                displayName: `${editedProfile.firstName} ${editedProfile.lastName}`.trim(),
                 phone: editedProfile.phone,
                 updatedAt: serverTimestamp()
             });
@@ -3558,7 +4463,7 @@ function UserProfile({ userData, currentUser, address, answers, userCoordinates 
         if (!userData?.id) return;
 
         try {
-            const userDocRef = doc(db, 'users', userData.id);
+            const userDocRef = doc(db, 'customer', userData.id);
             await updateDoc(userDocRef, {
                 address: editedAddress,
                 preferences: editedPreferences,
@@ -3962,7 +4867,7 @@ function NotificationCenter({ notifications = [], unreadCount = 0, onMarkAsRead,
     const formatDate = (timestamp) => {
         try {
             if (!timestamp) return 'Just now';
-            
+
             let date;
             if (timestamp && typeof timestamp.toDate === 'function') {
                 // Firestore Timestamp
@@ -3976,12 +4881,12 @@ function NotificationCenter({ notifications = [], unreadCount = 0, onMarkAsRead,
             } else {
                 return 'Just now';
             }
-            
+
             // Check if date is valid
             if (isNaN(date.getTime())) {
                 return 'Just now';
             }
-            
+
             const now = new Date();
             const diffMs = now - date;
             const diffMins = Math.floor(diffMs / 60000);
@@ -4033,9 +4938,8 @@ function NotificationCenter({ notifications = [], unreadCount = 0, onMarkAsRead,
                         return (
                             <div
                                 key={notification.id || Math.random()}
-                                className={`bg-white rounded-xl border-2 p-5 transition-all cursor-pointer hover:shadow-md ${
-                                    notification.read ? 'opacity-75' : getNotificationColor(notification.type || 'default')
-                                }`}
+                                className={`bg-white rounded-xl border-2 p-5 transition-all cursor-pointer hover:shadow-md ${notification.read ? 'opacity-75' : getNotificationColor(notification.type || 'default')
+                                    }`}
                                 onClick={() => !notification.read && onMarkAsRead && onMarkAsRead(notification.id)}
                             >
                                 <div className="flex items-start gap-4">
@@ -4077,12 +4981,14 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
     const [activeTab, setActiveTab] = useState('bookings');
     const [loading, setLoading] = useState(true);
     const [bookings, setBookings] = useState([]);
-    const [providerData, setProviderData] = useState(null);
+    // providerData removed - using userData instead (unified structure)
+    const [providerDocId, setProviderDocId] = useState(null); // Store provider document ID
     const [userData, setUserData] = useState(null);
     const [availablePackages, setAvailablePackages] = useState([]);
     const [selectedPackages, setSelectedPackages] = useState([]);
     const [selectedAddOns, setSelectedAddOns] = useState([]);
     const [packagePrices, setPackagePrices] = useState({}); // { "package-id": { priceMin: X, priceMax: Y } }
+    const [savingPackages, setSavingPackages] = useState(false);
     const [weeklySchedule, setWeeklySchedule] = useState({});
     const [blackoutDates, setBlackoutDates] = useState([]);
     const [selectedBlackoutDate, setSelectedBlackoutDate] = useState('');
@@ -4099,6 +5005,9 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
         phone: '',
         email: ''
     });
+    const [logoFile, setLogoFile] = useState(null);
+    const [logoPreview, setLogoPreview] = useState(null);
+    const [uploadingLogo, setUploadingLogo] = useState(false);
     const profileDropdownRef = React.useRef(null);
 
     // Close dropdown when clicking outside
@@ -4119,12 +5028,13 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
     }, [showProfileDropdown, setShowProfileDropdown]);
 
     async function loadPendingProviders() {
-        if (userData?.role !== 'admin') return;  // Change from currentUser?.role
+        if (userData?.role !== 'admin') return;
 
         setLoadingPending(true);
         try {
+            // Query users collection for providers with pending status
             const pendingQuery = query(
-                collection(db, 'providers'),
+                collection(db, 'detailer'),
                 where('status', '==', 'pending')
             );
             const snapshot = await getDocs(pendingQuery);
@@ -4153,17 +5063,17 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
     // Initialize notifications
     async function initializeNotifications() {
         if (!currentUser) return;
-        
+
         try {
             // Request notification permission and get token
             const token = await requestNotificationPermission();
             if (token) {
                 await saveFCMToken(currentUser.uid, token);
             }
-            
+
             // Set up foreground message handler
             setupForegroundMessageHandler();
-            
+
             // Subscribe to notifications with error handling
             try {
                 const unsubscribeNotifications = subscribeToNotifications(currentUser.uid, (notifs) => {
@@ -4174,7 +5084,7 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                         setNotifications([]);
                     }
                 });
-                
+
                 // Subscribe to unread count with error handling
                 const unsubscribeUnread = subscribeToUnreadCount(currentUser.uid, (count) => {
                     try {
@@ -4184,7 +5094,7 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                         setUnreadCount(0);
                     }
                 });
-                
+
                 return () => {
                     try {
                         if (typeof unsubscribeNotifications === 'function') unsubscribeNotifications();
@@ -4224,64 +5134,58 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
     async function loadProviderData() {
         setLoading(true);
         try {
-            // Load user data
-            const userQuery = query(
-                collection(db, 'users'),
-                where('uid', '==', currentUser.uid)
-            );
-            const userSnapshot = await getDocs(userQuery);
-            if (!userSnapshot.empty) {
-                const data = userSnapshot.docs[0].data();
-                setUserData({ id: userSnapshot.docs[0].id, ...data });
+            // Read from detailer collection
+            const detailerDoc = await getDoc(doc(db, 'detailer', currentUser.uid));
+
+            if (!detailerDoc.exists()) {
+                console.error('Detailer document not found');
+                return;
             }
 
-            // Load provider data
-            const providerQuery = query(
-                collection(db, 'providers'),
-                where('userId', '==', currentUser.uid)
-            );
-            const providerSnapshot = await getDocs(providerQuery);
-            if (!providerSnapshot.empty) {
-                const data = providerSnapshot.docs[0].data();
-                setProviderData(data);
-                setSelectedPackages(data.offeredPackages || []); // Load offered packages
-                setSelectedAddOns(data.addOns || []); // Load add-ons
-                setPackagePrices(data.packagePrices || {}); // Load custom package prices
-                
-                // Initialize edited profile data
-                setEditedProviderProfile({
-                    businessName: data.businessName || '',
-                    serviceArea: data.serviceArea || '',
-                    businessAddress: data.businessAddress || data.address || '',
-                    phone: data.phone || '',
-                    email: data.email || ''
-                });
+            const data = detailerDoc.data();
+            setUserData({ id: detailerDoc.id, ...data });
 
-                // Load availability and ensure enabled days have start/end times
-                const defaultAvail = data.defaultAvailability || {};
-                // Normalize the schedule - ensure enabled days have start/end times
-                const normalizedSchedule = {};
-                Object.keys(defaultAvail).forEach(day => {
-                    const daySchedule = defaultAvail[day];
-                    if (daySchedule && daySchedule.enabled) {
-                        normalizedSchedule[day] = {
-                            enabled: true,
-                            start: daySchedule.start || '09:00',
-                            end: daySchedule.end || '17:00'
-                        };
-                    } else {
-                        normalizedSchedule[day] = daySchedule;
-                    }
-                });
-                setWeeklySchedule(normalizedSchedule);
+            // Store document ID (same as UID now)
+            setProviderDocId(detailerDoc.id);
 
-                // Convert dateOverrides object to array for easier management
-                const overrides = data.dateOverrides || {};
-                const blackouts = Object.keys(overrides)
-                    .filter(date => overrides[date]?.type === 'unavailable')
-                    .map(date => ({ date, type: 'unavailable' }));
-                setBlackoutDates(blackouts);
-            }
+            // Load provider-specific state from unified document
+            setSelectedPackages(data.offeredPackages || []);
+            setSelectedAddOns(data.addOns || []);
+            setPackagePrices(data.packagePrices || {});
+
+            // Initialize edited profile data
+            setEditedProviderProfile({
+                businessName: data.businessName || '',
+                serviceArea: data.serviceArea || '',
+                businessAddress: data.businessAddress || data.address || '',
+                phone: data.phone || '',
+                email: data.email || ''
+            });
+
+            // Load availability and ensure enabled days have start/end times
+            const defaultAvail = data.defaultAvailability || {};
+            // Normalize the schedule - ensure enabled days have start/end times
+            const normalizedSchedule = {};
+            Object.keys(defaultAvail).forEach(day => {
+                const daySchedule = defaultAvail[day];
+                if (daySchedule && daySchedule.enabled) {
+                    normalizedSchedule[day] = {
+                        enabled: true,
+                        start: daySchedule.start || '09:00',
+                        end: daySchedule.end || '17:00'
+                    };
+                } else {
+                    normalizedSchedule[day] = daySchedule;
+                }
+            });
+            setWeeklySchedule(normalizedSchedule);
+
+            // Convert dateOverrides object to array for easier management
+            const overrides = data.dateOverrides || {};
+            const blackouts = Object.keys(overrides)
+                .filter(date => overrides[date]?.type === 'unavailable')
+                .map(date => ({ date, type: 'unavailable' }));
+            setBlackoutDates(blackouts);
 
             // Load packages from Firestore
             const packagesQuery = collection(db, 'packages');
@@ -4305,15 +5209,9 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
 
     async function loadBookings() {
         try {
-            // First, get the provider document to find the provider document ID
-            const providerQuery = query(
-                collection(db, 'providers'),
-                where('userId', '==', currentUser.uid)
-            );
-            const providerSnapshot = await getDocs(providerQuery);
-
-            const providerDocId = !providerSnapshot.empty ? providerSnapshot.docs[0].id : null;
-            const providerUserId = !providerSnapshot.empty ? providerSnapshot.docs[0].data().userId : currentUser.uid;
+            // Unified structure: providerUserId is the same as currentUser.uid
+            const providerUserId = currentUser.uid;
+            const providerDocId = currentUser.uid; // Document ID is now the UID
 
             // Query by providerUserId first (this is what new bookings use)
             let bookingsByUserId = { docs: [] };
@@ -4375,13 +5273,10 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                     let customerEmail = '';
                     let customerPhone = '';
                     if (booking.customerId) {
-                        const customerQuery = query(
-                            collection(db, 'users'),
-                            where('uid', '==', booking.customerId)
-                        );
-                        const customerSnapshot = await getDocs(customerQuery);
-                        if (!customerSnapshot.empty) {
-                            const customerData = customerSnapshot.docs[0].data();
+                        // Get customer directly by UID (no query needed)
+                        const customerDoc = await getDoc(doc(db, 'customer', booking.customerId));
+                        if (customerDoc.exists()) {
+                            const customerData = customerDoc.data();
                             customerName = customerData.firstName && customerData.lastName
                                 ? `${customerData.firstName} ${customerData.lastName}`
                                 : customerData.displayName || customerData.email || 'Unknown';
@@ -4430,7 +5325,7 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                 status: newStatus,
                 updatedAt: serverTimestamp()
             });
-            
+
             // Create notification if booking is cancelled
             if (newStatus === 'cancelled') {
                 try {
@@ -4445,7 +5340,7 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                     console.warn('Failed to create cancellation notification:', notifError);
                 }
             }
-            
+
             alert(`Booking ${newStatus} successfully`);
             loadBookings();
         } catch (error) {
@@ -4491,11 +5386,11 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
             // More robust matching - check id, slug, or name as fallback
             const updatedServices = services.map(service => {
                 // Match by id first, then slug, then name as fallback
-                const matches = 
+                const matches =
                     (service.id && updatedService.id && service.id === updatedService.id) ||
                     (service.slug && updatedService.slug && service.slug === updatedService.slug) ||
                     (service.name && updatedService.name && service.name === updatedService.name);
-                
+
                 return matches ? updatedService : service;
             });
 
@@ -4515,25 +5410,15 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
             setShowEditModal(false);
             setEditingService(null);
 
-            // Update in Firestore
-            const providerQuery = query(
-                collection(db, 'providers'),
-                where('userId', '==', currentUser.uid)
-            );
-            const providerSnapshot = await getDocs(providerQuery);
+            // Update in Firestore (detailer collection)
+            await updateDoc(doc(db, 'detailer', currentUser.uid), {
+                services: updatedServices,
+                updatedAt: serverTimestamp()
+            });
 
-            if (!providerSnapshot.empty) {
-                await updateDoc(doc(db, 'providers', providerSnapshot.docs[0].id), {
-                    services: updatedServices,
-                    updatedAt: serverTimestamp()
-                });
-                
-                // Reload provider data to ensure consistency
-                await loadProviderData();
-                alert('Service updated successfully!');
-            } else {
-                throw new Error('Provider not found');
-            }
+            // Reload provider data to ensure consistency
+            await loadProviderData();
+            alert('Service updated successfully!');
         } catch (error) {
             console.error('Error saving service:', error);
             alert('Failed to save service: ' + (error.message || 'Unknown error'));
@@ -4549,19 +5434,12 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
 
     async function handleSaveWeeklySchedule() {
         try {
-            const providerQuery = query(
-                collection(db, 'providers'),
-                where('userId', '==', currentUser.uid)
-            );
-            const providerSnapshot = await getDocs(providerQuery);
-
-            if (!providerSnapshot.empty) {
-                await updateDoc(doc(db, 'providers', providerSnapshot.docs[0].id), {
-                    defaultAvailability: weeklySchedule,
-                    updatedAt: serverTimestamp()
-                });
-                alert('Weekly schedule saved successfully!');
-            }
+            // Update detailer collection
+            await updateDoc(doc(db, 'detailer', currentUser.uid), {
+                defaultAvailability: weeklySchedule,
+                updatedAt: serverTimestamp()
+            });
+            alert('Weekly schedule saved successfully!');
         } catch (error) {
             console.error('Error saving schedule:', error);
             alert('Failed to save schedule');
@@ -4614,20 +5492,16 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
             setBlackoutDates(updatedBlackouts);
 
             // Update in Firestore
-            const providerQuery = query(
-                collection(db, 'providers'),
-                where('userId', '==', currentUser.uid)
-            );
-            const providerSnapshot = await getDocs(providerQuery);
+            // Update detailer collection
+            const detailerDoc = await getDoc(doc(db, 'detailer', currentUser.uid));
 
-            if (!providerSnapshot.empty) {
-                const providerDoc = providerSnapshot.docs[0];
-                const providerData = providerDoc.data();
-                const dateOverrides = providerData.dateOverrides || {};
+            if (detailerDoc.exists()) {
+                const detailerData = detailerDoc.data();
+                const dateOverrides = detailerData.dateOverrides || {};
 
                 dateOverrides[selectedBlackoutDate] = { type: 'unavailable' };
 
-                await updateDoc(doc(db, 'providers', providerSnapshot.docs[0].id), {
+                await updateDoc(doc(db, 'detailer', currentUser.uid), {
                     dateOverrides: dateOverrides,
                     updatedAt: serverTimestamp()
                 });
@@ -4650,21 +5524,16 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
             const updatedBlackouts = blackoutDates.filter(b => b.date !== dateToRemove);
             setBlackoutDates(updatedBlackouts);
 
-            // Update in Firestore
-            const providerQuery = query(
-                collection(db, 'providers'),
-                where('userId', '==', currentUser.uid)
-            );
-            const providerSnapshot = await getDocs(providerQuery);
+            // Update in Firestore (detailer collection)
+            const detailerDoc = await getDoc(doc(db, 'detailer', currentUser.uid));
 
-            if (!providerSnapshot.empty) {
-                const providerDoc = providerSnapshot.docs[0];
-                const providerData = providerDoc.data();
-                const dateOverrides = providerData.dateOverrides || {};
+            if (detailerDoc.exists()) {
+                const detailerData = detailerDoc.data();
+                const dateOverrides = detailerData.dateOverrides || {};
 
                 delete dateOverrides[dateToRemove];
 
-                await updateDoc(doc(db, 'providers', providerSnapshot.docs[0].id), {
+                await updateDoc(doc(db, 'detailer', currentUser.uid), {
                     dateOverrides: dateOverrides,
                     updatedAt: serverTimestamp()
                 });
@@ -4682,39 +5551,39 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
         if (!confirm('Approve this provider? They will be able to accept bookings.')) return;
 
         try {
-            // Get the provider document first to check if they have services
-            const providerDoc = await getDoc(doc(db, 'providers', providerId));
-            
-            if (!providerDoc.exists()) {
+            // Get the detailer document
+            const detailerDoc = await getDoc(doc(db, 'detailer', providerId));
+
+            if (!detailerDoc.exists()) {
                 alert('Error: Provider document not found!');
                 return;
             }
-            
-            const providerData = providerDoc.data();
-            
+
+            const detailerData = detailerDoc.data();
+
             // Prepare update data
             const updateData = {
                 status: 'approved',
                 approvedAt: serverTimestamp(),
                 updatedAt: serverTimestamp()
             };
-            
+
             // If provider doesn't have packages, initialize with all packages
-            if (!providerData.offeredPackages || providerData.offeredPackages.length === 0) {
+            if (!detailerData.offeredPackages || detailerData.offeredPackages.length === 0) {
                 updateData.offeredPackages = PACKAGES_DATA.map(pkg => pkg.id);
             }
-            
-            // Perform the update
-            await updateDoc(doc(db, 'providers', providerId), updateData);
-            
+
+            // Perform the update (detailer collection)
+            await updateDoc(doc(db, 'detailer', providerId), updateData);
+
             // Verify the update succeeded by reading the document again
-            const verifyDoc = await getDoc(doc(db, 'providers', providerId));
+            const verifyDoc = await getDoc(doc(db, 'detailer', providerId));
             const verifyData = verifyDoc.data();
-            
+
             if (verifyData.status !== 'approved') {
                 throw new Error('Update verification failed: status is still not approved');
             }
-            
+
             alert('Provider approved successfully!');
             // Reload pending providers list
             await loadPendingProviders();
@@ -4729,7 +5598,8 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
         if (reason === null) return; // User cancelled
 
         try {
-            await updateDoc(doc(db, 'providers', providerId), {
+            // Update detailer collection
+            await updateDoc(doc(db, 'detailer', providerId), {
                 status: 'rejected',
                 rejectionReason: reason || '',
                 rejectedAt: serverTimestamp(),
@@ -4743,13 +5613,120 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
         }
     }
 
-    if (loading) {
+    async function listAllProviders() {
+        try {
+            // Query users collection for providers (unified structure)
+            const providersQuery = query(
+                collection(db, 'detailer')
+            );
+            const providersSnapshot = await getDocs(providersQuery);
+
+            const providersList = providersSnapshot.docs.map(doc => {
+                const data = doc.data();
+                return {
+                    id: doc.id,
+                    userId: data.uid, // Now same as document ID
+                    email: data.email,
+                    businessName: data.businessName || data.name || 'N/A',
+                    status: data.status,
+                    hasPackages: (data.offeredPackages || []).length > 0,
+                    packageCount: (data.offeredPackages || []).length,
+                    createdAt: data.createdAt?.toDate?.() || 'N/A'
+                };
+            });
+
+            // Log to console
+            console.log('📋 All Providers in Database:');
+            console.table(providersList);
+
+            // Also show in alert with details
+            const details = providersList.map((p, idx) =>
+                `${idx + 1}. ${p.businessName}\n   Email: ${p.email || 'N/A'}\n   Status: ${p.status}\n   Packages: ${p.packageCount}\n   UserId: ${p.userId}\n   DocId: ${p.id}`
+            ).join('\n\n');
+
+            alert(`Found ${providersList.length} provider(s):\n\n${details}\n\nCheck console for table view.`);
+        } catch (error) {
+            console.error('Error listing providers:', error);
+            alert(`Error: ${error.message}`);
+        }
+    }
+
+    // Handle file selection for logo upload
+    function handleFileSelect(e) {
+        const file = e.target.files[0];
+        if (file) {
+            // Validate file type
+            if (!file.type.startsWith('image/')) {
+                alert('Please select an image file');
+                return;
+            }
+
+            // Validate file size (max 5MB)
+            if (file.size > 5 * 1024 * 1024) {
+                alert('Image size must be less than 5MB');
+                return;
+            }
+
+            setLogoFile(file);
+
+            // Create preview
+            const reader = new FileReader();
+            reader.onloadend = () => {
+                setLogoPreview(reader.result);
+            };
+            reader.readAsDataURL(file);
+        }
+    }
+
+    // Handle logo upload
+    async function handleLogoUpload() {
+        if (!logoFile) return;
+
+        try {
+            setUploadingLogo(true);
+
+            // Create storage reference
+            const storageRef = ref(storage, `provider-logos/${currentUser.uid}/${Date.now()}_${logoFile.name}`);
+
+            // Upload file
+            await uploadBytes(storageRef, logoFile);
+
+            // Get download URL
+            const downloadURL = await getDownloadURL(storageRef);
+
+            // Update detailer collection
+            await updateDoc(doc(db, 'detailer', currentUser.uid), {
+                image: downloadURL,
+                updatedAt: serverTimestamp()
+            });
+
+            alert('Logo uploaded successfully!');
+            setLogoFile(null);
+            setLogoPreview(null);
+            await loadProviderData();
+        } catch (error) {
+            console.error('Error uploading logo:', error);
+            alert(`Failed to upload logo: ${error.message}`);
+        } finally {
+            setUploadingLogo(false);
+        }
+    }
+
+    // --- EARLY RETURN FIX ---
+    // If loading or userData doesn't exist yet, show loading message
+    // and STOP the function here to prevent accessing undefined properties
+    if (loading || !userData) {
         return (
             <div className="min-h-screen bg-gray-50 flex items-center justify-center">
-                <p className="text-gray-600">Loading dashboard...</p>
+                <div className="text-center">
+                    <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto"></div>
+                    <p className="text-gray-600">Loading dashboard...</p>
+                </div>
             </div>
         );
     }
+    // --- END OF FIX ---
+    // If the code reaches this point, userData is guaranteed to exist
 
     const upcomingBookings = bookings.filter(b => ['pending', 'confirmed', 'scheduled'].includes(b.status));
     const completedBookings = bookings.filter(b => ['completed', 'cancelled'].includes(b.status));
@@ -4764,9 +5741,9 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                             <h1 className="text-3xl font-bold text-white drop-shadow-md">
                                 Provider Dashboard
                             </h1>
-                            {providerData && (
+                            {userData && (
                                 <p className="text-blue-100 mt-1 drop-shadow-sm">
-                                    {providerData.businessName || 'Your Business'}
+                                    {userData.businessName || userData.name || 'Your Business'}
                                 </p>
                             )}
                         </div>
@@ -5147,31 +6124,100 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                                 </p>
                             </div>
                             <button
-                                onClick={async () => {
+                                type="button"
+                                onClick={async (e) => {
+                                    e.preventDefault();
+                                    e.stopPropagation();
+
+                                    console.log('🔵 Save button clicked!', {
+                                        savingPackages,
+                                        currentUser: currentUser?.uid,
+                                        selectedPackages,
+                                        selectedAddOns,
+                                        packagePrices
+                                    });
+
+                                    if (savingPackages) {
+                                        console.log('⏸️ Already saving, ignoring click');
+                                        return;
+                                    }
+
                                     try {
-                                        const providerQuery = query(
-                                            collection(db, 'providers'),
-                                            where('userId', '==', currentUser.uid)
-                                        );
-                                        const providerSnapshot = await getDocs(providerQuery);
-                                        if (!providerSnapshot.empty) {
-                                            await updateDoc(doc(db, 'providers', providerSnapshot.docs[0].id), {
-                                                offeredPackages: selectedPackages,
-                                                addOns: selectedAddOns,
-                                                packagePrices: packagePrices, // Save custom prices
-                                                updatedAt: serverTimestamp()
-                                            });
-                                            alert('Packages saved successfully!');
-                                            loadProviderData();
+                                        setSavingPackages(true);
+                                        console.log('✅ Starting save process...');
+
+                                        if (!currentUser || !currentUser.uid) {
+                                            const errorMsg = 'Error: You must be logged in to save changes.';
+                                            console.error('❌', errorMsg);
+                                            alert(errorMsg);
+                                            setSavingPackages(false);
+                                            return;
                                         }
+
+                                        console.log('📦 Saving packages...', {
+                                            selectedPackages,
+                                            selectedAddOns,
+                                            packagePrices,
+                                            userId: currentUser.uid
+                                        });
+
+                                        // Unified structure: document ID is the UID
+                                        const docIdToUpdate = currentUser.uid;
+                                        console.log('✅ Using unified structure - document ID is UID:', docIdToUpdate);
+
+                                        // Verify document exists
+                                        const detailerDocRef = doc(db, 'detailer', currentUser.uid);
+                                        const detailerDocSnap = await getDoc(detailerDocRef);
+
+                                        if (!detailerDocSnap.exists()) {
+                                            console.error('⚠️ Detailer document not found!');
+                                            alert('Error: Your detailer account was not found. Please contact support.');
+                                            return;
+                                        }
+
+                                        // Ensure packagePrices is always an object
+                                        const safePackagePrices = packagePrices || {};
+
+                                        // Update detailer collection
+                                        await updateDoc(detailerDocRef, {
+                                            offeredPackages: selectedPackages,
+                                            addOns: selectedAddOns,
+                                            packagePrices: safePackagePrices,
+                                            updatedAt: serverTimestamp()
+                                        });
+
+                                        console.log('✅ Packages saved successfully!');
+                                        alert('Packages saved successfully!');
+
+                                        // Reload provider data to reflect changes
+                                        console.log('🔄 Reloading provider data...');
+                                        await loadProviderData();
+                                        console.log('✅ Reload complete!');
                                     } catch (error) {
-                                        console.error('Error saving packages:', error);
-                                        alert('Failed to save packages');
+                                        console.error('❌ Error saving packages:', error);
+                                        console.error('Error details:', {
+                                            message: error.message,
+                                            code: error.code,
+                                            stack: error.stack
+                                        });
+                                        alert(`Failed to save packages: ${error.message || 'Unknown error'}`);
+                                    } finally {
+                                        setSavingPackages(false);
+                                        console.log('🏁 Save process complete');
                                     }
                                 }}
-                                className="px-4 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700"
+                                disabled={savingPackages}
+                                className="px-4 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700 transition-colors disabled:bg-gray-400 disabled:cursor-not-allowed flex items-center gap-2 cursor-pointer"
+                                style={{ pointerEvents: savingPackages ? 'none' : 'auto' }}
                             >
-                                Save Changes
+                                {savingPackages ? (
+                                    <>
+                                        <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                                        Saving...
+                                    </>
+                                ) : (
+                                    'Save Changes'
+                                )}
                             </button>
                         </div>
 
@@ -5191,9 +6237,8 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                                         return (
                                             <div
                                                 key={pkg.id}
-                                                className={`bg-white rounded-xl border-2 p-6 transition-all ${
-                                                    isSelected ? 'border-blue-600 bg-blue-50' : 'border-gray-200'
-                                                }`}
+                                                className={`bg-white rounded-xl border-2 p-6 transition-all ${isSelected ? 'border-blue-600 bg-blue-50' : 'border-gray-200'
+                                                    }`}
                                             >
                                                 <div className="flex items-start justify-between">
                                                     <div className="flex-1">
@@ -5206,22 +6251,70 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                                                             )}
                                                         </div>
                                                         <p className="text-sm text-gray-600 mb-3">{pkg.description}</p>
-                                                        <div className="flex flex-wrap gap-4 text-sm text-gray-500 mb-3">
-                                                            <div className="flex items-center gap-1">
-                                                                <Clock className="w-4 h-4" />
-                                                                <span>{pkg.estimatedHours} hours</span>
+                                                        <div className="flex flex-wrap items-center justify-between gap-4 text-sm mb-3 p-3 bg-gray-50 rounded-lg">
+                                                            <div className="flex items-center gap-4">
+                                                                <div className="flex items-center gap-1 text-gray-500">
+                                                                    <Clock className="w-4 h-4" />
+                                                                    <span>{pkg.estimatedHours} hours</span>
+                                                                </div>
+                                                                <div className="flex items-center gap-2">
+                                                                    <DollarSign className="w-4 h-4 text-gray-600" />
+                                                                    <span className={`font-bold text-lg ${isSelected && packagePrices[pkg.id] ? 'text-blue-600' : 'text-gray-900'}`}>
+                                                                        ${packagePrices[pkg.id]?.priceMin ?? pkg.priceMin} - ${packagePrices[pkg.id]?.priceMax ?? pkg.priceMax}
+                                                                    </span>
+                                                                    {isSelected && packagePrices[pkg.id] && (
+                                                                        <span className="px-2 py-1 rounded-full text-xs bg-blue-100 text-blue-700 font-medium">Custom</span>
+                                                                    )}
+                                                                </div>
                                                             </div>
+                                                            {isSelected && (
+                                                                <button
+                                                                    onClick={() => {
+                                                                        // Initialize prices if not set
+                                                                        if (!packagePrices[pkg.id]) {
+                                                                            setPackagePrices(prev => ({
+                                                                                ...prev,
+                                                                                [pkg.id]: {
+                                                                                    priceMin: pkg.priceMin,
+                                                                                    priceMax: pkg.priceMax
+                                                                                }
+                                                                            }));
+                                                                        }
+                                                                    }}
+                                                                    className="px-4 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700 flex items-center gap-2 text-sm"
+                                                                >
+                                                                    <Edit2 className="w-4 h-4" />
+                                                                    {packagePrices[pkg.id] ? 'Edit Prices' : 'Set Custom Prices'}
+                                                                </button>
+                                                            )}
                                                         </div>
-                                                        
+
                                                         {/* Price editing section - only show if package is selected */}
-                                                        {isSelected && (
-                                                            <div className="mb-3 p-3 bg-blue-50 rounded-lg border border-blue-200">
-                                                                <label className="block text-xs font-semibold text-gray-700 mb-2">
-                                                                    Custom Pricing (Optional)
-                                                                </label>
+                                                        {isSelected && packagePrices[pkg.id] && (
+                                                            <div className="mb-3 p-4 bg-blue-50 rounded-lg border-2 border-blue-300">
+                                                                <div className="flex items-center justify-between mb-3">
+                                                                    <label className="block text-sm font-semibold text-gray-900">
+                                                                        <Edit2 className="w-4 h-4 inline mr-1" />
+                                                                        Custom Pricing
+                                                                    </label>
+                                                                    <button
+                                                                        onClick={() => {
+                                                                            setPackagePrices(prev => {
+                                                                                const updated = { ...prev };
+                                                                                delete updated[pkg.id];
+                                                                                return updated;
+                                                                            });
+                                                                        }}
+                                                                        className="text-xs text-red-600 hover:text-red-700 font-medium flex items-center gap-1 px-2 py-1 hover:bg-red-50 rounded"
+                                                                    >
+                                                                        <X className="w-3 h-3" />
+                                                                        Reset to Default
+                                                                    </button>
+                                                                </div>
+                                                                <p className="text-xs text-gray-600 mb-3">Set your own prices for this package</p>
                                                                 <div className="grid grid-cols-2 gap-3">
                                                                     <div>
-                                                                        <label className="block text-xs text-gray-600 mb-1">Min Price ($)</label>
+                                                                        <label className="block text-xs font-medium text-gray-700 mb-1">Minimum Price ($)</label>
                                                                         <input
                                                                             type="number"
                                                                             min="0"
@@ -5238,12 +6331,12 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                                                                                     }
                                                                                 }));
                                                                             }}
-                                                                            className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                                                                            className="w-full px-3 py-2 text-sm border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white font-medium"
                                                                             placeholder={pkg.priceMin.toString()}
                                                                         />
                                                                     </div>
                                                                     <div>
-                                                                        <label className="block text-xs text-gray-600 mb-1">Max Price ($)</label>
+                                                                        <label className="block text-xs font-medium text-gray-700 mb-1">Maximum Price ($)</label>
                                                                         <input
                                                                             type="number"
                                                                             min="0"
@@ -5260,39 +6353,19 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                                                                                     }
                                                                                 }));
                                                                             }}
-                                                                            className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                                                                            className="w-full px-3 py-2 text-sm border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white font-medium"
                                                                             placeholder={pkg.priceMax.toString()}
                                                                         />
                                                                     </div>
                                                                 </div>
-                                                                <div className="mt-2 flex items-center gap-2">
-                                                                    <DollarSign className="w-4 h-4 text-gray-600" />
-                                                                    <span className="text-sm font-medium text-gray-700">
-                                                                        ${packagePrices[pkg.id]?.priceMin ?? pkg.priceMin} - ${packagePrices[pkg.id]?.priceMax ?? pkg.priceMax}
-                                                                    </span>
-                                                                    {packagePrices[pkg.id] && (
-                                                                        <button
-                                                                            onClick={() => {
-                                                                                setPackagePrices(prev => {
-                                                                                    const updated = { ...prev };
-                                                                                    delete updated[pkg.id];
-                                                                                    return updated;
-                                                                                });
-                                                                            }}
-                                                                            className="ml-auto text-xs text-red-600 hover:text-red-700 font-medium"
-                                                                        >
-                                                                            Reset to Default
-                                                                        </button>
-                                                                    )}
+                                                                <div className="mt-3 pt-3 border-t border-blue-200">
+                                                                    <div className="flex items-center gap-2 text-sm">
+                                                                        <DollarSign className="w-4 h-4 text-blue-600" />
+                                                                        <span className="font-bold text-blue-700">
+                                                                            Your Price: ${packagePrices[pkg.id]?.priceMin ?? pkg.priceMin} - ${packagePrices[pkg.id]?.priceMax ?? pkg.priceMax}
+                                                                        </span>
+                                                                    </div>
                                                                 </div>
-                                                            </div>
-                                                        )}
-                                                        
-                                                        {/* Show default price if not selected */}
-                                                        {!isSelected && (
-                                                            <div className="flex items-center gap-1 text-sm text-gray-500 mb-3">
-                                                                <DollarSign className="w-4 h-4" />
-                                                                <span className="font-medium">${pkg.priceMin} - ${pkg.priceMax}</span>
                                                             </div>
                                                         )}
                                                         <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3 pt-3 border-t border-gray-200">
@@ -5367,9 +6440,8 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                                     return (
                                         <div
                                             key={addOn.id}
-                                            className={`bg-white rounded-xl border-2 p-4 transition-all ${
-                                                isSelected ? 'border-blue-600 bg-blue-50' : 'border-gray-200'
-                                            }`}
+                                            className={`bg-white rounded-xl border-2 p-4 transition-all ${isSelected ? 'border-blue-600 bg-blue-50' : 'border-gray-200'
+                                                }`}
                                         >
                                             <div className="flex items-center justify-between">
                                                 <div className="flex-1">
@@ -5603,6 +6675,12 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                                     Import Packages
                                 </button>
                                 <button
+                                    onClick={listAllProviders}
+                                    className="px-4 py-2 text-sm bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700"
+                                >
+                                    List All Providers
+                                </button>
+                                <button
                                     onClick={loadPendingProviders}
                                     className="px-4 py-2 text-sm border-2 border-gray-200 rounded-lg font-medium hover:bg-gray-50"
                                 >
@@ -5731,7 +6809,7 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                     <div>
                         <div className="flex items-center justify-between mb-6">
                             <h2 className="text-2xl font-bold text-gray-900">Provider Profile</h2>
-                            {!isEditingProfile && providerData && (
+                            {!isEditingProfile && userData && (
                                 <button
                                     onClick={() => setIsEditingProfile(true)}
                                     className="flex items-center gap-2 px-4 py-2 border-2 border-gray-200 rounded-lg font-semibold hover:bg-gray-50"
@@ -5741,16 +6819,31 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                                 </button>
                             )}
                         </div>
-                        {providerData ? (
+                        {userData ? (
                             <div className="bg-white rounded-xl border border-gray-200 p-8">
                                 {!isEditingProfile ? (
                                     <div className="space-y-6">
+                                        {/* Logo Display */}
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-500 mb-2">
+                                                Business Logo
+                                            </label>
+                                            <div className="w-32 h-32 bg-gray-100 rounded-lg overflow-hidden border-2 border-gray-200 flex items-center justify-center">
+                                                {userData.image ? (
+                                                    <img src={userData.image} alt="Business logo" className="w-full h-full object-cover" />
+                                                ) : (
+                                                    <span className="text-gray-400 text-3xl font-bold">
+                                                        {userData.businessName?.charAt(0) || userData.name?.charAt(0) || '?'}
+                                                    </span>
+                                                )}
+                                            </div>
+                                        </div>
                                         <div>
                                             <label className="block text-sm font-medium text-gray-500 mb-1">
                                                 Business Name
                                             </label>
                                             <div className="text-lg font-semibold text-gray-900">
-                                                {providerData.businessName || 'Not set'}
+                                                {userData.businessName || 'Not set'}
                                             </div>
                                         </div>
                                         <div>
@@ -5758,7 +6851,7 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                                                 Service Area
                                             </label>
                                             <div className="text-lg font-semibold text-gray-900">
-                                                {providerData.serviceArea || providerData.businessAddress || 'Not set'}
+                                                {userData.serviceArea || userData.businessAddress || 'Not set'}
                                             </div>
                                         </div>
                                         <div>
@@ -5766,7 +6859,7 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                                                 Business Address
                                             </label>
                                             <div className="text-lg font-semibold text-gray-900">
-                                                {providerData.businessAddress || providerData.address || 'Not set'}
+                                                {userData.businessAddress || userData.address || 'Not set'}
                                             </div>
                                         </div>
                                         <div>
@@ -5774,7 +6867,7 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                                                 Primary Service
                                             </label>
                                             <div className="text-lg font-semibold text-gray-900">
-                                                {providerData.primaryService || 'Not set'}
+                                                {userData.primaryService || 'Not set'}
                                             </div>
                                         </div>
                                         <div>
@@ -5782,7 +6875,7 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                                                 Phone
                                             </label>
                                             <div className="text-lg font-semibold text-gray-900">
-                                                {providerData.phone || 'Not set'}
+                                                {userData.phone || 'Not set'}
                                             </div>
                                         </div>
                                         <div>
@@ -5790,12 +6883,77 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                                                 Email
                                             </label>
                                             <div className="text-lg font-semibold text-gray-900">
-                                                {providerData.email || 'Not set'}
+                                                {userData.email || 'Not set'}
                                             </div>
                                         </div>
                                     </div>
                                 ) : (
                                     <div className="space-y-4">
+                                        {/* Logo Upload Section */}
+                                        <div>
+                                            <label className="block text-sm font-semibold text-gray-700 mb-2">
+                                                Business Logo
+                                            </label>
+
+                                            <div className="flex items-center gap-4">
+                                                {/* Current Logo Preview */}
+                                                <div className="w-32 h-32 bg-gray-100 rounded-lg overflow-hidden border-2 border-gray-200 flex items-center justify-center flex-shrink-0">
+                                                    {logoPreview ? (
+                                                        <img src={logoPreview} alt="Logo preview" className="w-full h-full object-cover" />
+                                                    ) : userData?.image ? (
+                                                        <img src={userData.image} alt="Current logo" className="w-full h-full object-cover" />
+                                                    ) : (
+                                                        <span className="text-gray-400 text-3xl font-bold">
+                                                            {userData?.businessName?.charAt(0) || userData?.name?.charAt(0) || '?'}
+                                                        </span>
+                                                    )}
+                                                </div>
+
+                                                {/* Upload Controls */}
+                                                <div className="flex-1">
+                                                    <input
+                                                        type="file"
+                                                        accept="image/*"
+                                                        onChange={handleFileSelect}
+                                                        className="hidden"
+                                                        id="logo-upload"
+                                                        disabled={uploadingLogo}
+                                                    />
+                                                    <label
+                                                        htmlFor="logo-upload"
+                                                        className={`inline-block px-4 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700 cursor-pointer transition-colors ${uploadingLogo ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                                    >
+                                                        {uploadingLogo ? 'Uploading...' : 'Choose Logo'}
+                                                    </label>
+
+                                                    {logoFile && (
+                                                        <div className="mt-2 flex items-center gap-2">
+                                                            <button
+                                                                onClick={handleLogoUpload}
+                                                                disabled={uploadingLogo}
+                                                                className="px-4 py-2 bg-green-600 text-white rounded-lg font-semibold hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                                                            >
+                                                                {uploadingLogo ? 'Uploading...' : 'Upload Logo'}
+                                                            </button>
+                                                            <button
+                                                                onClick={() => {
+                                                                    setLogoFile(null);
+                                                                    setLogoPreview(null);
+                                                                }}
+                                                                disabled={uploadingLogo}
+                                                                className="px-4 py-2 border-2 border-gray-300 rounded-lg font-semibold hover:bg-gray-50 disabled:opacity-50"
+                                                            >
+                                                                Cancel
+                                                            </button>
+                                                        </div>
+                                                    )}
+
+                                                    <p className="text-xs text-gray-500 mt-2">
+                                                        Recommended: Square image, max 5MB. Will appear on your detailer card.
+                                                    </p>
+                                                </div>
+                                            </div>
+                                        </div>
                                         <div>
                                             <label className="block text-sm font-medium text-gray-700 mb-2">
                                                 Business Name
@@ -5860,26 +7018,18 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                                             <button
                                                 onClick={async () => {
                                                     try {
-                                                        const providerQuery = query(
-                                                            collection(db, 'providers'),
-                                                            where('userId', '==', currentUser.uid)
-                                                        );
-                                                        const providerSnapshot = await getDocs(providerQuery);
-                                                        
-                                                        if (!providerSnapshot.empty) {
-                                                            await updateDoc(doc(db, 'providers', providerSnapshot.docs[0].id), {
-                                                                businessName: editedProviderProfile.businessName,
-                                                                serviceArea: editedProviderProfile.serviceArea,
-                                                                businessAddress: editedProviderProfile.businessAddress,
-                                                                address: editedProviderProfile.businessAddress,
-                                                                phone: editedProviderProfile.phone,
-                                                                email: editedProviderProfile.email,
-                                                                updatedAt: serverTimestamp()
-                                                            });
-                                                            alert('Profile updated successfully!');
-                                                            setIsEditingProfile(false);
-                                                            loadProviderData(); // Reload to show updated data
-                                                        }
+                                                        // Update detailer collection
+                                                        await updateDoc(doc(db, 'detailer', currentUser.uid), {
+                                                            businessName: editedProviderProfile.businessName,
+                                                            serviceArea: editedProviderProfile.serviceArea,
+                                                            businessAddress: editedProviderProfile.businessAddress,
+                                                            phone: editedProviderProfile.phone,
+                                                            email: editedProviderProfile.email,
+                                                            updatedAt: serverTimestamp()
+                                                        });
+                                                        alert('Profile updated successfully!');
+                                                        setIsEditingProfile(false);
+                                                        loadProviderData(); // Reload to show updated data
                                                     } catch (error) {
                                                         console.error('Error updating provider profile:', error);
                                                         alert('Failed to update profile');
@@ -5894,12 +7044,15 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                                                     setIsEditingProfile(false);
                                                     // Reset to original values
                                                     setEditedProviderProfile({
-                                                        businessName: providerData.businessName || '',
-                                                        serviceArea: providerData.serviceArea || '',
-                                                        businessAddress: providerData.businessAddress || providerData.address || '',
-                                                        phone: providerData.phone || '',
-                                                        email: providerData.email || ''
+                                                        businessName: userData?.businessName || '',
+                                                        serviceArea: userData?.serviceArea || '',
+                                                        businessAddress: userData?.businessAddress || userData?.address || '',
+                                                        phone: userData?.phone || '',
+                                                        email: userData?.email || ''
                                                     });
+                                                    // Reset logo upload state
+                                                    setLogoFile(null);
+                                                    setLogoPreview(null);
                                                 }}
                                                 className="px-6 py-3 border-2 border-gray-200 rounded-lg font-semibold hover:bg-gray-50"
                                             >

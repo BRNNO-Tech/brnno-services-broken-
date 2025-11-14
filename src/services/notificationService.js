@@ -3,7 +3,6 @@ import {
     addDoc, 
     query, 
     where, 
-    orderBy, 
     limit, 
     getDocs, 
     updateDoc, 
@@ -57,15 +56,41 @@ export async function getFCMToken() {
 }
 
 // Save FCM token to Firestore
+// Checks both customer and detailer collections to find where the user exists
 export async function saveFCMToken(userId, token) {
     if (!token || !userId) return;
 
     try {
-        const userRef = doc(db, 'users', userId);
-        await updateDoc(userRef, {
-            fcmToken: token,
-            fcmTokenUpdatedAt: serverTimestamp()
-        });
+        // Check if user exists in detailer collection
+        const detailerRef = doc(db, 'detailer', userId);
+        const detailerDoc = await getDoc(detailerRef);
+        
+        if (detailerDoc.exists()) {
+            // User is a detailer/provider
+            await updateDoc(detailerRef, {
+                fcmToken: token,
+                fcmTokenUpdatedAt: serverTimestamp()
+            });
+            console.log('✅ FCM token saved to detailer collection');
+            return;
+        }
+
+        // Check if user exists in customer collection
+        const customerRef = doc(db, 'customer', userId);
+        const customerDoc = await getDoc(customerRef);
+        
+        if (customerDoc.exists()) {
+            // User is a customer
+            await updateDoc(customerRef, {
+                fcmToken: token,
+                fcmTokenUpdatedAt: serverTimestamp()
+            });
+            console.log('✅ FCM token saved to customer collection');
+            return;
+        }
+
+        // If user doesn't exist in either collection, log a warning
+        console.warn('⚠️ User not found in customer or detailer collection, cannot save FCM token');
     } catch (error) {
         console.error('Error saving FCM token:', error);
     }
@@ -90,17 +115,28 @@ export async function createNotification(notificationData) {
 // Get notifications for a user
 export async function getNotifications(userId, limitCount = 50) {
     try {
+        // Query without orderBy to avoid needing composite index
         const q = query(
             collection(db, 'notifications'),
             where('userId', '==', userId),
-            orderBy('createdAt', 'desc'),
             limit(limitCount)
         );
         const snapshot = await getDocs(q);
-        return snapshot.docs.map(doc => ({
+        const notifications = snapshot.docs.map(doc => ({
             id: doc.id,
             ...doc.data()
         }));
+        // Sort manually by createdAt (descending - newest first)
+        notifications.sort((a, b) => {
+            const aTime = a.createdAt?.toDate ? a.createdAt.toDate().getTime() : 
+                         (a.createdAt?.seconds ? a.createdAt.seconds * 1000 : 
+                          (a.createdAt ? new Date(a.createdAt).getTime() : 0));
+            const bTime = b.createdAt?.toDate ? b.createdAt.toDate().getTime() : 
+                         (b.createdAt?.seconds ? b.createdAt.seconds * 1000 : 
+                          (b.createdAt ? new Date(b.createdAt).getTime() : 0));
+            return bTime - aTime; // Descending order
+        });
+        return notifications;
     } catch (error) {
         console.error('Error getting notifications:', error);
         return [];
@@ -161,66 +197,34 @@ export async function markAllAsRead(userId) {
 export function subscribeToNotifications(userId, callback) {
     if (!userId) return () => {};
 
-    try {
-        // Try with orderBy first (requires composite index)
-        const q = query(
-            collection(db, 'notifications'),
-            where('userId', '==', userId),
-            orderBy('createdAt', 'desc'),
-            limit(50)
-        );
+    // Use query without orderBy to avoid needing composite index
+    // We'll sort manually instead, which works fine for small datasets
+    const q = query(
+        collection(db, 'notifications'),
+        where('userId', '==', userId),
+        limit(50)
+    );
 
-        return onSnapshot(q, (snapshot) => {
-            const notifications = snapshot.docs.map(doc => ({
-                id: doc.id,
-                ...doc.data()
-            }));
-            // Sort manually as fallback
-            notifications.sort((a, b) => {
-                const aTime = a.createdAt?.toDate ? a.createdAt.toDate().getTime() : 
-                             (a.createdAt?.seconds ? a.createdAt.seconds * 1000 : 0);
-                const bTime = b.createdAt?.toDate ? b.createdAt.toDate().getTime() : 
-                             (b.createdAt?.seconds ? b.createdAt.seconds * 1000 : 0);
-                return bTime - aTime;
-            });
-            callback(notifications);
-        }, (error) => {
-            console.error('Error in notification listener (with orderBy):', error);
-            // Fallback: try without orderBy
-            if (error.code === 'failed-precondition') {
-                console.warn('Composite index missing, falling back to query without orderBy');
-                const fallbackQ = query(
-                    collection(db, 'notifications'),
-                    where('userId', '==', userId),
-                    limit(50)
-                );
-                return onSnapshot(fallbackQ, (snapshot) => {
-                    const notifications = snapshot.docs.map(doc => ({
-                        id: doc.id,
-                        ...doc.data()
-                    }));
-                    // Sort manually
-                    notifications.sort((a, b) => {
-                        const aTime = a.createdAt?.toDate ? a.createdAt.toDate().getTime() : 
-                                     (a.createdAt?.seconds ? a.createdAt.seconds * 1000 : 0);
-                        const bTime = b.createdAt?.toDate ? b.createdAt.toDate().getTime() : 
-                                     (b.createdAt?.seconds ? b.createdAt.seconds * 1000 : 0);
-                        return bTime - aTime;
-                    });
-                    callback(notifications);
-                }, (fallbackError) => {
-                    console.error('Error in fallback notification listener:', fallbackError);
-                    callback([]); // Return empty array on error
-                });
-            } else {
-                callback([]); // Return empty array on error
-            }
+    return onSnapshot(q, (snapshot) => {
+        const notifications = snapshot.docs.map(doc => ({
+            id: doc.id,
+            ...doc.data()
+        }));
+        // Sort manually by createdAt (descending - newest first)
+        notifications.sort((a, b) => {
+            const aTime = a.createdAt?.toDate ? a.createdAt.toDate().getTime() : 
+                         (a.createdAt?.seconds ? a.createdAt.seconds * 1000 : 
+                          (a.createdAt ? new Date(a.createdAt).getTime() : 0));
+            const bTime = b.createdAt?.toDate ? b.createdAt.toDate().getTime() : 
+                         (b.createdAt?.seconds ? b.createdAt.seconds * 1000 : 
+                          (b.createdAt ? new Date(b.createdAt).getTime() : 0));
+            return bTime - aTime; // Descending order
         });
-    } catch (error) {
-        console.error('Error setting up notification listener:', error);
+        callback(notifications);
+    }, (error) => {
+        console.error('Error in notification listener:', error);
         callback([]); // Return empty array on error
-        return () => {}; // Return no-op unsubscribe function
-    }
+    });
 }
 
 // Set up real-time listener for unread count
@@ -395,16 +399,30 @@ export async function sendPushNotification(fcmToken, title, body, data = {}) {
 }
 
 // Helper to get FCM token for a user and send push notification
+// Checks both customer and detailer collections to find the user's FCM token
 export async function sendPushNotificationToUser(userId, title, body, data = {}) {
     try {
-        // Get user's FCM token from Firestore
-        const userDoc = await getDoc(doc(db, 'users', userId));
-        if (userDoc.exists()) {
-            const userData = userDoc.data();
-            if (userData.fcmToken) {
-                await sendPushNotification(userData.fcmToken, title, body, data);
+        // Check detailer collection first
+        const detailerDoc = await getDoc(doc(db, 'detailer', userId));
+        if (detailerDoc.exists()) {
+            const detailerData = detailerDoc.data();
+            if (detailerData.fcmToken) {
+                await sendPushNotification(detailerData.fcmToken, title, body, data);
+                return;
             }
         }
+
+        // Check customer collection
+        const customerDoc = await getDoc(doc(db, 'customer', userId));
+        if (customerDoc.exists()) {
+            const customerData = customerDoc.data();
+            if (customerData.fcmToken) {
+                await sendPushNotification(customerData.fcmToken, title, body, data);
+                return;
+            }
+        }
+
+        console.warn('⚠️ No FCM token found for user:', userId);
     } catch (error) {
         console.warn('Failed to send push notification to user:', error);
     }
