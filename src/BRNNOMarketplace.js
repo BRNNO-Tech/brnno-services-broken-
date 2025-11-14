@@ -4536,6 +4536,12 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
         try {
             // Get the provider document first to check if they have services
             const providerDoc = await getDoc(doc(db, 'providers', providerId));
+            
+            if (!providerDoc.exists()) {
+                alert('Error: Provider document not found!');
+                return;
+            }
+            
             const providerData = providerDoc.data();
             
             // Prepare update data
@@ -4551,12 +4557,23 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                 updateData.services = defaultServices;
             }
             
+            // Perform the update
             await updateDoc(doc(db, 'providers', providerId), updateData);
+            
+            // Verify the update succeeded by reading the document again
+            const verifyDoc = await getDoc(doc(db, 'providers', providerId));
+            const verifyData = verifyDoc.data();
+            
+            if (verifyData.status !== 'approved') {
+                throw new Error('Update verification failed: status is still not approved');
+            }
+            
             alert('Provider approved successfully!');
-            loadPendingProviders();
+            // Reload pending providers list
+            await loadPendingProviders();
         } catch (error) {
             console.error('Error approving provider:', error);
-            alert('Failed to approve provider');
+            alert(`Failed to approve provider: ${error.message || 'Unknown error'}`);
         }
     }
 
