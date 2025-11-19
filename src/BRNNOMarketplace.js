@@ -11,7 +11,8 @@ import {
     createUserWithEmailAndPassword,
     signInWithPopup,
     onAuthStateChanged,
-    signOut
+    signOut,
+    sendPasswordResetEmail
 } from 'firebase/auth';
 import {
     collection,
@@ -4302,6 +4303,21 @@ function UserProfile({ userData, currentUser, address, answers, userCoordinates 
         }
     }
 
+    async function handleResetPassword() {
+        if (!currentUser?.email) {
+            alert('Email address not found. Please contact support.');
+            return;
+        }
+
+        try {
+            await sendPasswordResetEmail(auth, currentUser.email);
+            alert('Password reset email sent! Please check your inbox and follow the instructions to reset your password.');
+        } catch (error) {
+            console.error('Error sending password reset email:', error);
+            alert(`Failed to send password reset email: ${error.message}`);
+        }
+    }
+
     async function handleSavePreferences() {
         if (!userData?.id) return;
 
@@ -4351,62 +4367,76 @@ function UserProfile({ userData, currentUser, address, answers, userCoordinates 
                 </div>
                 <div className="max-w-2xl">
                     {!isEditingProfile ? (
-                        <div className="grid grid-cols-2 gap-6">
-                            <div>
-                                <label className="block text-sm font-medium text-gray-500 mb-1">
-                                    First Name
-                                </label>
-                                <div className="text-lg font-semibold text-gray-900">
-                                    {userData.firstName || 'Not set'}
+                        <>
+                            <div className="grid grid-cols-2 gap-6">
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-500 mb-1">
+                                        First Name
+                                    </label>
+                                    <div className="text-lg font-semibold text-gray-900">
+                                        {userData.firstName || 'Not set'}
+                                    </div>
                                 </div>
-                            </div>
 
-                            <div>
-                                <label className="block text-sm font-medium text-gray-500 mb-1">
-                                    Last Name
-                                </label>
-                                <div className="text-lg font-semibold text-gray-900">
-                                    {userData.lastName || 'Not set'}
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-500 mb-1">
+                                        Last Name
+                                    </label>
+                                    <div className="text-lg font-semibold text-gray-900">
+                                        {userData.lastName || 'Not set'}
+                                    </div>
                                 </div>
-                            </div>
 
-                            <div>
-                                <label className="block text-sm font-medium text-gray-500 mb-1">
-                                    Email
-                                </label>
-                                <div className="text-lg font-semibold text-gray-900">
-                                    {userData.email}
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-500 mb-1">
+                                        Email
+                                    </label>
+                                    <div className="text-lg font-semibold text-gray-900">
+                                        {userData.email}
+                                    </div>
+                                    <p className="text-xs text-gray-500 mt-1">Email cannot be changed</p>
                                 </div>
-                                <p className="text-xs text-gray-500 mt-1">Email cannot be changed</p>
-                            </div>
 
-                            <div>
-                                <label className="block text-sm font-medium text-gray-500 mb-1">
-                                    Phone
-                                </label>
-                                <div className="text-lg font-semibold text-gray-900">
-                                    {userData.phone || 'Not set'}
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-500 mb-1">
+                                        Phone
+                                    </label>
+                                    <div className="text-lg font-semibold text-gray-900">
+                                        {userData.phone || 'Not set'}
+                                    </div>
                                 </div>
-                            </div>
 
-                            <div>
-                                <label className="block text-sm font-medium text-gray-500 mb-1">
-                                    Account Type
-                                </label>
-                                <div className="text-lg font-semibold text-gray-900 capitalize">
-                                    {userData.accountType || 'customer'}
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-500 mb-1">
+                                        Account Type
+                                    </label>
+                                    <div className="text-lg font-semibold text-gray-900 capitalize">
+                                        {userData.accountType || 'customer'}
+                                    </div>
                                 </div>
-                            </div>
 
-                            <div>
-                                <label className="block text-sm font-medium text-gray-500 mb-1">
-                                    Member Since
-                                </label>
-                                <div className="text-lg font-semibold text-gray-900">
-                                    {userData.createdAt ? new Date(userData.createdAt.seconds * 1000).toLocaleDateString() : 'N/A'}
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-500 mb-1">
+                                        Member Since
+                                    </label>
+                                    <div className="text-lg font-semibold text-gray-900">
+                                        {userData.createdAt ? new Date(userData.createdAt.seconds * 1000).toLocaleDateString() : 'N/A'}
+                                    </div>
                                 </div>
                             </div>
-                        </div>
+                            <div className="mt-6 pt-6 border-t border-gray-200">
+                                <button
+                                    onClick={handleResetPassword}
+                                    className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700 transition-colors"
+                                >
+                                    <Shield className="w-4 h-4" />
+                                    Reset Password
+                                </button>
+                                <p className="text-xs text-gray-500 mt-2">
+                                    We'll send a password reset link to your email address.
+                                </p>
+                            </div>
+                        </>
                     ) : (
                         <div className="space-y-4">
                             <div className="grid grid-cols-2 gap-4">
@@ -6716,71 +6746,98 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                         {userData ? (
                             <div className="bg-white rounded-xl border border-gray-200 p-8">
                                 {!isEditingProfile ? (
-                                    <div className="space-y-6">
-                                        {/* Logo Display */}
-                                        <div>
-                                            <label className="block text-sm font-medium text-gray-500 mb-2">
-                                                Business Logo
-                                            </label>
-                                            <div className="w-32 h-32 bg-gray-100 rounded-lg overflow-hidden border-2 border-gray-200 flex items-center justify-center">
-                                                {userData.image ? (
-                                                    <img src={userData.image} alt="Business logo" className="w-full h-full object-cover" />
-                                                ) : (
-                                                    <span className="text-gray-400 text-3xl font-bold">
-                                                        {userData.businessName?.charAt(0) || userData.name?.charAt(0) || '?'}
-                                                    </span>
-                                                )}
+                                    <>
+                                        <div className="space-y-6">
+                                            {/* Logo Display */}
+                                            <div>
+                                                <label className="block text-sm font-medium text-gray-500 mb-2">
+                                                    Business Logo
+                                                </label>
+                                                <div className="w-32 h-32 bg-gray-100 rounded-lg overflow-hidden border-2 border-gray-200 flex items-center justify-center">
+                                                    {userData.image ? (
+                                                        <img src={userData.image} alt="Business logo" className="w-full h-full object-cover" />
+                                                    ) : (
+                                                        <span className="text-gray-400 text-3xl font-bold">
+                                                            {userData.businessName?.charAt(0) || userData.name?.charAt(0) || '?'}
+                                                        </span>
+                                                    )}
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <label className="block text-sm font-medium text-gray-500 mb-1">
+                                                    Business Name
+                                                </label>
+                                                <div className="text-lg font-semibold text-gray-900">
+                                                    {userData.businessName || 'Not set'}
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <label className="block text-sm font-medium text-gray-500 mb-1">
+                                                    Service Area
+                                                </label>
+                                                <div className="text-lg font-semibold text-gray-900">
+                                                    {userData.serviceArea || userData.businessAddress || 'Not set'}
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <label className="block text-sm font-medium text-gray-500 mb-1">
+                                                    Business Address
+                                                </label>
+                                                <div className="text-lg font-semibold text-gray-900">
+                                                    {userData.businessAddress || userData.address || 'Not set'}
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <label className="block text-sm font-medium text-gray-500 mb-1">
+                                                    Primary Service
+                                                </label>
+                                                <div className="text-lg font-semibold text-gray-900">
+                                                    {userData.primaryService || 'Not set'}
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <label className="block text-sm font-medium text-gray-500 mb-1">
+                                                    Phone
+                                                </label>
+                                                <div className="text-lg font-semibold text-gray-900">
+                                                    {userData.phone || 'Not set'}
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <label className="block text-sm font-medium text-gray-500 mb-1">
+                                                    Email
+                                                </label>
+                                                <div className="text-lg font-semibold text-gray-900">
+                                                    {userData.email || 'Not set'}
+                                                </div>
                                             </div>
                                         </div>
-                                        <div>
-                                            <label className="block text-sm font-medium text-gray-500 mb-1">
-                                                Business Name
-                                            </label>
-                                            <div className="text-lg font-semibold text-gray-900">
-                                                {userData.businessName || 'Not set'}
-                                            </div>
+                                        <div className="mt-6 pt-6 border-t border-gray-200">
+                                            <button
+                                                onClick={async () => {
+                                                    if (!currentUser?.email) {
+                                                        alert('Email address not found. Please contact support.');
+                                                        return;
+                                                    }
+
+                                                    try {
+                                                        await sendPasswordResetEmail(auth, currentUser.email);
+                                                        alert('Password reset email sent! Please check your inbox and follow the instructions to reset your password.');
+                                                    } catch (error) {
+                                                        console.error('Error sending password reset email:', error);
+                                                        alert(`Failed to send password reset email: ${error.message}`);
+                                                    }
+                                                }}
+                                                className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700 transition-colors"
+                                            >
+                                                <Shield className="w-4 h-4" />
+                                                Reset Password
+                                            </button>
+                                            <p className="text-xs text-gray-500 mt-2">
+                                                We'll send a password reset link to your email address.
+                                            </p>
                                         </div>
-                                        <div>
-                                            <label className="block text-sm font-medium text-gray-500 mb-1">
-                                                Service Area
-                                            </label>
-                                            <div className="text-lg font-semibold text-gray-900">
-                                                {userData.serviceArea || userData.businessAddress || 'Not set'}
-                                            </div>
-                                        </div>
-                                        <div>
-                                            <label className="block text-sm font-medium text-gray-500 mb-1">
-                                                Business Address
-                                            </label>
-                                            <div className="text-lg font-semibold text-gray-900">
-                                                {userData.businessAddress || userData.address || 'Not set'}
-                                            </div>
-                                        </div>
-                                        <div>
-                                            <label className="block text-sm font-medium text-gray-500 mb-1">
-                                                Primary Service
-                                            </label>
-                                            <div className="text-lg font-semibold text-gray-900">
-                                                {userData.primaryService || 'Not set'}
-                                            </div>
-                                        </div>
-                                        <div>
-                                            <label className="block text-sm font-medium text-gray-500 mb-1">
-                                                Phone
-                                            </label>
-                                            <div className="text-lg font-semibold text-gray-900">
-                                                {userData.phone || 'Not set'}
-                                            </div>
-                                        </div>
-                                        <div>
-                                            <label className="block text-sm font-medium text-gray-500 mb-1">
-                                                Email
-                                            </label>
-                                            <div className="text-lg font-semibold text-gray-900">
-                                                {userData.email || 'Not set'}
-                                            </div>
-                                        </div>
-                                    </div>
+                                    </>
                                 ) : (
                                     <div className="space-y-4">
                                         {/* Logo Upload Section */}
