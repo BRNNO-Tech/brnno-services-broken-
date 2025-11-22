@@ -2,7 +2,7 @@
 // Note: This requires Firebase Admin SDK setup
 // For production, consider using Firebase Cloud Functions instead
 
-import admin from 'firebase-admin';
+const admin = require('firebase-admin');
 
 // Initialize Firebase Admin (only if credentials are available)
 let adminInitialized = false;
@@ -18,7 +18,7 @@ if (process.env.FIREBASE_SERVICE_ACCOUNT) {
     }
 }
 
-export default async function handler(req, res) {
+module.exports = async function handler(req, res) {
     if (req.method !== 'POST') {
         res.setHeader('Allow', 'POST');
         return res.status(405).json({ error: 'Method Not Allowed' });
@@ -58,5 +58,5 @@ export default async function handler(req, res) {
             error: error.message || 'Failed to send notification' 
         });
     }
-}
+};
 
