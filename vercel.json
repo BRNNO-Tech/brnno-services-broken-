@@ -1,24 +1,10 @@
 {
   "functions": {
-    "api/**/*.js": {
-      "runtime": "nodejs18.x"
+    "api/create-payment-intent.js": {
+      "runtime": "@vercel/node@3.0.7"
+    },
+    "api/send-notification.js": {
+      "runtime": "@vercel/node@3.0.7"
     }
-  },
-  "rewrites": [
-    {
-      "source": "/api/:path*",
-      "destination": "/api/:path*"
-    }
-  ],
-  "headers": [
-    {
-      "source": "/(.*)",
-      "headers": [
-        {
-          "key": "Cache-Control",
-          "value": "public, max-age=0, must-revalidate"
-        }
-      ]
-    }
-  ]
+  }
 }
