@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { CardElement, AddressElement, useElements, useStripe } from '@stripe/react-stripe-js';
+import { isTestMode } from '../stripe';
 
 export default function PaymentForm({ amount, serviceAddress, onClose, onComplete }) {
     const stripe = useStripe();
@@ -123,7 +124,9 @@ export default function PaymentForm({ amount, serviceAddress, onClose, onComplet
                         >
                             {isLoading ? 'Processing…' : 'Pay'}
                         </button>
-                        <p className="text-xs text-gray-500 text-center mt-2">Stripe Test Mode • Use 4242 4242 4242 4242</p>
+                        {isTestMode && (
+                            <p className="text-xs text-gray-500 text-center mt-2">Stripe Test Mode • Use 4242 4242 4242 4242</p>
+                        )}
                     </div>
                 </form>
             </div>
