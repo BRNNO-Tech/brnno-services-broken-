@@ -2,11 +2,8 @@
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "functions": {
-    "api/create-payment-intent.js": {
-      "runtime": "@vercel/node@3.0.7"
-    },
-    "api/send-notification.js": {
-      "runtime": "@vercel/node@3.0.7"
+    "api/*.js": {
+      "runtime": "nodejs18.x"
     }
   }
 }
