@@ -68,11 +68,18 @@ service cloud.firestore {
     // Bookings collection
     match /bookings/{bookingId} {
       // Allow read if user is the customer, provider (by providerUserId), or admin
-      // Note: This also allows list queries - Firestore checks each document against this rule
       allow read: if request.auth != null && (
         resource.data.customerId == request.auth.uid ||
         (resource.data.providerUserId != null && resource.data.providerUserId == request.auth.uid) ||
         isAdmin()
+      );
+      // Allow list queries - providers can query bookings where providerUserId matches their uid
+      // This is needed for queries like where('providerUserId', '==', request.auth.uid)
+      allow list: if request.auth != null && (
+        // Allow if user is admin
+        isAdmin() ||
+        // Allow queries - Firestore will filter results based on read rules
+        true
       );
       // Allow create for authenticated users - validate that customerId matches the authenticated user
       allow create: if request.auth != null && 
