@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { CardElement, AddressElement, useElements, useStripe } from '@stripe/react-stripe-js';
 import { isTestMode } from '../stripe';
 
@@ -8,6 +8,53 @@ export default function PaymentForm({ amount, serviceAddress, onClose, onComplet
     const [isLoading, setIsLoading] = useState(false);
     const [errorMessage, setErrorMessage] = useState('');
     const [billingAddress, setBillingAddress] = useState(null);
+    const [taxBreakdown, setTaxBreakdown] = useState(null);
+    const [isCalculatingTax, setIsCalculatingTax] = useState(false);
+
+    // Calculate tax when billing address changes
+    const calculateTax = async (amountCents, zipCode, state, address) => {
+        if (!zipCode || !amountCents) return;
+        
+        setIsCalculatingTax(true);
+        try {
+            const response = await fetch('/api/calculate-tax', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    amountCents: amountCents,
+                    zipCode,
+                    state,
+                    serviceAddress: address || serviceAddress,
+                }),
+            });
+            
+            const data = await response.json();
+            setTaxBreakdown(data);
+        } catch (error) {
+            console.error('Tax calculation failed:', error);
+            // Fallback: show subtotal only
+            setTaxBreakdown({
+                subtotal: amountCents,
+                tax: 0,
+                total: amountCents,
+            });
+        } finally {
+            setIsCalculatingTax(false);
+        }
+    };
+
+    // Watch for address changes
+    useEffect(() => {
+        if (billingAddress?.address?.postal_code && amount) {
+            const amountCents = Math.round((amount || 0) * 100);
+            calculateTax(
+                amountCents,
+                billingAddress.address.postal_code,
+                billingAddress.address.state,
+                serviceAddress
+            );
+        }
+    }, [billingAddress?.address?.postal_code, billingAddress?.address?.state, amount, serviceAddress]);
 
     const handleSubmit = async (e) => {
         e.preventDefault();
@@ -33,13 +80,20 @@ export default function PaymentForm({ amount, serviceAddress, onClose, onComplet
                 }
             }
 
+            // Use tax breakdown total if available, otherwise use original amount
+            const finalAmountCents = taxBreakdown?.total || Math.round((amount || 0) * 100);
+
             const res = await fetch('/api/create-payment-intent', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    amountCents: Math.round((amount || 0) * 100),
-                    metadata: { source: 'brnno-marketplace' },
-                    serviceAddress: serviceAddress || null, // Pass service location for tax calculation
+                    amountCents: finalAmountCents,
+                    metadata: { 
+                        source: 'brnno-marketplace',
+                        subtotal: taxBreakdown?.subtotal || finalAmountCents,
+                        tax: taxBreakdown?.tax || 0,
+                    },
+                    serviceAddress: serviceAddress || null,
                 })
             });
             const data = await res.json();
@@ -76,6 +130,11 @@ export default function PaymentForm({ amount, serviceAddress, onClose, onComplet
         }
     };
 
+    const subtotalCents = Math.round((amount || 0) * 100);
+    const displaySubtotal = taxBreakdown?.subtotal || subtotalCents;
+    const displayTax = taxBreakdown?.tax || 0;
+    const displayTotal = taxBreakdown?.total || subtotalCents;
+
     return (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50 overflow-y-auto">
             <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md max-h-[90vh] my-auto flex flex-col p-6">
@@ -83,12 +142,35 @@ export default function PaymentForm({ amount, serviceAddress, onClose, onComplet
                     <h3 className="text-lg font-semibold text-gray-900">Checkout</h3>
                     <button onClick={onClose} className="text-gray-400 hover:text-gray-600">✕</button>
                 </div>
-                <div className="flex-shrink-0 mb-4">
-                    <p className="text-sm text-gray-600">
-                        Subtotal: <span className="font-semibold">${amount?.toFixed?.(2) || amount}</span>
-                        <br />
-                        <span className="text-xs text-gray-500">Tax will be calculated automatically based on service location</span>
-                    </p>
+                
+                {/* Tax Breakdown */}
+                <div className="flex-shrink-0 mb-4 p-4 bg-gray-50 rounded-lg border border-gray-200">
+                    <div className="space-y-2">
+                        <div className="flex justify-between text-sm">
+                            <span className="text-gray-600">Subtotal:</span>
+                            <span className="font-medium">${(displaySubtotal / 100).toFixed(2)}</span>
+                        </div>
+                        {isCalculatingTax ? (
+                            <div className="flex justify-between text-sm">
+                                <span className="text-gray-600">Tax:</span>
+                                <span className="text-gray-400">Calculating...</span>
+                            </div>
+                        ) : taxBreakdown ? (
+                            <div className="flex justify-between text-sm">
+                                <span className="text-gray-600">Tax:</span>
+                                <span className="font-medium">${(displayTax / 100).toFixed(2)}</span>
+                            </div>
+                        ) : (
+                            <div className="flex justify-between text-sm">
+                                <span className="text-gray-600">Tax:</span>
+                                <span className="text-xs text-gray-500">Enter address to calculate</span>
+                            </div>
+                        )}
+                        <div className="flex justify-between pt-2 border-t border-gray-300">
+                            <span className="font-semibold text-gray-900">Total:</span>
+                            <span className="font-bold text-lg text-gray-900">${(displayTotal / 100).toFixed(2)}</span>
+                        </div>
+                    </div>
                 </div>
                 <form onSubmit={handleSubmit} className="space-y-4 overflow-y-auto flex-1 min-h-0">
                     {/* Billing Address */}
@@ -119,10 +201,10 @@ export default function PaymentForm({ amount, serviceAddress, onClose, onComplet
                     <div className="flex-shrink-0 pt-2">
                         <button
                             type="submit"
-                            disabled={!stripe || isLoading}
+                            disabled={!stripe || isLoading || isCalculatingTax}
                             className="w-full bg-blue-600 text-white py-3 rounded-lg font-semibold hover:bg-blue-700 disabled:opacity-60"
                         >
-                            {isLoading ? 'Processing…' : 'Pay'}
+                            {isLoading ? 'Processing…' : `Pay $${(displayTotal / 100).toFixed(2)}`}
                         </button>
                         {isTestMode && (
                             <p className="text-xs text-gray-500 text-center mt-2">Stripe Test Mode • Use 4242 4242 4242 4242</p>
