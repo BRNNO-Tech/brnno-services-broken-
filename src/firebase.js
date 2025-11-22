@@ -1,3 +1,3 @@
-export { auth, db, analytics, default as app } from './firebase/config';
+export { auth, db, storage, analytics, default as app } from './firebase/config';
 
 
