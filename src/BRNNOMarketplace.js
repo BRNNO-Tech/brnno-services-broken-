@@ -5108,7 +5108,7 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
         try {
             // Debug: Log current user UID
             console.log('Current user UID:', auth.currentUser?.uid);
-            
+
             // Unified structure: providerUserId is the same as currentUser.uid
             const providerUserId = currentUser.uid;
             const providerDocId = currentUser.uid; // Document ID is now the UID
