@@ -67,10 +67,9 @@ service cloud.firestore {
 
     // Bookings collection
     match /bookings/{bookingId} {
-      // Allow read/list if user is the customer, detailer (by detailerId), or admin
+      // Allow read/list if user is the customer, provider (detailer), or admin
       allow read, list: if request.auth != null && (
         resource.data.customerId == request.auth.uid ||
-        resource.data.detailerId == request.auth.uid ||
         resource.data.providerUserId == request.auth.uid ||
         isAdmin()
       );
@@ -79,10 +78,9 @@ service cloud.firestore {
       allow create: if request.auth != null && 
         request.resource.data.customerId == request.auth.uid;
         
-      // Allow update if user is the customer, detailer, or admin
+      // Allow update if user is the customer, provider, or admin
       allow update: if request.auth != null && (
         resource.data.customerId == request.auth.uid ||
-        resource.data.detailerId == request.auth.uid ||
         resource.data.providerUserId == request.auth.uid ||
         isAdmin()
       );
