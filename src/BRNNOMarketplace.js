@@ -5106,9 +5106,14 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
 
     async function loadBookings() {
         try {
+            // Debug: Log current user UID
+            console.log('Current user UID:', auth.currentUser?.uid);
+            
             // Unified structure: providerUserId is the same as currentUser.uid
             const providerUserId = currentUser.uid;
             const providerDocId = currentUser.uid; // Document ID is now the UID
+
+            console.log('Loading bookings for provider:', providerUserId);
 
             // Query by providerUserId first (this is what new bookings use)
             let bookingsByUserId = { docs: [] };
@@ -5118,8 +5123,14 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                     where('providerUserId', '==', providerUserId)
                 );
                 bookingsByUserId = await getDocs(bookingsQueryByUserId);
+                console.log(`Found ${bookingsByUserId.docs.length} bookings by providerUserId`);
             } catch (err) {
-                console.warn('Could not query by providerUserId:', err);
+                console.error('Error querying by providerUserId:', err);
+                console.error('Error details:', {
+                    code: err.code,
+                    message: err.message,
+                    stack: err.stack
+                });
             }
 
             // Also query by providerId if we have a provider document
@@ -5133,9 +5144,9 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                         where('providerId', '==', providerDocId)
                     );
                     bookingsById = await getDocs(bookingsQueryById);
+                    console.log(`Found ${bookingsById.docs.length} bookings by providerId`);
                 } catch (err) {
-                    // Silently fail - this is expected if security rules don't allow querying by providerId alone
-                    // The primary query by providerUserId should work
+                    // Log error but don't fail completely
                     if (err.code !== 'permission-denied') {
                         console.warn('Could not query by providerId:', err);
                     }
@@ -5151,6 +5162,8 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                     allBookingDocs.push(doc);
                 }
             });
+
+            console.log(`Total unique bookings found: ${allBookingDocs.length}`);
 
             // Note: Removed fallback search that queries all bookings due to permission restrictions
             // If bookings aren't showing up, check that:

@@ -14,7 +14,7 @@ export default function PaymentForm({ amount, serviceAddress, onClose, onComplet
     // Calculate tax when billing address changes
     const calculateTax = async (amountCents, zipCode, state, address) => {
         if (!zipCode || !amountCents) return;
-        
+
         setIsCalculatingTax(true);
         try {
             const response = await fetch('/api/calculate-tax', {
@@ -27,7 +27,7 @@ export default function PaymentForm({ amount, serviceAddress, onClose, onComplet
                     serviceAddress: address || serviceAddress,
                 }),
             });
-            
+
             const data = await response.json();
             setTaxBreakdown(data);
         } catch (error) {
@@ -88,7 +88,7 @@ export default function PaymentForm({ amount, serviceAddress, onClose, onComplet
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     amountCents: finalAmountCents,
-                    metadata: { 
+                    metadata: {
                         source: 'brnno-marketplace',
                         subtotal: taxBreakdown?.subtotal || finalAmountCents,
                         tax: taxBreakdown?.tax || 0,
@@ -101,12 +101,12 @@ export default function PaymentForm({ amount, serviceAddress, onClose, onComplet
 
             const clientSecret = data.clientSecret;
             const card = elements.getElement(CardElement);
-            
+
             // Prepare payment method options with billing address if available
             const paymentMethodOptions = {
                 card: card,
             };
-            
+
             if (billingAddressData) {
                 paymentMethodOptions.billing_details = {
                     address: billingAddressData,
@@ -118,9 +118,9 @@ export default function PaymentForm({ amount, serviceAddress, onClose, onComplet
             });
             if (confirmError) throw new Error(confirmError.message);
 
-            onComplete && onComplete({ 
+            onComplete && onComplete({
                 status: paymentIntent?.status || 'succeeded',
-                paymentIntent: paymentIntent 
+                paymentIntent: paymentIntent
             });
             onClose && onClose();
         } catch (err) {
@@ -142,7 +142,7 @@ export default function PaymentForm({ amount, serviceAddress, onClose, onComplet
                     <h3 className="text-lg font-semibold text-gray-900">Checkout</h3>
                     <button onClick={onClose} className="text-gray-400 hover:text-gray-600">✕</button>
                 </div>
-                
+
                 {/* Tax Breakdown */}
                 <div className="flex-shrink-0 mb-4 p-4 bg-gray-50 rounded-lg border border-gray-200">
                     <div className="space-y-2">
@@ -175,7 +175,7 @@ export default function PaymentForm({ amount, serviceAddress, onClose, onComplet
                 <form onSubmit={handleSubmit} className="space-y-4 overflow-y-auto flex-1 min-h-0">
                     {/* Billing Address */}
                     <div className="p-3 border-2 border-gray-200 rounded-lg">
-                        <AddressElement 
+                        <AddressElement
                             options={{
                                 mode: 'billing',
                                 allowedCountries: ['US'],
@@ -190,7 +190,7 @@ export default function PaymentForm({ amount, serviceAddress, onClose, onComplet
                             }}
                         />
                     </div>
-                    
+
                     {/* Card Details */}
                     <div className="p-3 border-2 border-gray-200 rounded-lg">
                         <CardElement options={{ style: { base: { fontSize: '16px' } } }} />
