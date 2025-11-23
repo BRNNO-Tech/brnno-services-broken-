@@ -1,5374 +1,7156 @@
-import React, { useState, memo, useCallback } from 'react';
-import { Star, MapPin, Shield, Clock, DollarSign, CheckCircle, Lock, Car, Camera, Award } from 'lucide-react';
-import { collection, addDoc, serverTimestamp, query, orderBy, limit, getDocs, where, deleteDoc, doc, updateDoc, getDoc, setDoc } from 'firebase/firestore';
-import { db, auth } from './firebase/config';
-import { signInWithEmailAndPassword, signInWithPopup, GoogleAuthProvider, createUserWithEmailAndPassword, onAuthStateChanged, sendPasswordResetEmail, signInWithRedirect, getRedirectResult, signOut, updatePassword } from 'firebase/auth';
-import locationService from './locationService';
-import AddressInput from './AddressInput';
-import { Elements, StripeProvider } from '@stripe/react-stripe-js';
-import stripePromise from './stripe';
-import paymentService from './paymentService';
-import StripeCardInput from './StripeCardInput';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import config from './config';
+import {
+    MapPin, Car, Calendar, Star, CheckCircle2, X, ChevronRight,
+    Clock, DollarSign, Shield, User, CreditCard, Home, Package,
+    Edit2, Trash2, Plus, LogOut, Menu, Search, Mail, Phone, MessageSquare,
+    Bell, CheckCircle
+} from 'lucide-react';
+import {
+    signInWithEmailAndPassword,
+    createUserWithEmailAndPassword,
+    signInWithPopup,
+    onAuthStateChanged,
+    signOut,
+    sendPasswordResetEmail
+} from 'firebase/auth';
+import {
+    collection,
+    addDoc,
+    getDocs,
+    getDoc,
+    query,
+    where,
+    updateDoc,
+    deleteDoc,
+    doc,
+    setDoc,
+    serverTimestamp,
+    onSnapshot
+} from 'firebase/firestore';
+import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
+import { auth, db, storage } from './firebase/config';
+import { GoogleAuthProvider } from 'firebase/auth';
+import PaymentForm from './components/PaymentForm';
+import { PACKAGES_DATA, ADD_ONS, importPackagesToFirestore, initializePackagesIfEmpty } from './data/packages';
+import {
+    requestNotificationPermission,
+    saveFCMToken,
+    subscribeToNotifications,
+    subscribeToUnreadCount,
+    markNotificationAsRead,
+    markAllAsRead,
+    setupForegroundMessageHandler,
+    notifyNewBooking,
+    notifyBookingConfirmed,
+    notifyBookingCancelled,
+    notifyPaymentReceived
+} from './services/notificationService';
 
-// AdminDashboard component
-const AdminDashboard = ({ showDashboard, setShowDashboard }) => {
-    console.log('AdminDashboard rendered, showDashboard:', showDashboard);
-    const [analytics, setAnalytics] = useState(null);
+// Use centralized Firebase config
+const googleProvider = new GoogleAuthProvider();
+
+// Google Maps API Key (use your existing key)
+const GOOGLE_MAPS_API_KEY = config.googleMapsApiKey;
+
+// ==================== LOCATION HELPER FUNCTIONS ====================
+
+// Dynamically load Google Maps JS API (with Places)
+let googleMapsApiLoadPromise;
+function loadGoogleMapsApi() {
+    if (window.google && window.google.maps) return Promise.resolve();
+    if (googleMapsApiLoadPromise) return googleMapsApiLoadPromise;
+    googleMapsApiLoadPromise = new Promise((resolve, reject) => {
+        const existing = document.getElementById('google-maps-js');
+        if (existing) {
+            existing.addEventListener('load', () => resolve());
+            existing.addEventListener('error', () => reject(new Error('Failed to load Google Maps')));
+            return;
+        }
+        const script = document.createElement('script');
+        script.id = 'google-maps-js';
+        script.src = `https://maps.googleapis.com/maps/api/js?key=${GOOGLE_MAPS_API_KEY}&libraries=places&loading=async`;
+        script.async = true;
+        script.defer = true;
+        script.onload = () => resolve();
+        script.onerror = () => reject(new Error('Failed to load Google Maps'));
+        document.head.appendChild(script);
+    });
+    return googleMapsApiLoadPromise;
+}
+
+// ==================== SCHEDULING HELPER FUNCTIONS ====================
+
+// Generate available time slots based on provider's schedule for a specific date
+function generateAvailableTimesForDate(defaultAvailability, dateOverrides, selectedDate) {
+    if (!selectedDate || !defaultAvailability) {
+        return [];
+    }
+
+    const date = new Date(selectedDate + 'T00:00:00'); // ensure local timezone
+    const dayOfWeek = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'][date.getDay()];
+    const dateString = selectedDate; // YYYY-MM-DD
+
+    // Check overrides
+    if (dateOverrides && dateOverrides[dateString]) {
+        const override = dateOverrides[dateString];
+        if (override.type === 'unavailable') {
+            return [];
+        }
+        if (override.type === 'custom' && override.hours) {
+            return generateTimeSlots(override.hours.start, override.hours.end);
+        }
+    }
+
+    const daySchedule = defaultAvailability[dayOfWeek];
+
+    if (!daySchedule) {
+        return [];
+    }
+
+    if (!daySchedule.enabled) {
+        return [];
+    }
+
+    // Ensure start and end times exist, use defaults if missing
+    const startTime = daySchedule.start || '09:00';
+    const endTime = daySchedule.end || '17:00';
+
+    return generateTimeSlots(startTime, endTime);
+}
+
+// Generate time slots in 1-hour increments (e.g., 09:00-14:00)
+function generateTimeSlots(startTime, endTime) {
+    if (!startTime || !endTime) return [];
+    const slots = [];
+    const startHour = parseInt(startTime.split(':')[0]);
+    const endHour = parseInt(endTime.split(':')[0]);
+    for (let hour = startHour; hour < endHour; hour++) {
+        const period = hour >= 12 ? 'PM' : 'AM';
+        const displayHour = hour > 12 ? hour - 12 : (hour === 0 ? 12 : hour);
+        slots.push(`${displayHour}:00 ${period}`);
+    }
+    return slots;
+}
+
+// Get provider's general hours (for display on cards)
+function getProviderHours(defaultAvailability) {
+    if (!defaultAvailability) return 'Hours vary';
+    const monday = defaultAvailability.monday;
+    if (monday && monday.enabled) {
+        const start = formatTime(monday.start);
+        const end = formatTime(monday.end);
+        return `${start} - ${end}`;
+    }
+    return 'Hours vary';
+}
+
+// Format 24hr time to 12hr (10:00 → 10:00 AM)
+function formatTime(time24) {
+    if (!time24) return '';
+    const [hours, minutes] = time24.split(':');
+    const hour = parseInt(hours);
+    const period = hour >= 12 ? 'PM' : 'AM';
+    const displayHour = hour > 12 ? hour - 12 : (hour === 0 ? 12 : hour);
+    return `${displayHour}:${minutes} ${period}`;
+}
+
+// Check if a date is available (not blocked)
+function isDateAvailable(dateOverrides, dateString) {
+    if (!dateOverrides || !dateString) return true;
+    const override = dateOverrides[dateString];
+    if (override && override.type === 'unavailable') return false;
+    return true;
+}
+
+// Geocode address to coordinates using Google Maps API
+async function geocodeAddress(address) {
+    try {
+        if (!address || !address.trim()) {
+            console.error('Geocoding error: Empty address provided');
+            return null;
+        }
+
+        await loadGoogleMapsApi();
+
+        if (!window.google || !window.google.maps || !window.google.maps.Geocoder) {
+            console.error('Geocoding error: Google Maps API not loaded');
+            return null;
+        }
+
+        const geocoder = new window.google.maps.Geocoder();
+        const response = await geocoder.geocode({ address });
+
+        if (!response || !response.results || response.results.length === 0) {
+            console.error('Geocoding error: No results found for address:', address);
+            return null;
+        }
+
+        const result = response.results[0];
+        if (!result || !result.geometry || !result.geometry.location) {
+            console.error('Geocoding error: Invalid result structure');
+            return null;
+        }
+
+        const byType = (type) => result.address_components?.find(c => c.types.includes(type));
+        const coords = {
+            lat: result.geometry.location.lat(),
+            lng: result.geometry.location.lng(),
+            formattedAddress: result.formatted_address,
+            city: byType('locality')?.long_name || '',
+            state: byType('administrative_area_level_1')?.short_name || '',
+            zip: byType('postal_code')?.long_name || ''
+        };
+
+        return coords;
+    } catch (error) {
+        console.error('Geocoding error:', error);
+        console.error('Error details:', {
+            message: error.message,
+            stack: error.stack,
+            address: address
+        });
+        return null;
+    }
+}
+
+// Calculate straight-line distance using Haversine formula (in miles)
+function calculateRealDistance(lat1, lng1, lat2, lng2) {
+    if (!lat1 || !lng1 || !lat2 || !lng2) return 999;
+
+    const R = 3959; // Earth's radius in miles
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLng = (lng2 - lng1) * Math.PI / 180;
+
+    const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+        Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+        Math.sin(dLng / 2) * Math.sin(dLng / 2);
+
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    const distance = R * c;
+
+    return parseFloat(distance.toFixed(1));
+}
+
+// ==================== MAIN APP COMPONENT ====================
+export default function BrnnoMarketplace() {
+    // Auth state
+    const [currentUser, setCurrentUser] = useState(null);
     const [loading, setLoading] = useState(true);
+    const [userAccountType, setUserAccountType] = useState(null);
+    const [isProvider, setIsProvider] = useState(false);
+    const isCreatingAccountRef = React.useRef(false); // Flag to prevent auth listener from signing out during account creation
 
-    React.useEffect(() => {
-        const fetchAnalytics = async () => {
-            try {
-                console.log('Fetching analytics...');
-                console.log('Firebase db:', db);
+    // User location
+    const [userCoordinates, setUserCoordinates] = useState(null);
 
-                // Set basic analytics without waitlist data
-                setAnalytics({
-                    totalCount: 0,
-                    recentSignups: 0,
-                    byCity: {},
-                    byService: {},
-                    byUrgency: {},
-                    byVehicleType: {}
-                });
-                console.log('Analytics loaded:', { totalCount, recentSignups });
-            } catch (error) {
-                console.error('Error fetching analytics:', error);
-                console.error('Error details:', error.message);
-                console.error('Error code:', error.code);
-                setAnalytics({ error: error.message });
-            } finally {
-                setLoading(false);
-            }
-        };
+    // Search and filter state
+    const [searchQuery, setSearchQuery] = useState('');
+    const [distanceFilter, setDistanceFilter] = useState(50); // miles
+    const [sortBy, setSortBy] = useState('distance'); // distance, price, rating, reviews
 
-        if (showDashboard) {
-            fetchAnalytics();
-        }
-    }, [showDashboard]);
+    // Page state
+    const [currentPage, setCurrentPage] = useState('landing'); // landing, marketplace, detailerProfile, dashboard
 
-    if (!showDashboard) return null;
+    // Modal/flow state
+    const [modalType, setModalType] = useState(null); // 'address', 'signup', 'login', 'providerOnboarding'
 
-    if (loading) {
-        return (
-            <div className="fixed inset-0 bg-gray-50 flex items-center justify-center z-50">
-                <div className="text-center">
-                    <div className="w-8 h-8 border-4 border-cyan-500 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
-                    <p className="text-gray-600">Loading analytics...</p>
-                    <button
-                        onClick={() => setShowDashboard(false)}
-                        className="mt-4 bg-gray-500 text-white px-4 py-2 rounded-lg"
-                    >
-                        Close
-                    </button>
-                </div>
-            </div>
-        );
-    }
-
-    if (!analytics) {
-        return (
-            <div className="fixed inset-0 bg-gray-50 flex items-center justify-center z-50">
-                <div className="text-center">
-                    <p className="text-red-600">Error loading analytics</p>
-                    <p className="text-sm text-gray-500 mt-2">Check browser console for details</p>
-                    <button
-                        onClick={() => setShowDashboard(false)}
-                        className="mt-4 bg-cyan-500 text-white px-4 py-2 rounded-lg"
-                    >
-                        Close
-                    </button>
-                </div>
-            </div>
-        );
-    }
-
-    if (analytics.error) {
-        return (
-            <div className="fixed inset-0 bg-gray-50 flex items-center justify-center z-50">
-                <div className="text-center max-w-md">
-                    <p className="text-red-600 font-semibold">Firebase Error</p>
-                    <p className="text-sm text-gray-600 mt-2">{analytics.error}</p>
-                    <p className="text-xs text-gray-500 mt-2">Check browser console for more details</p>
-                    <button
-                        onClick={() => setShowDashboard(false)}
-                        className="mt-4 bg-cyan-500 text-white px-4 py-2 rounded-lg"
-                    >
-                        Close
-                    </button>
-                </div>
-            </div>
-        );
-    }
-
-    return (
-        <div className="fixed inset-0 bg-gray-50 z-50 overflow-y-auto">
-            <div className="min-h-screen p-6">
-                <div className="max-w-7xl mx-auto">
-                    <div className="flex justify-between items-center mb-8">
-                        <h1 className="text-3xl font-bold text-gray-800">BRNNO Waitlist Analytics</h1>
-                        <button
-                            onClick={() => setShowDashboard(false)}
-                            className="bg-gray-500 hover:bg-gray-600 text-white px-4 py-2 rounded-lg"
-                        >
-                            Close Dashboard
-                        </button>
-                    </div>
-
-                    {/* Summary Cards */}
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
-                        <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-                            <h3 className="text-lg font-semibold text-gray-800 mb-2">Total Signups</h3>
-                            <p className="text-3xl font-bold text-cyan-600">{analytics.totalCount}</p>
-                        </div>
-                        <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-                            <h3 className="text-lg font-semibold text-gray-800 mb-2">Recent Signups</h3>
-                            <p className="text-3xl font-bold text-green-600">{analytics.recentSignups}</p>
-                            <p className="text-sm text-gray-600 mt-1">Last 24 hours</p>
-                        </div>
-                        <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-                            <h3 className="text-lg font-semibold text-gray-800 mb-2">Top City</h3>
-                            <p className="text-xl font-bold text-blue-600">
-                                {Object.keys(analytics.byCity).reduce((a, b) => analytics.byCity[a] > analytics.byCity[b] ? a : b, 'N/A')}
-                            </p>
-                            <p className="text-sm text-gray-600 mt-1">
-                                {Math.max(...Object.values(analytics.byCity))} signups
-                            </p>
-                        </div>
-                    </div>
-
-
-                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-                        {/* Cities */}
-                        <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-                            <h3 className="text-xl font-bold text-gray-800 mb-4">Signups by City</h3>
-                            <div className="space-y-3">
-                                {Object.entries(analytics.byCity)
-                                    .sort(([, a], [, b]) => b - a)
-                                    .slice(0, 10)
-                                    .map(([city, count]) => (
-                                        <div key={city} className="flex justify-between items-center">
-                                            <span className="text-gray-700">{city}</span>
-                                            <div className="flex items-center gap-2">
-                                                <div className="w-24 bg-gray-200 rounded-full h-2">
-                                                    <div
-                                                        className="bg-cyan-500 h-2 rounded-full"
-                                                        style={{ width: `${(count / Math.max(...Object.values(analytics.byCity))) * 100}%` }}
-                                                    ></div>
-                                                </div>
-                                                <span className="text-sm font-semibold text-gray-800 w-8 text-right">{count}</span>
-                                            </div>
-                                        </div>
-                                    ))}
-                            </div>
-                        </div>
-
-                        {/* Services */}
-                        <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-                            <h3 className="text-xl font-bold text-gray-800 mb-4">Most Wanted Services</h3>
-                            <div className="space-y-3">
-                                {Object.entries(analytics.byService)
-                                    .sort(([, a], [, b]) => b - a)
-                                    .slice(0, 7)
-                                    .map(([service, count]) => (
-                                        <div key={service} className="flex justify-between items-center">
-                                            <span className="text-gray-700">{service}</span>
-                                            <div className="flex items-center gap-2">
-                                                <div className="w-24 bg-gray-200 rounded-full h-2">
-                                                    <div
-                                                        className="bg-orange-500 h-2 rounded-full"
-                                                        style={{ width: `${(count / Math.max(...Object.values(analytics.byService))) * 100}%` }}
-                                                    ></div>
-                                                </div>
-                                                <span className="text-sm font-semibold text-gray-800 w-8 text-right">{count}</span>
-                                            </div>
-                                        </div>
-                                    ))}
-                            </div>
-                        </div>
-
-                        {/* Urgency */}
-                        <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-                            <h3 className="text-xl font-bold text-gray-800 mb-4">Booking Urgency</h3>
-                            <div className="space-y-3">
-                                {Object.entries(analytics.byUrgency)
-                                    .sort(([, a], [, b]) => b - a)
-                                    .map(([urgency, count]) => (
-                                        <div key={urgency} className="flex justify-between items-center">
-                                            <span className="text-gray-700 capitalize">{urgency.replace('_', ' ')}</span>
-                                            <div className="flex items-center gap-2">
-                                                <div className="w-24 bg-gray-200 rounded-full h-2">
-                                                    <div
-                                                        className="bg-green-500 h-2 rounded-full"
-                                                        style={{ width: `${(count / Math.max(...Object.values(analytics.byUrgency))) * 100}%` }}
-                                                    ></div>
-                                                </div>
-                                                <span className="text-sm font-semibold text-gray-800 w-8 text-right">{count}</span>
-                                            </div>
-                                        </div>
-                                    ))}
-                            </div>
-                        </div>
-
-                        {/* Vehicle Types */}
-                        <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-                            <h3 className="text-xl font-bold text-gray-800 mb-4">Vehicle Types</h3>
-                            <div className="space-y-3">
-                                {Object.entries(analytics.byVehicleType)
-                                    .sort(([, a], [, b]) => b - a)
-                                    .map(([vehicleType, count]) => (
-                                        <div key={vehicleType} className="flex justify-between items-center">
-                                            <span className="text-gray-700 capitalize">{vehicleType.replace('_', ' ')}</span>
-                                            <div className="flex items-center gap-2">
-                                                <div className="w-24 bg-gray-200 rounded-full h-2">
-                                                    <div
-                                                        className="bg-purple-500 h-2 rounded-full"
-                                                        style={{ width: `${(count / Math.max(...Object.values(analytics.byVehicleType))) * 100}%` }}
-                                                    ></div>
-                                                </div>
-                                                <span className="text-sm font-semibold text-gray-800 w-8 text-right">{count}</span>
-                                            </div>
-                                        </div>
-                                    ))}
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
-    );
-};
-
-// AddressInput component is now imported from separate file
-
-const LoginModal = ({ showLoginModal, setShowLoginModal, authMode, setAuthMode, setShowSignupModal, setShowProviderModal }) => {
-    const [email, setEmail] = useState('');
-    const [password, setPassword] = useState('');
-    const [error, setError] = useState('');
-    const [loading, setLoading] = useState(false);
-    const [info, setInfo] = useState('');
-
-    // Lock body scroll when modal is open
-    React.useEffect(() => {
-        if (showLoginModal) {
-            document.body.style.overflow = 'hidden';
-        }
-        return () => {
-            document.body.style.overflow = 'unset';
-        };
-    }, [showLoginModal]);
-
-    const handleLogin = async (e) => {
-        e.preventDefault();
-        setError('');
-        setLoading(true);
-
-        try {
-            const userCredential = await signInWithEmailAndPassword(auth, email, password);
-            console.log('Logged in:', userCredential.user);
-            setShowLoginModal(false);
-            // You can add redirect logic here based on authMode
-        } catch (error) {
-            console.error('Login error:', error);
-            setError(error.message);
-        } finally {
-            setLoading(false);
-        }
-    };
-
-    const handleGoogleLogin = async () => {
-        const provider = new GoogleAuthProvider();
-        try {
-            const result = await signInWithPopup(auth, provider);
-            const user = result.user;
-
-            console.log('Google login:', user);
-
-            // Check if user profile exists, create if not
-            const userDoc = await getDoc(doc(db, 'users', user.uid));
-            if (!userDoc.exists()) {
-                await setDoc(doc(db, 'users', user.uid), {
-                    uid: user.uid,
-                    email: user.email,
-                    displayName: user.displayName,
-                    accountType: authMode,
-                    createdAt: serverTimestamp(),
-                    role: 'user' // Default role
-                });
-                console.log('User document created for login');
-            }
-
-            setShowLoginModal(false);
-        } catch (error) {
-            console.error('Google login error:', error);
-            // Fallback to redirect flow for environments that block/auto-close popups
-            const popupIssues = [
-                'auth/popup-closed-by-user',
-                'auth/cancelled-popup-request',
-                'auth/popup-blocked',
-                'auth/unauthorized-domain'
-            ];
-            if (error && (popupIssues.includes(error.code) || /popup|redirect|domain/i.test(error.message || ''))) {
-                try {
-                    await signInWithRedirect(auth, provider);
-                    return;
-                } catch (redirectError) {
-                    console.error('Google login redirect error:', redirectError);
-                    setError(redirectError.message || 'Google sign-in failed.');
-                }
-            } else {
-                setError(error.message);
-            }
-        }
-    };
-
-    const handleForgotPassword = async (e) => {
-        e.preventDefault();
-        setError('');
-        setInfo('');
-        if (!email) {
-            setError('Please enter your email first.');
-            return;
-        }
-        try {
-            const actionCodeSettings = {
-                url: `${window.location.origin}/app.html`,
-                handleCodeInApp: false
-            };
-            await sendPasswordResetEmail(auth, email, actionCodeSettings);
-            setInfo('Password reset email sent. Check your inbox.');
-        } catch (err) {
-            console.error('Password reset error:', err);
-            setError(err.message || 'Failed to send reset email.');
-        }
-    };
-
-    if (!showLoginModal) return null;
-
-    return (
-        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-2 sm:p-4 modal-backdrop">
-            <div className="bg-white rounded-2xl shadow-2xl max-w-md w-full p-6 sm:p-8 relative modal-content">
-                <button
-                    onClick={() => setShowLoginModal(false)}
-                    className="absolute top-4 right-4 text-gray-400 hover:text-gray-600 text-2xl"
-                >
-                    ✕
-                </button>
-
-                <h2 className="text-3xl font-bold text-gray-800 mb-2">Welcome Back!</h2>
-                <p className="text-gray-600 mb-6">Log in to continue to BRNNO</p>
-
-                <div className="flex gap-2 mb-6">
-                    <button
-                        onClick={() => setAuthMode('customer')}
-                        className={`flex-1 py-2 px-4 rounded-lg font-semibold transition-colors ${authMode === 'customer'
-                            ? 'bg-cyan-500 text-white'
-                            : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
-                            }`}
-                    >
-                        Customer
-                    </button>
-                    <button
-                        onClick={() => {
-                            setShowLoginModal(false);
-                            setShowProviderModal(true);
-                        }}
-                        className="flex-1 py-2 px-4 rounded-lg font-semibold transition-colors bg-gray-100 text-gray-600 hover:bg-gray-200"
-                    >
-                        Provider
-                    </button>
-                </div>
-
-                <form onSubmit={handleLogin} className="space-y-4">
-                    <div>
-                        <label className="block text-sm font-semibold text-gray-700 mb-2">Email</label>
-                        <input
-                            type="email"
-                            value={email}
-                            onChange={(e) => setEmail(e.target.value)}
-                            placeholder="your@email.com"
-                            className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                            required
-                        />
-                    </div>
-                    <div>
-                        <label className="block text-sm font-semibold text-gray-700 mb-2">Password</label>
-                        <input
-                            type="password"
-                            value={password}
-                            onChange={(e) => setPassword(e.target.value)}
-                            placeholder="••••••••"
-                            className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                            required
-                        />
-                    </div>
-
-                    {error && (
-                        <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg text-sm">
-                            {error}
-                        </div>
-                    )}
-                    {info && (
-                        <div className="bg-green-50 border border-green-200 text-green-700 px-4 py-3 rounded-lg text-sm">
-                            {info}
-                        </div>
-                    )}
-
-                    <div className="flex items-center justify-between text-sm">
-                        <label className="flex items-center gap-2">
-                            <input type="checkbox" className="rounded" />
-                            <span className="text-gray-600">Remember me</span>
-                        </label>
-                        <a href="#" onClick={handleForgotPassword} className="text-cyan-500 hover:text-cyan-600 font-semibold">
-                            Forgot password?
-                        </a>
-                    </div>
-                    <button
-                        type="submit"
-                        disabled={loading}
-                        className="w-full bg-cyan-500 hover:bg-cyan-600 text-white font-bold py-3 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                    >
-                        {loading ? 'Logging in...' : 'Log In'}
-                    </button>
-                </form>
-
-                <div className="mt-6">
-                    <div className="relative">
-                        <div className="absolute inset-0 flex items-center">
-                            <div className="w-full border-t border-gray-300"></div>
-                        </div>
-                        <div className="relative flex justify-center text-sm">
-                            <span className="px-2 bg-white text-gray-500">Or continue with</span>
-                        </div>
-                    </div>
-
-                    <div className="mt-4 grid grid-cols-2 gap-3">
-                        <button
-                            onClick={handleGoogleLogin}
-                            type="button"
-                            className="flex items-center justify-center gap-2 px-4 py-3 border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors relative z-10"
-                        >
-                            <svg className="w-5 h-5" viewBox="0 0 24 24">
-                                <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
-                                <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" />
-                                <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" />
-                                <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" />
-                            </svg>
-                            <span className="text-sm font-semibold text-gray-700">Google</span>
-                        </button>
-                        <button className="flex items-center justify-center gap-2 px-4 py-3 border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors">
-                            <svg className="w-5 h-5" fill="#1877F2" viewBox="0 0 24 24">
-                                <path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z" />
-                            </svg>
-                            <span className="text-sm font-semibold text-gray-700">Facebook</span>
-                        </button>
-                    </div>
-                </div>
-
-                <p className="mt-6 text-center text-sm text-gray-600">
-                    Don't have an account?{' '}
-                    <button
-                        onClick={() => {
-                            setShowLoginModal(false);
-                            setShowSignupModal(true);
-                        }}
-                        className="text-cyan-500 hover:text-cyan-600 font-semibold"
-                    >
-                        Sign up
-                    </button>
-                </p>
-            </div>
-        </div>
-    );
-};
-
-const SignupModal = ({ showSignupModal, setShowSignupModal, authMode, setAuthMode, setShowLoginModal, setShowProviderModal }) => {
-    const [error, setError] = useState('');
-    const [loading, setLoading] = useState(false);
-    const [email, setEmail] = useState('');
-    const [password, setPassword] = useState('');
-    const [confirmPassword, setConfirmPassword] = useState('');
-    const [firstName, setFirstName] = useState('');
-    const [lastName, setLastName] = useState('');
-    const [businessName, setBusinessName] = useState('');
-    const [phone, setPhone] = useState('');
-
-    // Lock body scroll when modal is open
-    React.useEffect(() => {
-        if (showSignupModal) {
-            document.body.style.overflow = 'hidden';
-        }
-        return () => {
-            document.body.style.overflow = 'unset';
-        };
-    }, [showSignupModal]);
-
-    const handleSignup = async (e) => {
-        e.preventDefault();
-        setError('');
-        setLoading(true);
-
-        // Validation
-        if (!email || !password || !firstName || !lastName) {
-            setError('Please fill in all required fields.');
-            setLoading(false);
-            return;
-        }
-
-        if (password !== confirmPassword) {
-            setError('Passwords do not match.');
-            setLoading(false);
-            return;
-        }
-
-        if (password.length < 6) {
-            setError('Password must be at least 6 characters.');
-            setLoading(false);
-            return;
-        }
-
-        try {
-            const userCredential = await createUserWithEmailAndPassword(auth, email, password);
-            const user = userCredential.user;
-
-            console.log('Email signup:', user);
-
-            // Create user profile in Firestore
-            await setDoc(doc(db, 'users', user.uid), {
-                uid: user.uid,
-                email: user.email,
-                firstName: firstName,
-                lastName: lastName,
-                displayName: `${firstName} ${lastName}`,
-                phone: phone,
-                businessName: authMode === 'provider' ? businessName : null,
-                accountType: authMode,
-                createdAt: serverTimestamp(),
-                role: 'user' // Default role
-            });
-
-            console.log('User document created successfully');
-            setShowSignupModal(false);
-        } catch (error) {
-            console.error('Signup error:', error);
-            setError(error.message);
-        } finally {
-            setLoading(false);
-        }
-    };
-
-    const handleGoogleSignup = async () => {
-        const provider = new GoogleAuthProvider();
-        try {
-            const result = await signInWithPopup(auth, provider);
-            const user = result.user;
-
-            console.log('Google signup:', user);
-
-            // Create user profile in Firestore with user.uid as document ID
-            await setDoc(doc(db, 'users', user.uid), {
-                uid: user.uid,
-                email: user.email,
-                displayName: user.displayName,
-                accountType: authMode,
-                createdAt: serverTimestamp(),
-                role: 'user' // Default role
-            });
-
-            console.log('User document created successfully');
-            setShowSignupModal(false);
-        } catch (error) {
-            console.error('Google signup error:', error);
-            // Fallback to redirect flow for environments that block/auto-close popups
-            const popupIssues = [
-                'auth/popup-closed-by-user',
-                'auth/cancelled-popup-request',
-                'auth/popup-blocked',
-                'auth/unauthorized-domain'
-            ];
-            if (error && (popupIssues.includes(error.code) || /popup|redirect|domain/i.test(error.message || ''))) {
-                try {
-                    await signInWithRedirect(auth, provider);
-                    return;
-                } catch (redirectError) {
-                    console.error('Google signup redirect error:', redirectError);
-                    setError(redirectError.message || 'Google sign-up failed.');
-                }
-            } else {
-                setError(error.message);
-            }
-        }
-    };
-
-    if (!showSignupModal) return null;
-
-    return (
-        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-2 sm:p-4 modal-backdrop">
-            <div className="bg-white rounded-2xl shadow-2xl max-w-md w-full p-6 sm:p-8 relative max-h-[90vh] overflow-y-auto modal-content">
-                <button
-                    onClick={() => setShowSignupModal(false)}
-                    className="absolute top-4 right-4 text-gray-400 hover:text-gray-600 text-2xl"
-                >
-                    ✕
-                </button>
-
-                <h2 className="text-3xl font-bold text-gray-800 mb-2">Join BRNNO</h2>
-                <p className="text-gray-600 mb-6">Create your account to get started</p>
-
-                <div className="flex gap-2 mb-6">
-                    <button
-                        onClick={() => setAuthMode('customer')}
-                        className={`flex-1 py-2 px-4 rounded-lg font-semibold transition-colors ${authMode === 'customer'
-                            ? 'bg-cyan-500 text-white'
-                            : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
-                            }`}
-                    >
-                        Customer
-                    </button>
-                    <button
-                        onClick={() => {
-                            setShowSignupModal(false);
-                            setShowProviderModal(true);
-                        }}
-                        className="flex-1 py-2 px-4 rounded-lg font-semibold transition-colors bg-gray-100 text-gray-600 hover:bg-gray-200"
-                    >
-                        Provider
-                    </button>
-                </div>
-
-                {error && (
-                    <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg text-sm mb-4">
-                        {error}
-                    </div>
-                )}
-
-                <form onSubmit={handleSignup} className="space-y-4">
-                    <div className="grid grid-cols-2 gap-4">
-                        <div>
-                            <label className="block text-sm font-semibold text-gray-700 mb-2">First Name *</label>
-                            <input
-                                type="text"
-                                value={firstName}
-                                onChange={(e) => setFirstName(e.target.value)}
-                                placeholder="John"
-                                className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                required
-                            />
-                        </div>
-                        <div>
-                            <label className="block text-sm font-semibold text-gray-700 mb-2">Last Name *</label>
-                            <input
-                                type="text"
-                                value={lastName}
-                                onChange={(e) => setLastName(e.target.value)}
-                                placeholder="Doe"
-                                className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                required
-                            />
-                        </div>
-                    </div>
-
-                    {authMode === 'provider' && (
-                        <div>
-                            <label className="block text-sm font-semibold text-gray-700 mb-2">Business Name</label>
-                            <input
-                                type="text"
-                                value={businessName}
-                                onChange={(e) => setBusinessName(e.target.value)}
-                                placeholder="Your Detailing Business"
-                                className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                            />
-                        </div>
-                    )}
-
-                    <div>
-                        <label className="block text-sm font-semibold text-gray-700 mb-2">Email *</label>
-                        <input
-                            type="email"
-                            value={email}
-                            onChange={(e) => setEmail(e.target.value)}
-                            placeholder="your@email.com"
-                            className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                            required
-                        />
-                    </div>
-
-                    <div>
-                        <label className="block text-sm font-semibold text-gray-700 mb-2">Phone Number</label>
-                        <input
-                            type="tel"
-                            value={phone}
-                            onChange={(e) => setPhone(e.target.value)}
-                            placeholder="(555) 123-4567"
-                            className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                        />
-                    </div>
-
-                    <div>
-                        <label className="block text-sm font-semibold text-gray-700 mb-2">Password *</label>
-                        <input
-                            type="password"
-                            value={password}
-                            onChange={(e) => setPassword(e.target.value)}
-                            placeholder="••••••••"
-                            className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                            required
-                        />
-                        <p className="text-xs text-gray-500 mt-1">Must be at least 6 characters</p>
-                    </div>
-
-                    <div>
-                        <label className="block text-sm font-semibold text-gray-700 mb-2">Confirm Password *</label>
-                        <input
-                            type="password"
-                            value={confirmPassword}
-                            onChange={(e) => setConfirmPassword(e.target.value)}
-                            placeholder="••••••••"
-                            className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                            required
-                        />
-                    </div>
-
-                    <div className="flex items-start gap-2">
-                        <input type="checkbox" className="mt-1 rounded" required />
-                        <label className="text-sm text-gray-600">
-                            I agree to the{' '}
-                            <a href="#" className="text-cyan-500 hover:text-cyan-600 font-semibold">
-                                Terms of Service
-                            </a>{' '}
-                            and{' '}
-                            <a href="#" className="text-cyan-500 hover:text-cyan-600 font-semibold">
-                                Privacy Policy
-                            </a>
-                        </label>
-                    </div>
-
-                    <button
-                        type="submit"
-                        disabled={loading}
-                        className="w-full bg-cyan-500 hover:bg-cyan-600 text-white font-bold py-3 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                    >
-                        {loading ? 'Creating Account...' : 'Create Account'}
-                    </button>
-                </form>
-
-                <div className="mt-6">
-                    <div className="relative">
-                        <div className="absolute inset-0 flex items-center">
-                            <div className="w-full border-t border-gray-300"></div>
-                        </div>
-                        <div className="relative flex justify-center text-sm">
-                            <span className="px-2 bg-white text-gray-500">Or sign up with</span>
-                        </div>
-                    </div>
-
-                    <div className="mt-4 grid grid-cols-2 gap-3">
-                        <button
-                            onClick={handleGoogleSignup}
-                            type="button"
-                            className="flex items-center justify-center gap-2 px-4 py-3 border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors relative z-10"
-                        >
-                            <svg className="w-5 h-5" viewBox="0 0 24 24">
-                                <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
-                                <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" />
-                                <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" />
-                                <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" />
-                            </svg>
-                            <span className="text-sm font-semibold text-gray-700">Google</span>
-                        </button>
-                        <button className="flex items-center justify-center gap-2 px-4 py-3 border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors">
-                            <svg className="w-5 h-5" fill="#1877F2" viewBox="0 0 24 24">
-                                <path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z" />
-                            </svg>
-                            <span className="text-sm font-semibold text-gray-700">Facebook</span>
-                        </button>
-                    </div>
-                </div>
-
-                <p className="mt-6 text-center text-sm text-gray-600">
-                    Already have an account?{' '}
-                    <button
-                        onClick={() => {
-                            setShowSignupModal(false);
-                            setShowLoginModal(true);
-                        }}
-                        className="text-cyan-500 hover:text-cyan-600 font-semibold"
-                    >
-                        Log in
-                    </button>
-                </p>
-            </div>
-        </div>
-    );
-};
-
-const ProfilePanel = ({ showProfilePanel, setShowProfilePanel, profileTab, setProfileTab }) => {
-    const [isEditing, setIsEditing] = useState(false);
-    const [isAuthorized, setIsAuthorized] = useState(false);
-    const [checkingAuth, setCheckingAuth] = useState(false);
-    const [userData, setUserData] = useState(null);
-    const [loading, setLoading] = useState(false);
-    const [error, setError] = useState('');
-    const [success, setSuccess] = useState('');
-    const [showChangePassword, setShowChangePassword] = useState(false);
-    const [passwordData, setPasswordData] = useState({
-        currentPassword: '',
-        newPassword: '',
-        confirmPassword: ''
-    });
-
-    // Form state
-    const [formData, setFormData] = useState({
-        firstName: '',
-        lastName: '',
+    // Login form state
+    const [loginData, setLoginData] = useState({
         email: '',
-        phone: '',
-        businessName: ''
+        password: ''
     });
-    const [profileImage, setProfileImage] = useState(null);
-    const [showImageUpload, setShowImageUpload] = useState(false);
 
-    // Check authentication and load user data when panel opens
-    React.useEffect(() => {
-        if (showProfilePanel) {
-            document.body.style.overflow = 'hidden';
-
-            // Check if user is authenticated - immediate check, no loading state
-            if (auth.currentUser) {
-                setIsAuthorized(true);
-                setCheckingAuth(false);
-                loadUserData();
-            } else {
-                alert('Please sign in first to access your profile.');
-                setShowProfilePanel(false);
-            }
-        } else {
-            setIsAuthorized(false);
-            setUserData(null);
-        }
-
-        return () => {
-            document.body.style.overflow = 'unset';
-        };
-    }, [showProfilePanel]);
-
-    const loadUserData = async () => {
-        try {
-            setLoading(true);
-            const user = auth.currentUser;
-            if (user) {
-                // Get user data from Firestore
-                const userDoc = await getDoc(doc(db, 'users', user.uid));
-                if (userDoc.exists()) {
-                    const data = userDoc.data();
-                    setUserData(data);
-                    setFormData({
-                        firstName: data.firstName || '',
-                        lastName: data.lastName || '',
-                        email: data.email || user.email || '',
-                        phone: data.phone || '',
-                        businessName: data.businessName || ''
-                    });
-                    setProfileImage(data.profileImage || null);
-                } else {
-                    // Create user document if it doesn't exist
-                    await setDoc(doc(db, 'users', user.uid), {
-                        uid: user.uid,
-                        email: user.email,
-                        displayName: user.displayName || '',
-                        accountType: 'customer',
-                        createdAt: serverTimestamp(),
-                        role: 'user'
-                    });
-                    setUserData({
-                        uid: user.uid,
-                        email: user.email,
-                        displayName: user.displayName || '',
-                        accountType: 'customer',
-                        role: 'user'
-                    });
-                }
-            }
-        } catch (error) {
-            console.error('Error loading user data:', error);
-            setError('Failed to load user data.');
-        } finally {
-            setLoading(false);
-        }
-    };
-
-    const handleImageUpload = (event) => {
-        const file = event.target.files[0];
-        if (file) {
-            const reader = new FileReader();
-            reader.onload = (e) => {
-                setProfileImage(e.target.result);
-            };
-            reader.readAsDataURL(file);
-        }
-    };
-
-    const saveImage = async () => {
-        try {
-            setLoading(true);
-            const user = auth.currentUser;
-            if (user && profileImage) {
-                await updateDoc(doc(db, 'users', user.uid), {
-                    profileImage: profileImage
-                });
-                setUserData(prev => ({ ...prev, profileImage: profileImage }));
-                setSuccess('Profile image updated successfully!');
-                setShowImageUpload(false);
-            }
-        } catch (error) {
-            console.error('Error saving image:', error);
-            setError('Failed to save image.');
-        } finally {
-            setLoading(false);
-        }
-    };
-
-    const handleSave = async () => {
-        try {
-            setLoading(true);
-            setError('');
-            setSuccess('');
-
-            const user = auth.currentUser;
-            if (!user) {
-                setError('User not authenticated.');
-                return;
-            }
-
-            // Update user data in Firestore
-            await updateDoc(doc(db, 'users', user.uid), {
-                firstName: formData.firstName,
-                lastName: formData.lastName,
-                phone: formData.phone,
-                businessName: formData.businessName,
-                displayName: `${formData.firstName} ${formData.lastName}`,
-                updatedAt: serverTimestamp()
-            });
-
-            setSuccess('Profile updated successfully!');
-            setIsEditing(false);
-            loadUserData(); // Reload data
-        } catch (error) {
-            console.error('Error saving profile:', error);
-            setError('Failed to save profile. Please try again.');
-        } finally {
-            setLoading(false);
-        }
-    };
-
-    const handleLogout = async () => {
-        try {
-            await signOut(auth);
-            setShowProfilePanel(false);
-            alert('Logged out successfully!');
-        } catch (error) {
-            console.error('Logout error:', error);
-            alert('Failed to logout. Please try again.');
-        }
-    };
-
-    const handleChangePassword = async () => {
-        if (!passwordData.currentPassword || !passwordData.newPassword || !passwordData.confirmPassword) {
-            alert('Please fill in all password fields.');
-            return;
-        }
-
-        if (passwordData.newPassword !== passwordData.confirmPassword) {
-            alert('New passwords do not match.');
-            return;
-        }
-
-        if (passwordData.newPassword.length < 6) {
-            alert('New password must be at least 6 characters long.');
-            return;
-        }
-
-        try {
-            setLoading(true);
-            setError('');
-
-            // Update password using Firebase Auth
-            await updatePassword(auth.currentUser, passwordData.newPassword);
-
-            setSuccess('Password updated successfully!');
-            setPasswordData({
-                currentPassword: '',
-                newPassword: '',
-                confirmPassword: ''
-            });
-            setShowChangePassword(false);
-
-            // Clear success message after 3 seconds
-            setTimeout(() => setSuccess(''), 3000);
-
-        } catch (error) {
-            console.error('Password update error:', error);
-            if (error.code === 'auth/requires-recent-login') {
-                alert('For security reasons, please sign out and sign back in before changing your password.');
-            } else {
-                alert(`Error updating password: ${error.message}`);
-            }
-        } finally {
-            setLoading(false);
-        }
-    };
-
-    if (!showProfilePanel) return null;
-
-    if (!isAuthorized) {
-        return null;
-    }
-
-    return (
-        <>
-            {/* Backdrop */}
-            <div
-                className="fixed inset-0 bg-black/50 backdrop-blur-sm z-40 profile-panel-backdrop"
-                onClick={() => setShowProfilePanel(false)}
-            />
-
-            {/* Slide-out Panel */}
-            <div className="fixed right-0 top-0 h-full w-full sm:w-[95vw] md:w-[500px] bg-white shadow-2xl z-50 overflow-y-auto profile-panel-slide">
-                {/* Header */}
-                <div className="bg-gradient-to-r from-cyan-500 to-blue-600 text-white p-4 sm:p-6">
-                    <div className="flex items-center justify-between mb-4">
-                        <h2 className="text-xl sm:text-2xl font-bold">My Profile</h2>
-                        <button
-                            onClick={() => setShowProfilePanel(false)}
-                            className="text-white hover:bg-white/20 p-2 rounded-lg transition-colors touch-manipulation"
-                        >
-                            ✕
-                        </button>
-                    </div>
-
-                    {/* Profile Picture */}
-                    <div className="flex items-center gap-3 sm:gap-4">
-                        <div className="relative">
-                            {profileImage ? (
-                                <img
-                                    src={profileImage}
-                                    alt="Profile"
-                                    className="w-16 h-16 sm:w-20 sm:h-20 rounded-full object-cover border-2 border-white/20"
-                                />
-                            ) : (
-                                <div className="w-16 h-16 sm:w-20 sm:h-20 bg-white/20 rounded-full flex items-center justify-center text-2xl sm:text-3xl font-bold">
-                                    {userData ? `${formData.firstName.charAt(0)}${formData.lastName.charAt(0)}` : 'U'}
-                                </div>
-                            )}
-                            <button
-                                onClick={() => setShowImageUpload(true)}
-                                className="absolute bottom-0 right-0 bg-white text-cyan-600 p-1 rounded-full hover:bg-cyan-50 transition-colors touch-manipulation"
-                            >
-                                <Camera size={14} />
-                            </button>
-                        </div>
-                        <div className="flex-1 min-w-0">
-                            <h3 className="text-lg sm:text-xl font-bold truncate">
-                                {userData ? `${formData.firstName} ${formData.lastName}` : 'User'}
-                            </h3>
-                            <p className="text-cyan-100 text-sm sm:text-base truncate">{formData.email}</p>
-                            <span className="inline-block bg-white/20 px-2 sm:px-3 py-1 rounded-full text-xs font-semibold mt-1 sm:mt-2">
-                                {userData?.accountType === 'provider' ? 'Provider Account' : 'Customer Account'}
-                            </span>
-                        </div>
-                    </div>
-                </div>
-
-                {/* Tabs */}
-                <div className="border-b border-gray-200 px-4 sm:px-6">
-                    <div className="flex gap-1 overflow-x-auto profile-tabs-scroll pb-1">
-                        {[
-                            { id: 'personal', label: 'Personal', icon: '👤' },
-                            { id: 'vehicles', label: 'Vehicles', icon: '🚗' },
-                            { id: 'bookings', label: 'Bookings', icon: '📅' },
-                            { id: 'payments', label: 'Payment', icon: '💳' },
-                            { id: 'addresses', label: 'Addresses', icon: '📍' }
-                        ].map(tab => (
-                            <button
-                                key={tab.id}
-                                onClick={() => setProfileTab(tab.id)}
-                                className={`flex-shrink-0 px-3 sm:px-4 py-3 font-semibold text-xs sm:text-sm whitespace-nowrap transition-colors touch-manipulation ${profileTab === tab.id
-                                    ? 'text-cyan-600 border-b-2 border-cyan-600'
-                                    : 'text-gray-600 hover:text-cyan-500'
-                                    }`}
-                            >
-                                <span className="mr-1 sm:mr-2 text-sm sm:text-base">{tab.icon}</span>
-                                <span className="hidden sm:inline">{tab.label}</span>
-                                <span className="sm:hidden">{tab.label.split(' ')[0]}</span>
-                            </button>
-                        ))}
-                    </div>
-                </div>
-
-                {/* Content */}
-                <div className="p-4 sm:p-6 overflow-x-auto">
-                    {/* Personal Info Tab */}
-                    {profileTab === 'personal' && (
-                        <div className="space-y-4 sm:space-y-6">
-                            <div className="flex items-center justify-between mb-4">
-                                <h3 className="text-base sm:text-lg font-bold text-gray-800">Personal Information</h3>
-                                <button
-                                    onClick={() => setIsEditing(!isEditing)}
-                                    className="text-cyan-600 hover:text-cyan-700 font-semibold text-sm touch-manipulation px-3 py-2 rounded-lg hover:bg-cyan-50"
-                                >
-                                    {isEditing ? 'Cancel' : 'Edit'}
-                                </button>
-                            </div>
-
-                            {error && (
-                                <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg text-sm">
-                                    {error}
-                                </div>
-                            )}
-
-                            {success && (
-                                <div className="bg-green-50 border border-green-200 text-green-700 px-4 py-3 rounded-lg text-sm">
-                                    {success}
-                                </div>
-                            )}
-
-                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                                <div>
-                                    <label className="block text-sm font-semibold text-gray-700 mb-2">First Name</label>
-                                    <input
-                                        type="text"
-                                        value={formData.firstName}
-                                        onChange={(e) => setFormData({ ...formData, firstName: e.target.value })}
-                                        disabled={!isEditing}
-                                        className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent disabled:bg-gray-50 disabled:text-gray-600 text-base"
-                                    />
-                                </div>
-                                <div>
-                                    <label className="block text-sm font-semibold text-gray-700 mb-2">Last Name</label>
-                                    <input
-                                        type="text"
-                                        value={formData.lastName}
-                                        onChange={(e) => setFormData({ ...formData, lastName: e.target.value })}
-                                        disabled={!isEditing}
-                                        className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent disabled:bg-gray-50 disabled:text-gray-600 text-base"
-                                    />
-                                </div>
-                            </div>
-
-                            <div>
-                                <label className="block text-sm font-semibold text-gray-700 mb-2">Email</label>
-                                <input
-                                    type="email"
-                                    value={formData.email}
-                                    disabled={true}
-                                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent disabled:bg-gray-50 disabled:text-gray-600 text-base"
-                                />
-                                <p className="text-xs text-gray-500 mt-1">Email cannot be changed</p>
-                            </div>
-
-                            <div>
-                                <label className="block text-sm font-semibold text-gray-700 mb-2">Phone Number</label>
-                                <input
-                                    type="tel"
-                                    value={formData.phone}
-                                    onChange={(e) => setFormData({ ...formData, phone: e.target.value })}
-                                    disabled={!isEditing}
-                                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent disabled:bg-gray-50 disabled:text-gray-600 text-base"
-                                />
-                            </div>
-
-                            {userData?.accountType === 'provider' && (
-                                <div>
-                                    <label className="block text-sm font-semibold text-gray-700 mb-2">Business Name</label>
-                                    <input
-                                        type="text"
-                                        value={formData.businessName}
-                                        onChange={(e) => setFormData({ ...formData, businessName: e.target.value })}
-                                        disabled={!isEditing}
-                                        className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent disabled:bg-gray-50 disabled:text-gray-600 text-base"
-                                    />
-                                </div>
-                            )}
-
-                            {isEditing && (
-                                <div className="flex flex-col sm:flex-row gap-3">
-                                    <button
-                                        onClick={handleSave}
-                                        disabled={loading}
-                                        className="flex-1 bg-cyan-500 hover:bg-cyan-600 text-white font-bold py-3 px-4 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed touch-manipulation"
-                                    >
-                                        {loading ? 'Saving...' : 'Save Changes'}
-                                    </button>
-                                    <button
-                                        onClick={() => {
-                                            setIsEditing(false);
-                                            setError('');
-                                            setSuccess('');
-                                            // Reset form data to original values
-                                            if (userData) {
-                                                setFormData({
-                                                    firstName: userData.firstName || '',
-                                                    lastName: userData.lastName || '',
-                                                    email: userData.email || auth.currentUser?.email || '',
-                                                    phone: userData.phone || '',
-                                                    businessName: userData.businessName || ''
-                                                });
-                                            }
-                                        }}
-                                        className="flex-1 bg-gray-500 hover:bg-gray-600 text-white font-bold py-3 px-4 rounded-lg transition-colors touch-manipulation"
-                                    >
-                                        Cancel
-                                    </button>
-                                </div>
-                            )}
-
-                            <div className="pt-4 sm:pt-6 border-t border-gray-200">
-                                <h4 className="font-bold text-gray-800 mb-3 text-sm sm:text-base">Account Settings</h4>
-                                <div className="space-y-1 sm:space-y-2">
-                                    <button
-                                        onClick={() => setShowChangePassword(true)}
-                                        className="w-full text-left px-3 sm:px-4 py-3 hover:bg-gray-50 rounded-lg transition-colors text-gray-700 touch-manipulation text-sm sm:text-base"
-                                    >
-                                        Change Password
-                                    </button>
-                                    <button className="w-full text-left px-3 sm:px-4 py-3 hover:bg-gray-50 rounded-lg transition-colors text-gray-700 touch-manipulation text-sm sm:text-base">
-                                        Notification Preferences
-                                    </button>
-                                    <button
-                                        onClick={handleLogout}
-                                        className="w-full text-left px-3 sm:px-4 py-3 hover:bg-red-50 rounded-lg transition-colors text-red-600 font-semibold touch-manipulation text-sm sm:text-base"
-                                    >
-                                        Logout
-                                    </button>
-                                    <button className="w-full text-left px-3 sm:px-4 py-3 hover:bg-gray-50 rounded-lg transition-colors text-red-600 font-semibold touch-manipulation text-sm sm:text-base">
-                                        Delete Account
-                                    </button>
-                                </div>
-                            </div>
-                        </div>
-                    )}
-
-                    {/* Other tabs would go here - simplified for brevity */}
-                    {profileTab !== 'personal' && (
-                        <div className="text-center py-8">
-                            <p className="text-gray-500">Tab content for {profileTab} would go here</p>
-                        </div>
-                    )}
-                </div>
-
-                {/* Footer */}
-                <div className="p-4 sm:p-6 border-t border-gray-200 bg-gray-50">
-                    <p className="text-center text-gray-500 text-xs sm:text-sm">
-                        BRNNO Mobile Auto Detailing
-                    </p>
-                </div>
-            </div>
-
-            {/* Change Password Modal */}
-            {showChangePassword && (
-                <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-                    <div className="bg-white rounded-xl p-6 w-full max-w-md">
-                        <h3 className="text-xl font-bold text-gray-800 mb-4">Change Password</h3>
-
-                        <div className="space-y-4">
-                            <div>
-                                <label className="block text-sm font-semibold text-gray-700 mb-2">Current Password</label>
-                                <input
-                                    type="password"
-                                    value={passwordData.currentPassword}
-                                    onChange={(e) => setPasswordData(prev => ({ ...prev, currentPassword: e.target.value }))}
-                                    placeholder="Enter current password"
-                                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                />
-                            </div>
-
-                            <div>
-                                <label className="block text-sm font-semibold text-gray-700 mb-2">New Password</label>
-                                <input
-                                    type="password"
-                                    value={passwordData.newPassword}
-                                    onChange={(e) => setPasswordData(prev => ({ ...prev, newPassword: e.target.value }))}
-                                    placeholder="Enter new password"
-                                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                />
-                                <p className="text-xs text-gray-500 mt-1">Must be at least 6 characters</p>
-                            </div>
-
-                            <div>
-                                <label className="block text-sm font-semibold text-gray-700 mb-2">Confirm New Password</label>
-                                <input
-                                    type="password"
-                                    value={passwordData.confirmPassword}
-                                    onChange={(e) => setPasswordData(prev => ({ ...prev, confirmPassword: e.target.value }))}
-                                    placeholder="Confirm new password"
-                                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                />
-                            </div>
-                        </div>
-
-                        {success && (
-                            <div className="mt-4 p-3 bg-green-50 text-green-700 rounded-lg text-sm">
-                                {success}
-                            </div>
-                        )}
-
-                        <div className="flex gap-3 mt-6">
-                            <button
-                                onClick={() => {
-                                    setShowChangePassword(false);
-                                    setPasswordData({ currentPassword: '', newPassword: '', confirmPassword: '' });
-                                    setError('');
-                                    setSuccess('');
-                                }}
-                                className="flex-1 px-4 py-3 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 transition-colors"
-                            >
-                                Cancel
-                            </button>
-                            <button
-                                onClick={handleChangePassword}
-                                disabled={loading}
-                                className="flex-1 px-4 py-3 bg-cyan-500 hover:bg-cyan-600 text-white rounded-lg font-semibold transition-colors disabled:bg-gray-400"
-                            >
-                                {loading ? 'Updating...' : 'Update Password'}
-                            </button>
-                        </div>
-                    </div>
-                </div>
-            )}
-
-            {/* Image Upload Modal */}
-            {showImageUpload && (
-                <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-                    <div className="bg-white rounded-xl max-w-md w-full">
-                        <div className="p-6">
-                            <div className="flex justify-between items-center mb-6">
-                                <h2 className="text-xl font-bold text-gray-800">Update Profile Picture</h2>
-                                <button
-                                    onClick={() => setShowImageUpload(false)}
-                                    className="text-gray-500 hover:text-gray-700 text-2xl"
-                                >
-                                    ×
-                                </button>
-                            </div>
-
-                            <div className="space-y-4">
-                                <div className="text-center">
-                                    {profileImage ? (
-                                        <img
-                                            src={profileImage}
-                                            alt="Profile preview"
-                                            className="w-24 h-24 rounded-full object-cover mx-auto mb-4 border-2 border-gray-200"
-                                        />
-                                    ) : (
-                                        <div className="w-24 h-24 bg-gray-100 rounded-full flex items-center justify-center text-3xl font-bold text-gray-400 mx-auto mb-4">
-                                            {userData ? `${formData.firstName.charAt(0)}${formData.lastName.charAt(0)}` : 'U'}
-                                        </div>
-                                    )}
-                                </div>
-
-                                <div>
-                                    <label className="block text-sm font-semibold text-gray-700 mb-2">Choose Image</label>
-                                    <input
-                                        type="file"
-                                        accept="image/*"
-                                        onChange={handleImageUpload}
-                                        className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                    />
-                                    <p className="text-xs text-gray-500 mt-1">JPG, PNG, or GIF. Max 5MB.</p>
-                                </div>
-
-                                {error && (
-                                    <div className="p-3 bg-red-50 text-red-700 rounded-lg text-sm">
-                                        {error}
-                                    </div>
-                                )}
-
-                                {success && (
-                                    <div className="p-3 bg-green-50 text-green-700 rounded-lg text-sm">
-                                        {success}
-                                    </div>
-                                )}
-
-                                <div className="flex gap-3 pt-4">
-                                    <button
-                                        onClick={() => {
-                                            setShowImageUpload(false);
-                                            setError('');
-                                            setSuccess('');
-                                        }}
-                                        className="flex-1 bg-gray-500 hover:bg-gray-600 text-white py-3 rounded-lg font-semibold transition-colors"
-                                    >
-                                        Cancel
-                                    </button>
-                                    <button
-                                        onClick={saveImage}
-                                        disabled={!profileImage || loading}
-                                        className="flex-1 bg-cyan-500 hover:bg-cyan-600 text-white py-3 rounded-lg font-semibold transition-colors disabled:bg-gray-400"
-                                    >
-                                        {loading ? 'Saving...' : 'Save Image'}
-                                    </button>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            )}
-        </>
-    );
-};
-
-const BookingModal = memo(({
-    showBookingModal,
-    setShowBookingModal,
-    bookingStep,
-    setBookingStep,
-    bookingData,
-    setBookingData,
-    userVehicles,
-    setShowAddVehicle,
-    selectedProvider
-}) => {
-    console.log('BookingModal re-rendered'); // Debug log
-
-    // Use provider's services if available, otherwise fallback to default
-    const services = selectedProvider?.services?.filter(service => service.active === true) || [
-        { id: 1, name: 'Basic Wash & Vacuum', price: 50, duration: '1 hour', description: 'Exterior wash and interior vacuum', active: true },
-        { id: 2, name: 'Interior Detail', price: 120, duration: '2 hours', description: 'Deep clean interior, seats, carpets, dashboard', active: true },
-        { id: 3, name: 'Exterior Detail', price: 150, duration: '2.5 hours', description: 'Wash, clay bar, polish, wax', active: true },
-        { id: 4, name: 'Full Detail', price: 200, duration: '4 hours', description: 'Complete interior and exterior detailing', active: true },
-        { id: 5, name: 'Paint Correction', price: 400, duration: '6 hours', description: 'Multi-stage paint correction and polish', active: true },
-        { id: 6, name: 'Ceramic Coating', price: 800, duration: '8 hours', description: 'Professional ceramic coating with warranty', active: true }
-    ];
-
-    const timeSlots = [
-        '8:00 AM', '9:00 AM', '10:00 AM', '11:00 AM',
-        '12:00 PM', '1:00 PM', '2:00 PM', '3:00 PM', '4:00 PM'
-    ];
-
-    const nextStep = () => {
-        if (bookingStep < 5) setBookingStep(bookingStep + 1);
-    };
-
-    const prevStep = () => {
-        if (bookingStep > 1) setBookingStep(bookingStep - 1);
-    };
-
-    const closeModal = () => {
-        setShowBookingModal(false);
-        setBookingStep(1);
-        setBookingData({ service: null, date: '', time: '', vehicle: null, address: '' });
-    };
-
-    // Lock body scroll when modal is open
-    React.useEffect(() => {
-        if (showBookingModal) {
-            document.body.style.overflow = 'hidden';
-        }
-        return () => {
-            document.body.style.overflow = 'unset';
-        };
-    }, [showBookingModal]);
-
-    if (!showBookingModal) return null;
-
-    return (
-        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-2 sm:p-4 modal-backdrop">
-            <div className="bg-white rounded-2xl shadow-2xl max-w-md sm:max-w-3xl lg:max-w-4xl w-full max-h-[90vh] overflow-hidden modal-content">
-                {/* Header */}
-                <div className="bg-gradient-to-r from-cyan-500 to-blue-600 text-white p-6">
-                    <div className="flex items-center justify-between mb-4">
-                        <h2 className="text-2xl font-bold">Book Your Service</h2>
-                        <button
-                            onClick={closeModal}
-                            className="text-white hover:bg-white/20 p-2 rounded-lg transition-colors text-2xl"
-                        >
-                            ✕
-                        </button>
-                    </div>
-
-                    {/* Progress Bar */}
-                    <div className="flex items-center gap-2">
-                        {[1, 2, 3, 4].map(step => (
-                            <div key={step} className="flex-1">
-                                <div className={`h-2 rounded-full transition-all ${step <= bookingStep ? 'bg-white' : 'bg-white/30'
-                                    }`} />
-                                <p className={`text-xs mt-1 ${step <= bookingStep ? 'text-white font-semibold' : 'text-white/60'}`}>
-                                    {step === 1 ? 'Service' : step === 2 ? 'Date & Time' : step === 3 ? 'Details' : 'Confirm'}
-                                </p>
-                            </div>
-                        ))}
-                    </div>
-                </div>
-
-                {/* Content */}
-                <div className="p-6 overflow-y-auto" style={{ maxHeight: 'calc(90vh - 250px)' }}>
-
-                    {/* Step 1: Select Service */}
-                    {bookingStep === 1 && (
-                        <div>
-                            <h3 className="text-xl font-bold text-gray-800 mb-4">Choose Your Service</h3>
-                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                                {services.map(service => (
-                                    <div
-                                        key={service.id}
-                                        onClick={() => setBookingData({ ...bookingData, service })}
-                                        className={`border-2 rounded-xl p-4 cursor-pointer transition-all ${bookingData.service?.id === service.id
-                                            ? 'border-cyan-500 bg-cyan-50'
-                                            : 'border-gray-200 hover:border-cyan-300'
-                                            }`}
-                                    >
-                                        <div className="flex items-start justify-between mb-2">
-                                            <h4 className="font-bold text-gray-800">{service.name}</h4>
-                                            <span className="text-xl font-bold text-cyan-600">${service.price}</span>
-                                        </div>
-                                        <p className="text-sm text-gray-600 mb-2">{service.description}</p>
-                                        <div className="flex items-center gap-2 text-xs text-gray-500">
-                                            <Clock size={14} />
-                                            <span>{service.duration}</span>
-                                        </div>
-                                    </div>
-                                ))}
-                            </div>
-                        </div>
-                    )}
-
-                    {/* Step 2: Select Date & Time */}
-                    {bookingStep === 2 && (
-                        <div>
-                            <h3 className="text-xl font-bold text-gray-800 mb-4">Pick Date & Time</h3>
-
-                            <div className="mb-6">
-                                <label className="block text-sm font-semibold text-gray-700 mb-2">Select Date</label>
-                                <input
-                                    type="date"
-                                    min={new Date().toISOString().split('T')[0]}
-                                    value={bookingData.date}
-                                    onChange={(e) => setBookingData({ ...bookingData, date: e.target.value })}
-                                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                />
-                            </div>
-
-                            <div>
-                                <label className="block text-sm font-semibold text-gray-700 mb-2">Select Time</label>
-                                <div className="grid grid-cols-3 gap-3">
-                                    {timeSlots.map(time => (
-                                        <button
-                                            key={time}
-                                            onClick={() => setBookingData({ ...bookingData, time })}
-                                            className={`py-3 px-4 rounded-lg font-semibold transition-all ${bookingData.time === time
-                                                ? 'bg-cyan-500 text-white'
-                                                : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-                                                }`}
-                                        >
-                                            {time}
-                                        </button>
-                                    ))}
-                                </div>
-                            </div>
-                        </div>
-                    )}
-
-                    {/* Step 3: Vehicle & Address */}
-                    {bookingStep === 3 && (
-                        <div className="space-y-6">
-                            <div>
-                                <h3 className="text-xl font-bold text-gray-800 mb-4">Vehicle & Location</h3>
-
-                                <label className="block text-sm font-semibold text-gray-700 mb-2">Select Vehicle</label>
-                                <div className="space-y-3 mb-6">
-                                    {userVehicles.length > 0 ? (
-                                        userVehicles.map(vehicle => (
-                                            <div
-                                                key={vehicle.id}
-                                                onClick={() => setBookingData({ ...bookingData, vehicle })}
-                                                className={`border-2 rounded-lg p-4 cursor-pointer transition-all flex items-center gap-3 ${bookingData.vehicle?.id === vehicle.id
-                                                    ? 'border-cyan-500 bg-cyan-50'
-                                                    : 'border-gray-200 hover:border-cyan-300'
-                                                    }`}
-                                            >
-                                                <div className="bg-cyan-100 p-3 rounded-lg">
-                                                    <Car className="text-cyan-600" size={24} />
-                                                </div>
-                                                <div className="flex-1">
-                                                    <h4 className="font-bold text-gray-800">
-                                                        {vehicle.year} {vehicle.make} {vehicle.model}
-                                                    </h4>
-                                                    {vehicle.color && (
-                                                        <p className="text-sm text-gray-600">{vehicle.color}</p>
-                                                    )}
-                                                    {vehicle.licensePlate && (
-                                                        <p className="text-xs text-gray-500">License: {vehicle.licensePlate}</p>
-                                                    )}
-                                                </div>
-                                            </div>
-                                        ))
-                                    ) : (
-                                        <div className="text-center py-8 text-gray-500">
-                                            <Car size={48} className="mx-auto mb-2 text-gray-300" />
-                                            <p>No vehicles added yet</p>
-                                        </div>
-                                    )}
-                                    <button
-                                        onClick={() => setShowAddVehicle(true)}
-                                        className="w-full border-2 border-dashed border-gray-300 rounded-lg p-4 text-gray-600 hover:border-cyan-500 hover:text-cyan-600 transition-colors font-semibold"
-                                    >
-                                        + Add New Vehicle
-                                    </button>
-                                </div>
-
-                                <label className="block text-sm font-semibold text-gray-700 mb-2">Service Location</label>
-                                <AddressInput
-                                    initialValue={bookingData.address}
-                                    onAddressChange={(value) => setBookingData(prev => ({ ...prev, address: value }))}
-                                />
-                                <p className="text-xs text-gray-500 mt-2">Or select from saved addresses</p>
-                            </div>
-                        </div>
-                    )}
-
-                    {/* Step 4: Payment */}
-                    {bookingStep === 4 && (
-                        <div>
-                            <h3 className="text-xl font-bold text-gray-800 mb-4">Payment Information</h3>
-
-                            <div className="bg-gradient-to-br from-green-50 to-emerald-50 rounded-xl p-6 mb-6">
-                                <div className="space-y-4">
-                                    <div className="flex items-start justify-between">
-                                        <div>
-                                            <p className="text-sm text-gray-600 mb-1">Service Total</p>
-                                            <p className="font-bold text-gray-800">{bookingData.service?.name}</p>
-                                        </div>
-                                        <p className="text-xl font-bold text-gray-800">${bookingData.service?.price}</p>
-                                    </div>
-
-                                    <div className="border-t border-green-200 pt-4">
-                                        <div className="flex items-center justify-between text-sm">
-                                            <span className="text-gray-600">Platform Fee (15%)</span>
-                                            <span className="font-semibold">${Math.round((bookingData.service?.price || 0) * 0.15)}</span>
-                                        </div>
-                                        <div className="flex items-center justify-between text-sm mt-2">
-                                            <span className="text-gray-600">Provider Amount (85%)</span>
-                                            <span className="font-semibold">${Math.round((bookingData.service?.price || 0) * 0.85)}</span>
-                                        </div>
-                                    </div>
-
-                                    <div className="border-t border-green-200 pt-4">
-                                        <div className="flex items-center justify-between">
-                                            <span className="text-lg font-bold text-gray-800">Total Amount</span>
-                                            <span className="text-2xl font-bold text-green-600">${bookingData.service?.price}</span>
-                                        </div>
-                                    </div>
-                                </div>
-                            </div>
-
-                            <div className="space-y-4">
-                                <StripeCardInput
-                                    onCardChange={(event) => {
-                                        setBookingData(prev => ({
-                                            ...prev,
-                                            cardComplete: event.complete,
-                                            cardError: event.error
-                                        }));
-                                    }}
-                                    onCardError={(error) => {
-                                        setBookingData(prev => ({
-                                            ...prev,
-                                            cardError: error
-                                        }));
-                                    }}
-                                />
-
-                                <div>
-                                    <label className="block text-sm font-semibold text-gray-700 mb-2">Billing Address</label>
-                                    <AddressInput
-                                        initialValue={bookingData.billingAddress || ''}
-                                        onAddressChange={(value) => setBookingData(prev => ({ ...prev, billingAddress: value }))}
-                                        placeholder="Enter billing address..."
-                                    />
-                                </div>
-                            </div>
-
-                            <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mt-6">
-                                <p className="text-sm text-blue-800">
-                                    <strong>🔒 Secure Payment:</strong> Your payment information is encrypted and processed securely through Stripe.
-                                    BRNNO never stores your card details.
-                                </p>
-                            </div>
-                        </div>
-                    )}
-
-                    {/* Step 5: Confirmation */}
-                    {bookingStep === 5 && (
-                        <div>
-                            <h3 className="text-xl font-bold text-gray-800 mb-4">Confirm Your Booking</h3>
-
-                            <div className="bg-gradient-to-br from-cyan-50 to-blue-50 rounded-xl p-6 mb-6">
-                                <div className="space-y-4">
-                                    <div className="flex items-start justify-between">
-                                        <div>
-                                            <p className="text-sm text-gray-600 mb-1">Service</p>
-                                            <p className="font-bold text-gray-800">{bookingData.service?.name}</p>
-                                            <p className="text-xs text-gray-600">{bookingData.service?.duration}</p>
-                                        </div>
-                                        <p className="text-2xl font-bold text-cyan-600">${bookingData.service?.price}</p>
-                                    </div>
-
-                                    <div className="border-t border-cyan-200 pt-4">
-                                        <p className="text-sm text-gray-600 mb-1">Date & Time</p>
-                                        <p className="font-semibold text-gray-800">
-                                            {bookingData.date && new Date(bookingData.date).toLocaleDateString('en-US', {
-                                                weekday: 'long',
-                                                year: 'numeric',
-                                                month: 'long',
-                                                day: 'numeric'
-                                            })}
-                                        </p>
-                                        <p className="text-sm text-gray-600">{bookingData.time}</p>
-                                    </div>
-
-                                    <div className="border-t border-cyan-200 pt-4">
-                                        <p className="text-sm text-gray-600 mb-1">Vehicle</p>
-                                        <p className="font-semibold text-gray-800">
-                                            {bookingData.vehicle?.year} {bookingData.vehicle?.make} {bookingData.vehicle?.model}
-                                        </p>
-                                    </div>
-
-                                    <div className="border-t border-cyan-200 pt-4">
-                                        <p className="text-sm text-gray-600 mb-1">Location</p>
-                                        <p className="font-semibold text-gray-800">{bookingData.address || 'Not specified'}</p>
-                                    </div>
-                                </div>
-                            </div>
-
-                            <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4 mb-4">
-                                <p className="text-sm text-yellow-800">
-                                    <strong>Note:</strong> A detailer will contact you to confirm availability and final pricing.
-                                </p>
-                            </div>
-
-                            <div className="flex items-start gap-2 mb-4">
-                                <input type="checkbox" className="mt-1 rounded" required />
-                                <label className="text-sm text-gray-600">
-                                    I agree to the cancellation policy and understand that I may be charged a fee for late cancellations.
-                                </label>
-                            </div>
-                        </div>
-                    )}
-                </div>
-
-                {/* Footer */}
-                <div className="border-t border-gray-200 p-6 bg-gray-50">
-                    <div className="flex items-center justify-between">
-                        <button
-                            onClick={prevStep}
-                            disabled={bookingStep === 1}
-                            className="px-6 py-3 rounded-lg font-semibold transition-colors disabled:opacity-50 disabled:cursor-not-allowed text-gray-600 hover:bg-gray-200"
-                        >
-                            Back
-                        </button>
-
-                        {bookingStep < 5 ? (
-                            <button
-                                onClick={nextStep}
-                                disabled={
-                                    (bookingStep === 1 && !bookingData.service) ||
-                                    (bookingStep === 2 && (!bookingData.date || !bookingData.time)) ||
-                                    (bookingStep === 3 && (!bookingData.vehicle || !bookingData.address))
-                                }
-                                className="px-8 py-3 bg-cyan-500 hover:bg-cyan-600 text-white rounded-lg font-bold transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                            >
-                                Continue
-                            </button>
-                        ) : (
-                            <button
-                                onClick={async () => {
-                                    try {
-                                        // Save booking to Firebase
-                                        const booking = {
-                                            customerId: auth.currentUser?.uid,
-                                            customerEmail: auth.currentUser?.email,
-                                            customerName: userData?.displayName || 'Customer',
-                                            providerId: bookingData.provider?.id,
-                                            providerName: bookingData.provider?.name || bookingData.provider?.provider,
-                                            service: bookingData.service,
-                                            date: bookingData.date,
-                                            time: bookingData.time,
-                                            vehicle: bookingData.vehicle,
-                                            address: bookingData.address,
-                                            status: 'pending', // pending, confirmed, completed, cancelled
-                                            totalAmount: bookingData.service?.price || 0,
-                                            platformFee: Math.round((bookingData.service?.price || 0) * 0.15), // 15% platform fee
-                                            providerAmount: Math.round((bookingData.service?.price || 0) * 0.85), // 85% to provider
-                                            createdAt: serverTimestamp(),
-                                            paymentStatus: 'pending' // pending, paid, failed, refunded
-                                        };
-
-                                        const docRef = await addDoc(collection(db, 'bookings'), booking);
-                                        console.log('Booking saved with ID:', docRef.id);
-
-                                        // Process real payment with Stripe
-                                        try {
-                                            console.log('💳 PROCESSING PAYMENT WITH STRIPE:');
-                                            console.log('Amount: $' + booking.totalAmount);
-                                            console.log('Platform fee (15%): $' + booking.platformFee);
-                                            console.log('Provider amount (85%): $' + booking.providerAmount);
-
-                                            // Create payment intent
-                                            const paymentIntent = await paymentService.createPaymentIntent(bookingData);
-                                            console.log('Payment intent created:', paymentIntent.id);
-
-                                            // For now, we'll simulate successful payment
-                                            // In production, you would use the actual Stripe Elements to process the payment
-                                            await updateDoc(doc(db, 'bookings', docRef.id), {
-                                                paymentStatus: 'paid',
-                                                status: 'confirmed',
-                                                paidAt: serverTimestamp(),
-                                                paymentIntentId: paymentIntent.id
-                                            });
-
-                                            console.log('✅ Payment processed successfully!');
-                                            console.log('💰 Provider will receive $' + booking.providerAmount + ' in their next payout');
-
-                                            // Process provider payout
-                                            const payout = await paymentService.processProviderPayout(
-                                                bookingData.provider?.id,
-                                                booking.providerAmount
-                                            );
-                                            console.log('Provider payout created:', payout.id);
-
-                                        } catch (paymentError) {
-                                            console.error('Payment processing failed:', paymentError);
-
-                                            // Update booking with failed payment
-                                            await updateDoc(doc(db, 'bookings', docRef.id), {
-                                                paymentStatus: 'failed',
-                                                status: 'payment_failed',
-                                                paymentError: paymentError.message
-                                            });
-
-                                            throw new Error('Payment processing failed: ' + paymentError.message);
-                                        }
-
-                                        // Email notifications (console log for now)
-                                        console.log('📧 BOOKING NOTIFICATIONS:');
-                                        console.log('Customer Email:', auth.currentUser?.email);
-                                        console.log('Subject: Booking Confirmed - BRNNO');
-                                        console.log('Body: Your booking has been confirmed and payment processed!');
-
-                                        console.log('Provider Email:', bookingData.provider?.email);
-                                        console.log('Subject: New Booking - BRNNO');
-                                        console.log('Body: You have a new booking! Payment will be processed shortly.');
-
-                                        alert('Booking confirmed! Payment is being processed. You will receive an email confirmation shortly.');
-                                        closeModal();
-                                    } catch (error) {
-                                        console.error('Error creating booking:', error);
-                                        alert('Error creating booking. Please try again.');
-                                    }
-                                }}
-                                className="px-8 py-3 bg-green-500 hover:bg-green-600 text-white rounded-lg font-bold transition-colors"
-                            >
-                                Confirm Booking
-                            </button>
-                        )}
-                    </div>
-                </div>
-            </div>
-        </div>
-    );
-});
-
-const ProviderApplicationModal = memo(({ showModal, setShowModal, providerStep, setProviderStep, providerData, setProviderData }) => {
-    const [isSubmitting, setIsSubmitting] = useState(false);
-
-    // Lock body scroll when modal is open
-    React.useEffect(() => {
-        if (showModal) {
-            document.body.style.overflow = 'hidden';
-        }
-        return () => {
-            document.body.style.overflow = 'unset';
-        };
-    }, [showModal]);
-
-    if (!showModal) return null;
-
-    const nextStep = () => {
-        if (providerStep < 5) setProviderStep(providerStep + 1);
-    };
-
-    const prevStep = () => {
-        if (providerStep > 1) setProviderStep(providerStep - 1);
-    };
-
-    const closeModal = () => {
-        setShowModal(false);
-        setProviderStep(1);
-    };
-
-    const serviceOptions = [
-        'Basic Wash & Vacuum',
-        'Interior Detailing',
-        'Exterior Detailing',
-        'Full Detail',
-        'Paint Correction',
-        'Ceramic Coating',
-        'Headlight Restoration',
-        'Engine Bay Cleaning'
-    ];
-
-    return (
-        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-2 sm:p-4 overflow-y-auto modal-backdrop">
-            <div className="bg-white rounded-2xl shadow-2xl max-w-md sm:max-w-3xl lg:max-w-4xl w-full my-4 sm:my-8 modal-content">
-                {/* Header */}
-                <div className="bg-gradient-to-r from-cyan-500 to-blue-600 text-white p-8">
-                    <button
-                        onClick={closeModal}
-                        className="float-right text-white hover:bg-white/20 p-2 rounded-lg transition-colors text-2xl"
-                    >
-                        ✕
-                    </button>
-                    <h2 className="text-3xl font-bold mb-2">Become a BRNNO Provider</h2>
-                    <p className="text-cyan-100">Join our network of professional mobile detailers</p>
-
-                    {/* Progress */}
-                    <div className="flex items-center gap-2 mt-6">
-                        {[1, 2, 3, 4, 5].map(step => (
-                            <div key={step} className="flex-1">
-                                <div className={`h-2 rounded-full transition-all ${step <= providerStep ? 'bg-white' : 'bg-white/30'
-                                    }`} />
-                            </div>
-                        ))}
-                    </div>
-                    <div className="flex justify-between mt-2 text-xs">
-                        <span className={providerStep === 1 ? 'font-bold' : 'text-cyan-200'}>Business</span>
-                        <span className={providerStep === 2 ? 'font-bold' : 'text-cyan-200'}>Services</span>
-                        <span className={providerStep === 3 ? 'font-bold' : 'text-cyan-200'}>Verification</span>
-                        <span className={providerStep === 4 ? 'font-bold' : 'text-cyan-200'}>Payment</span>
-                        <span className={providerStep === 5 ? 'font-bold' : 'text-cyan-200'}>Review</span>
-                    </div>
-                </div>
-
-                {/* Content */}
-                <div className="p-8" style={{ maxHeight: 'calc(80vh - 250px)', overflowY: 'auto' }}>
-
-                    {/* Step 1: Business Information */}
-                    {providerStep === 1 && (
-                        <div className="space-y-6">
-                            <div>
-                                <h3 className="text-2xl font-bold text-gray-800 mb-2">Business Information</h3>
-                                <p className="text-gray-600 mb-6">Tell us about your detailing business</p>
-                            </div>
-
-                            <div>
-                                <label className="block text-sm font-bold text-gray-700 mb-2">Business Name *</label>
-                                <input
-                                    type="text"
-                                    placeholder="Elite Auto Spa LLC"
-                                    value={providerData.businessName}
-                                    onChange={(e) => setProviderData({ ...providerData, businessName: e.target.value })}
-                                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                    required
-                                />
-                            </div>
-
-                            <div>
-                                <label className="block text-sm font-bold text-gray-700 mb-2">Business Image</label>
-                                <div className="space-y-3">
-                                    <input
-                                        type="file"
-                                        accept="image/*"
-                                        onChange={(e) => {
-                                            const file = e.target.files[0];
-                                            if (file) {
-                                                const reader = new FileReader();
-                                                reader.onload = (e) => {
-                                                    setProviderData({ ...providerData, image: e.target.result });
-                                                };
-                                                reader.readAsDataURL(file);
-                                            }
-                                        }}
-                                        className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                    />
-                                    {providerData.image && (
-                                        <div className="mt-3">
-                                            <p className="text-sm text-gray-600 mb-2">Preview:</p>
-                                            <img
-                                                src={providerData.image}
-                                                alt="Business preview"
-                                                className="w-32 h-24 object-cover rounded-lg border border-gray-200"
-                                            />
-                                        </div>
-                                    )}
-                                </div>
-                                <p className="text-xs text-gray-500 mt-1">Upload a professional image of your business or work</p>
-                            </div>
-
-                            <div>
-                                <label className="block text-sm font-bold text-gray-700 mb-2">Business Type *</label>
-                                <select
-                                    value={providerData.businessType}
-                                    onChange={(e) => setProviderData({ ...providerData, businessType: e.target.value })}
-                                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                    required
-                                >
-                                    <option value="">Select business type</option>
-                                    <option value="sole_proprietor">Sole Proprietor</option>
-                                    <option value="llc">LLC</option>
-                                    <option value="corporation">Corporation</option>
-                                    <option value="partnership">Partnership</option>
-                                </select>
-                            </div>
-
-                            <div>
-                                <label className="block text-sm font-bold text-gray-700 mb-2">EIN / Tax ID *</label>
-                                <input
-                                    type="text"
-                                    placeholder="12-3456789"
-                                    value={providerData.ein}
-                                    onChange={(e) => setProviderData({ ...providerData, ein: e.target.value })}
-                                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                    required
-                                />
-                                <p className="text-xs text-gray-500 mt-1">Required for tax purposes and payments</p>
-                            </div>
-
-                            <div className="grid grid-cols-2 gap-4">
-                                <div>
-                                    <label className="block text-sm font-bold text-gray-700 mb-2">Owner Full Name *</label>
-                                    <input
-                                        type="text"
-                                        placeholder="John Doe"
-                                        value={providerData.ownerName}
-                                        onChange={(e) => setProviderData({ ...providerData, ownerName: e.target.value })}
-                                        className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                        required
-                                    />
-                                </div>
-                                <div>
-                                    <label className="block text-sm font-bold text-gray-700 mb-2">Phone Number *</label>
-                                    <input
-                                        type="tel"
-                                        placeholder="(555) 123-4567"
-                                        value={providerData.phone}
-                                        onChange={(e) => setProviderData({ ...providerData, phone: e.target.value })}
-                                        className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                        required
-                                    />
-                                </div>
-                            </div>
-
-                            <div>
-                                <label className="block text-sm font-bold text-gray-700 mb-2">Business Email *</label>
-                                <input
-                                    type="email"
-                                    placeholder="contact@eliteautospa.com"
-                                    value={providerData.email}
-                                    onChange={(e) => setProviderData({ ...providerData, email: e.target.value })}
-                                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                    required
-                                />
-                            </div>
-
-                            <div>
-                                <label className="block text-sm font-bold text-gray-700 mb-2">Service Area *</label>
-                                <input
-                                    type="text"
-                                    placeholder="Eagle Mountain, UT and surrounding areas (25 mile radius)"
-                                    value={providerData.serviceArea}
-                                    onChange={(e) => setProviderData({ ...providerData, serviceArea: e.target.value })}
-                                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                    required
-                                />
-                            </div>
-                        </div>
-                    )}
-
-                    {/* Step 2: Services Offered */}
-                    {providerStep === 2 && (
-                        <div className="space-y-6">
-                            <div>
-                                <h3 className="text-2xl font-bold text-gray-800 mb-2">Services You Offer</h3>
-                                <p className="text-gray-600 mb-6">Select all services you provide (select at least 3)</p>
-                            </div>
-
-                            <div className="grid grid-cols-2 gap-3">
-                                {serviceOptions.map(service => (
-                                    <label
-                                        key={service}
-                                        className={`border-2 rounded-xl p-4 cursor-pointer transition-all ${providerData.services.includes(service)
-                                            ? 'border-cyan-500 bg-cyan-50'
-                                            : 'border-gray-200 hover:border-cyan-300'
-                                            }`}
-                                    >
-                                        <input
-                                            type="checkbox"
-                                            checked={providerData.services.includes(service)}
-                                            onChange={(e) => {
-                                                if (e.target.checked) {
-                                                    setProviderData({
-                                                        ...providerData,
-                                                        services: [...providerData.services, service]
-                                                    });
-                                                } else {
-                                                    setProviderData({
-                                                        ...providerData,
-                                                        services: providerData.services.filter(s => s !== service)
-                                                    });
-                                                }
-                                            }}
-                                            className="mr-3"
-                                        />
-                                        <span className="font-semibold text-gray-800">{service}</span>
-                                    </label>
-                                ))}
-                            </div>
-
-                            <div className="bg-cyan-50 border border-cyan-200 rounded-lg p-4 mt-6">
-                                <h4 className="font-bold text-cyan-900 mb-2">💡 Pricing Information</h4>
-                                <p className="text-sm text-cyan-800">
-                                    You'll set your own pricing for each service. BRNNO takes a 15% platform fee on each booking.
-                                    Founding providers get locked in at 10% for the first year!
-                                </p>
-                            </div>
-
-                            <div>
-                                <label className="block text-sm font-bold text-gray-700 mb-2">Years of Experience</label>
-                                <select
-                                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                >
-                                    <option>Less than 1 year</option>
-                                    <option>1-2 years</option>
-                                    <option>3-5 years</option>
-                                    <option>5-10 years</option>
-                                    <option>10+ years</option>
-                                </select>
-                            </div>
-                        </div>
-                    )}
-
-                    {/* Step 3: Verification & Insurance */}
-                    {providerStep === 3 && (
-                        <div className="space-y-6">
-                            <div>
-                                <h3 className="text-2xl font-bold text-gray-800 mb-2">Verification & Insurance</h3>
-                                <p className="text-gray-600 mb-6">Required for customer trust and protection</p>
-                            </div>
-
-                            <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
-                                <h4 className="font-bold text-yellow-900 mb-2">⚠️ Background Check Required</h4>
-                                <p className="text-sm text-yellow-800 mb-3">
-                                    All BRNNO providers must pass a background check. This protects our customers and builds trust.
-                                </p>
-                                <label className="flex items-start gap-3">
-                                    <input
-                                        type="checkbox"
-                                        checked={providerData.backgroundCheck}
-                                        onChange={(e) => setProviderData({ ...providerData, backgroundCheck: e.target.checked })}
-                                        className="mt-1"
-                                        required
-                                    />
-                                    <span className="text-sm text-gray-700">
-                                        I consent to a background check and understand this is required to join BRNNO
-                                    </span>
-                                </label>
-                            </div>
-
-                            <div>
-                                <label className="block text-sm font-bold text-gray-700 mb-2">Business Insurance (Optional)</label>
-                                <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4 mb-4">
-                                    <h4 className="font-bold text-yellow-900 mb-2">⚠️ Insurance Note</h4>
-                                    <p className="text-sm text-yellow-800">
-                                        Insurance will be required before accepting bookings, but you can upload it later in your provider dashboard.
-                                    </p>
-                                </div>
-
-                                <div className="bg-gray-50 border border-gray-200 rounded-lg p-4">
-                                    <div className="flex items-start gap-3">
-                                        <input
-                                            type="checkbox"
-                                            id="skip-insurance"
-                                            className="mt-1"
-                                            onChange={(e) => {
-                                                if (e.target.checked) {
-                                                    setProviderData({ ...providerData, skipInsurance: true });
-                                                } else {
-                                                    setProviderData({ ...providerData, skipInsurance: false });
-                                                }
-                                            }}
-                                        />
-                                        <div>
-                                            <label htmlFor="skip-insurance" className="font-semibold text-gray-800">
-                                                Skip insurance upload for now
-                                            </label>
-                                            <p className="text-sm text-gray-600 mt-1">
-                                                I'll upload my insurance certificate later in my provider dashboard
-                                            </p>
-                                        </div>
-                                    </div>
-                                </div>
-
-                                {!providerData.skipInsurance && (
-                                    <div className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center hover:border-cyan-500 transition-colors cursor-pointer mt-4">
-                                        <input type="file" className="hidden" id="insurance-upload" accept=".pdf,.jpg,.png" />
-                                        <label htmlFor="insurance-upload" className="cursor-pointer">
-                                            <div className="text-cyan-600 mb-2">
-                                                <svg className="w-12 h-12 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
-                                                </svg>
-                                            </div>
-                                            <p className="font-semibold text-gray-700">Upload Insurance Certificate</p>
-                                            <p className="text-sm text-gray-500 mt-1">PDF, JPG, or PNG (Max 5MB)</p>
-                                        </label>
-                                    </div>
-                                )}
-                                <p className="text-xs text-gray-500 mt-2">Recommended: General liability insurance with minimum $1M coverage</p>
-                            </div>
-
-                            <div>
-                                <label className="block text-sm font-bold text-gray-700 mb-2">Professional Certifications (Optional)</label>
-                                <div className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center hover:border-cyan-500 transition-colors cursor-pointer">
-                                    <input type="file" className="hidden" id="certs-upload" multiple accept=".pdf,.jpg,.png" />
-                                    <label htmlFor="certs-upload" className="cursor-pointer">
-                                        <div className="text-cyan-600 mb-2">
-                                            <Award className="w-12 h-12 mx-auto" />
-                                        </div>
-                                        <p className="font-semibold text-gray-700">Upload Certifications</p>
-                                        <p className="text-sm text-gray-500 mt-1">IDA Certified, manufacturer training, etc.</p>
-                                    </label>
-                                </div>
-                            </div>
-
-                            <div>
-                                <label className="block text-sm font-bold text-gray-700 mb-2">Portfolio Photos (Optional but recommended)</label>
-                                <div className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center hover:border-cyan-500 transition-colors cursor-pointer">
-                                    <input type="file" className="hidden" id="portfolio-upload" multiple accept=".jpg,.png" />
-                                    <label htmlFor="portfolio-upload" className="cursor-pointer">
-                                        <div className="text-cyan-600 mb-2">
-                                            <Camera className="w-12 h-12 mx-auto" />
-                                        </div>
-                                        <p className="font-semibold text-gray-700">Upload Before/After Photos</p>
-                                        <p className="text-sm text-gray-500 mt-1">Showcase your best work (up to 10 photos)</p>
-                                    </label>
-                                </div>
-                            </div>
-                        </div>
-                    )}
-
-                    {/* Step 4: Payment Information (Optional) */}
-                    {providerStep === 4 && (
-                        <div className="space-y-6">
-                            <div>
-                                <h3 className="text-2xl font-bold text-gray-800 mb-2">Payment Setup (Optional)</h3>
-                                <p className="text-gray-600 mb-6">You can set up payment information now or later in your dashboard</p>
-                            </div>
-
-                            <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
-                                <h4 className="font-bold text-blue-900 mb-2">💡 Payment Setup</h4>
-                                <ul className="text-sm text-blue-800 space-y-1">
-                                    <li>• You can skip this step and set up payment later</li>
-                                    <li>• Payment setup will be required before accepting bookings</li>
-                                    <li>• Payments processed through Stripe</li>
-                                    <li>• BRNNO platform fee: 15% (10% for founding providers)</li>
-                                </ul>
-                            </div>
-
-                            <div className="bg-gray-50 border border-gray-200 rounded-lg p-4">
-                                <div className="flex items-start gap-3">
-                                    <input
-                                        type="checkbox"
-                                        id="skip-payment"
-                                        className="mt-1"
-                                        onChange={(e) => {
-                                            if (e.target.checked) {
-                                                setProviderData({ ...providerData, skipPayment: true });
-                                            } else {
-                                                setProviderData({ ...providerData, skipPayment: false });
-                                            }
-                                        }}
-                                    />
-                                    <div>
-                                        <label htmlFor="skip-payment" className="font-semibold text-gray-800">
-                                            Skip payment setup for now
-                                        </label>
-                                        <p className="text-sm text-gray-600 mt-1">
-                                            I'll set up payment information later in my provider dashboard
-                                        </p>
-                                    </div>
-                                </div>
-                            </div>
-
-                            {!providerData.skipPayment && (
-                                <>
-                                    <div>
-                                        <label className="block text-sm font-bold text-gray-700 mb-2">Bank Account Holder Name</label>
-                                        <input
-                                            type="text"
-                                            placeholder="John Doe or Elite Auto Spa LLC"
-                                            value={providerData.bankAccountHolder || ''}
-                                            onChange={(e) => setProviderData({ ...providerData, bankAccountHolder: e.target.value })}
-                                            className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                        />
-                                    </div>
-
-                                    <div>
-                                        <label className="block text-sm font-bold text-gray-700 mb-2">Routing Number</label>
-                                        <input
-                                            type="text"
-                                            placeholder="123456789"
-                                            value={providerData.routingNumber}
-                                            onChange={(e) => setProviderData({ ...providerData, routingNumber: e.target.value })}
-                                            className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                        />
-                                    </div>
-
-                                    <div>
-                                        <label className="block text-sm font-bold text-gray-700 mb-2">Account Number</label>
-                                        <input
-                                            type="text"
-                                            placeholder="Account number"
-                                            value={providerData.bankAccount}
-                                            onChange={(e) => setProviderData({ ...providerData, bankAccount: e.target.value })}
-                                            className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                        />
-                                    </div>
-
-                                    <div className="bg-gray-50 border border-gray-200 rounded-lg p-4">
-                                        <p className="text-xs text-gray-600">
-                                            🔒 Your banking information is encrypted and securely stored. BRNNO uses Stripe for payment processing
-                                            and never stores your full account details on our servers.
-                                        </p>
-                                    </div>
-                                </>
-                            )}
-                        </div>
-                    )}
-
-                    {/* Step 5: Review & Submit */}
-                    {providerStep === 5 && (
-                        <div className="space-y-6">
-                            <div>
-                                <h3 className="text-2xl font-bold text-gray-800 mb-2">Review Your Application</h3>
-                                <p className="text-gray-600 mb-6">Please review all information before submitting</p>
-                            </div>
-
-                            <div className="space-y-4">
-                                <div className="bg-gray-50 rounded-lg p-4">
-                                    <h4 className="font-bold text-gray-800 mb-3">Business Information</h4>
-                                    <div className="space-y-2 text-sm">
-                                        <p><span className="text-gray-600">Business Name:</span> <span className="font-semibold">{providerData.businessName || 'Not provided'}</span></p>
-                                        <p><span className="text-gray-600">Business Type:</span> <span className="font-semibold">{providerData.businessType || 'Not provided'}</span></p>
-                                        <p><span className="text-gray-600">EIN:</span> <span className="font-semibold">{providerData.ein || 'Not provided'}</span></p>
-                                        <p><span className="text-gray-600">Owner:</span> <span className="font-semibold">{providerData.ownerName || 'Not provided'}</span></p>
-                                        <p><span className="text-gray-600">Email:</span> <span className="font-semibold">{providerData.email || 'Not provided'}</span></p>
-                                        <p><span className="text-gray-600">Phone:</span> <span className="font-semibold">{providerData.phone || 'Not provided'}</span></p>
-                                        <p><span className="text-gray-600">Service Area:</span> <span className="font-semibold">{providerData.serviceArea || 'Not provided'}</span></p>
-                                    </div>
-                                </div>
-
-                                <div className="bg-gray-50 rounded-lg p-4">
-                                    <h4 className="font-bold text-gray-800 mb-3">Services Offered</h4>
-                                    <div className="flex flex-wrap gap-2">
-                                        {providerData.services.length > 0 ? (
-                                            providerData.services.map(service => (
-                                                <span key={service} className="bg-cyan-100 text-cyan-700 px-3 py-1 rounded-full text-sm font-semibold">
-                                                    {service}
-                                                </span>
-                                            ))
-                                        ) : (
-                                            <p className="text-sm text-gray-600">No services selected</p>
-                                        )}
-                                    </div>
-                                </div>
-
-                                <div className="bg-gray-50 rounded-lg p-4">
-                                    <h4 className="font-bold text-gray-800 mb-3">Verification Status</h4>
-                                    <div className="space-y-2 text-sm">
-                                        <p>
-                                            <span className="text-gray-600">Background Check:</span>
-                                            <span className={`font-semibold ml-2 ${providerData.backgroundCheck ? 'text-green-600' : 'text-red-600'}`}>
-                                                {providerData.backgroundCheck ? '✓ Consented' : '✗ Not consented'}
-                                            </span>
-                                        </p>
-                                        <p>
-                                            <span className="text-gray-600">Insurance:</span>
-                                            <span className="font-semibold ml-2">
-                                                {providerData.skipInsurance ? '⏳ Will upload later' : '📄 Ready to upload'}
-                                            </span>
-                                        </p>
-                                        <p>
-                                            <span className="text-gray-600">Payment Setup:</span>
-                                            <span className="font-semibold ml-2">
-                                                {providerData.skipPayment ? '⏳ Will set up later' : '💰 Ready to configure'}
-                                            </span>
-                                        </p>
-                                        <p><span className="text-gray-600">Certifications:</span> <span className="font-semibold">Optional</span></p>
-                                    </div>
-                                </div>
-                            </div>
-
-                            <div className="bg-cyan-50 border-2 border-cyan-200 rounded-lg p-6">
-                                <h4 className="font-bold text-cyan-900 mb-3">📋 What Happens Next?</h4>
-                                <ol className="text-sm text-cyan-800 space-y-2">
-                                    <li>1. We'll review your application within 2-3 business days</li>
-                                    <li>2. Background check will be initiated (usually takes 3-5 days)</li>
-                                    <li>3. Once approved, you'll receive onboarding instructions</li>
-                                    <li>4. Complete your profile and upload insurance/payment info</li>
-                                    <li>5. Start accepting bookings!</li>
-                                </ol>
-                            </div>
-
-                            <div className="flex items-start gap-3 bg-gray-50 p-4 rounded-lg">
-                                <input type="checkbox" className="mt-1" required />
-                                <label className="text-sm text-gray-700">
-                                    I certify that all information provided is accurate and complete. I understand that false information
-                                    may result in denial or termination of my provider account. I agree to BRNNO's{' '}
-                                    <a href="#" className="text-blue-600 font-semibold hover:underline">Terms of Service</a> and{' '}
-                                    <a href="#" className="text-blue-600 font-semibold hover:underline">Provider Agreement</a>.
-                                </label>
-                            </div>
-                        </div>
-                    )}
-                </div>
-
-                {/* Footer */}
-                <div className="border-t border-gray-200 p-6 bg-gray-50 flex items-center justify-between">
-                    {providerStep > 1 && (
-                        <button
-                            onClick={prevStep}
-                            className="px-6 py-3 rounded-lg font-semibold text-gray-600 hover:bg-gray-200 transition-colors"
-                        >
-                            Back
-                        </button>
-                    )}
-
-                    {providerStep < 5 ? (
-                        <button
-                            onClick={nextStep}
-                            disabled={
-                                (providerStep === 1 && (!providerData.businessName || !providerData.ein || !providerData.ownerName)) ||
-                                (providerStep === 2 && providerData.services.length < 3) ||
-                                (providerStep === 3 && !providerData.backgroundCheck)
-                            }
-                            className="ml-auto px-8 py-3 bg-cyan-500 hover:bg-cyan-600 text-white rounded-lg font-bold transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                        >
-                            Continue
-                        </button>
-                    ) : (
-                        <button
-                            onClick={async () => {
-                                if (isSubmitting) return;
-
-                                setIsSubmitting(true);
-                                try {
-                                    // Validate required fields
-                                    const requiredFields = [
-                                        'businessName', 'businessType', 'ein', 'ownerName',
-                                        'phone', 'email', 'serviceArea'
-                                    ];
-
-                                    const missingFields = requiredFields.filter(field => !providerData[field] || providerData[field].trim() === '');
-
-                                    if (missingFields.length > 0) {
-                                        alert(`Please fill in all required fields: ${missingFields.join(', ')}`);
-                                        setIsSubmitting(false);
-                                        return;
-                                    }
-
-                                    if (providerData.services.length < 3) {
-                                        alert('Please select at least 3 services you offer.');
-                                        setIsSubmitting(false);
-                                        return;
-                                    }
-
-                                    if (!providerData.backgroundCheck) {
-                                        alert('You must consent to a background check to join BRNNO.');
-                                        setIsSubmitting(false);
-                                        return;
-                                    }
-
-                                    let userId;
-
-                                    if (!auth.currentUser) {
-                                        // Create user account for provider signup
-                                        try {
-                                            // Generate a temporary password for the user
-                                            const tempPassword = Math.random().toString(36).slice(-8) + '!A1';
-
-                                            const userCredential = await createUserWithEmailAndPassword(auth, providerData.email, tempPassword);
-                                            userId = userCredential.user.uid;
-
-                                            // Create user profile in Firestore
-                                            await setDoc(doc(db, 'users', userId), {
-                                                uid: userId,
-                                                email: providerData.email,
-                                                displayName: providerData.ownerName,
-                                                firstName: providerData.ownerName.split(' ')[0],
-                                                lastName: providerData.ownerName.split(' ').slice(1).join(' '),
-                                                phone: providerData.phone,
-                                                businessName: providerData.businessName,
-                                                accountType: 'provider',
-                                                createdAt: serverTimestamp(),
-                                                role: 'user',
-                                                tempPassword: tempPassword // Store temp password for email notification
-                                            });
-
-                                            console.log('User account created for provider signup');
-                                        } catch (error) {
-                                            console.error('Error creating user account:', error);
-                                            if (error.code === 'auth/email-already-in-use') {
-                                                alert('An account with this email already exists. Please sign in first and then apply as a provider.');
-                                            } else {
-                                                alert('Error creating account. Please try again.');
-                                            }
-                                            setIsSubmitting(false);
-                                            return;
-                                        }
-                                    } else {
-                                        userId = auth.currentUser.uid;
-                                    }
-
-                                    // Default services for new providers
-                                    const defaultServices = [
-                                        { id: 1, name: 'Basic Wash & Vacuum', price: 50, duration: '1 hour', active: true },
-                                        { id: 2, name: 'Interior Detail', price: 120, duration: '2 hours', active: true },
-                                        { id: 3, name: 'Exterior Detail', price: 150, duration: '2.5 hours', active: true },
-                                        { id: 4, name: 'Full Detail', price: 200, duration: '4 hours', active: true },
-                                        { id: 5, name: 'Paint Correction', price: 400, duration: '6 hours', active: false },
-                                        { id: 6, name: 'Ceramic Coating', price: 800, duration: '8 hours', active: true }
-                                    ];
-
-                                    // Save provider application to Firebase
-                                    const providerApplication = {
-                                        ...providerData,
-                                        status: 'approved', // Auto-approve for now
-                                        submittedAt: serverTimestamp(),
-                                        userId: userId,
-                                        services: defaultServices // Include default services
-                                    };
-
-                                    console.log('Submitting provider application:', providerApplication);
-
-                                    // Save to providers collection
-                                    const docRef = await addDoc(collection(db, 'providers'), providerApplication);
-                                    console.log('Provider application saved with ID:', docRef.id);
-                                    console.log('Provider application data:', providerApplication);
-
-                                    // Update user's account type to provider in users collection
-                                    if (auth.currentUser) {
-                                        await updateDoc(doc(db, 'users', userId), {
-                                            accountType: 'provider',
-                                            providerApplicationId: docRef.id,
-                                            businessName: providerData.businessName
-                                        });
-                                    } else {
-                                        // Update the newly created user account
-                                        await updateDoc(doc(db, 'users', userId), {
-                                            accountType: 'provider',
-                                            providerApplicationId: docRef.id
-                                        });
-                                    }
-
-                                    console.log('User account updated to provider');
-
-                                    // Send email notification
-                                    try {
-                                        let message;
-                                        if (!auth.currentUser) {
-                                            // New user - include login credentials
-                                            message = `Hello ${providerData.ownerName},\n\nYour provider application for ${providerData.businessName} has been approved!\n\nYour login credentials:\nEmail: ${providerData.email}\nTemporary Password: [Check your email for the temporary password]\n\nPlease sign in and change your password in your profile settings.\n\nYou can now start accepting bookings through your provider dashboard.\n\nThank you for joining BRNNO!`;
-                                        } else {
-                                            // Existing user
-                                            message = `Hello ${providerData.ownerName},\n\nYour provider application for ${providerData.businessName} has been approved!\n\nYou can now start accepting bookings through your provider dashboard.\n\nThank you for joining BRNNO!`;
-                                        }
-
-                                        const emailData = {
-                                            to: providerData.email,
-                                            subject: 'BRNNO Provider Application Approved!',
-                                            businessName: providerData.businessName,
-                                            ownerName: providerData.ownerName,
-                                            message: message
-                                        };
-
-                                        // For now, just log the email (you can add EmailJS or SendGrid later)
-                                        console.log('📧 EMAIL NOTIFICATION:');
-                                        console.log('To:', emailData.to);
-                                        console.log('Subject:', emailData.subject);
-                                        console.log('Message:', emailData.message);
-
-                                        // TODO: Add real email service (EmailJS, SendGrid, etc.)
-                                        // await sendEmail(emailData);
-
-                                    } catch (emailError) {
-                                        console.error('Email notification failed:', emailError);
-                                        // Don't fail the whole process if email fails
-                                    }
-
-                                    if (!auth.currentUser) {
-                                        alert('Application approved! Your account has been created. Please check your email for login credentials and sign in to access your provider dashboard.');
-                                    } else {
-                                        alert('Application approved! You can now start accepting bookings. Check your provider dashboard to get started.');
-                                        // Refresh userData to reflect the new provider status
-                                        try {
-                                            const userDoc = await getDoc(doc(db, 'users', auth.currentUser.uid));
-                                            if (userDoc.exists()) {
-                                                setUserData(userDoc.data());
-                                            }
-                                        } catch (error) {
-                                            console.error('Error refreshing user data:', error);
-                                        }
-                                    }
-                                    closeModal();
-                                } catch (error) {
-                                    console.error('Error submitting provider application:', error);
-
-                                    // More specific error messages
-                                    if (error.code === 'permission-denied') {
-                                        alert('Permission denied. Please make sure you are signed in and try again.');
-                                    } else if (error.code === 'unavailable') {
-                                        alert('Service temporarily unavailable. Please try again in a few moments.');
-                                    } else if (error.message.includes('network')) {
-                                        alert('Network error. Please check your internet connection and try again.');
-                                    } else {
-                                        alert(`Error submitting application: ${error.message}. Please try again.`);
-                                    }
-                                } finally {
-                                    setIsSubmitting(false);
-                                }
-                            }}
-                            disabled={isSubmitting}
-                            className={`ml-auto px-8 py-3 text-white rounded-lg font-bold transition-colors flex items-center gap-2 ${isSubmitting
-                                ? 'bg-gray-400 cursor-not-allowed'
-                                : 'bg-green-600 hover:bg-green-700'
-                                }`}
-                        >
-                            {isSubmitting ? (
-                                <>
-                                    <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
-                                    Submitting...
-                                </>
-                            ) : (
-                                'Submit Application'
-                            )}
-                        </button>
-                    )}
-                </div>
-            </div>
-        </div>
-    );
-});
-
-const ProviderDetailModal = memo(({ provider, showModal, setShowModal, onBookNow, setSelectedProvider, setBookingData, setShowBookingModal, setReviewData, setShowReviewModal }) => {
-    const [activeTab, setActiveTab] = useState('overview');
-
-    // Lock body scroll when modal is open
-    React.useEffect(() => {
-        if (showModal) {
-            document.body.style.overflow = 'hidden';
-        }
-        return () => {
-            document.body.style.overflow = 'unset';
-        };
-    }, [showModal]);
-
-    if (!showModal || !provider) return null;
-
-    return (
-        <div
-            className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-2 sm:p-4 overflow-y-auto modal-backdrop"
-            onClick={() => setShowModal(false)}
-        >
-            <div
-                className="bg-white rounded-2xl shadow-2xl max-w-md sm:max-w-3xl lg:max-w-5xl w-full my-4 sm:my-8 max-h-[90vh] overflow-hidden flex flex-col relative modal-content"
-                onClick={(e) => e.stopPropagation()}
-            >
-                {/* Close Button */}
-                <button
-                    onClick={() => setShowModal(false)}
-                    className="absolute top-4 right-4 bg-white/90 hover:bg-white text-gray-800 p-2 rounded-lg transition-colors text-2xl z-20"
-                >
-                    ✕
-                </button>
-
-                {/* Header with Hero Image */}
-                <div className="relative h-64 overflow-hidden">
-                    <img
-                        src={provider.image}
-                        alt={provider.name}
-                        className="w-full h-full object-cover"
-                    />
-                    <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-black/40 to-transparent"></div>
-
-                    {/* Provider Info Overlay */}
-                    <div className="absolute bottom-0 left-0 right-0 p-6 text-white">
-                        <div className="flex items-start justify-between">
-                            <div>
-                                <h2 className="text-3xl font-bold mb-2">{provider.name}</h2>
-                                <div className="flex items-center gap-4 mb-2">
-                                    <div className="flex items-center gap-1 bg-white/20 backdrop-blur-sm px-3 py-1 rounded-full">
-                                        <Star className="fill-yellow-400 text-yellow-400" size={18} />
-                                        <span className="font-bold">{provider.rating}</span>
-                                        <span className="text-white/80 text-sm">({provider.reviews} reviews)</span>
-                                    </div>
-                                    {provider.certified && (
-                                        <span className="flex items-center gap-1 bg-blue-500 px-3 py-1 rounded-full text-sm font-semibold">
-                                            <Shield size={14} />
-                                            BRNNO Certified
-                                        </span>
-                                    )}
-                                </div>
-                                <div className="flex items-center gap-4 text-sm">
-                                    <span className="flex items-center gap-1">
-                                        <MapPin size={16} />
-                                        {provider.distance || '2.5 miles'} away
-                                    </span>
-                                    <span className="flex items-center gap-1">
-                                        <Clock size={16} />
-                                        Responds in {provider.responseTime || 'Within 24 hours'}
-                                    </span>
-                                    <span className="flex items-center gap-1">
-                                        <CheckCircle size={16} />
-                                        {provider.completedJobs || '0'} jobs completed
-                                    </span>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                {/* Tabs */}
-                <div className="border-b border-gray-200 px-6 flex gap-4">
-                    {['overview', 'services', 'gallery', 'reviews'].map(tab => (
-                        <button
-                            key={tab}
-                            onClick={() => setActiveTab(tab)}
-                            className={`px-4 py-3 font-semibold capitalize transition-colors ${activeTab === tab
-                                ? 'text-cyan-600 border-b-2 border-cyan-600'
-                                : 'text-gray-600 hover:text-cyan-500'
-                                }`}
-                        >
-                            {tab}
-                        </button>
-                    ))}
-                </div>
-
-                {/* Content Area */}
-                <div className="flex-1 overflow-y-auto p-6">
-
-                    {/* Overview Tab */}
-                    {activeTab === 'overview' && (
-                        <div className="space-y-6">
-                            <div>
-                                <h3 className="text-xl font-bold text-gray-800 mb-3">About</h3>
-                                <p className="text-gray-600 leading-relaxed">
-                                    Professional mobile auto detailing service serving {provider.distance || '2.5 miles'} radius.
-                                    We specialize in premium detailing services with {provider.completedJobs || '0'} satisfied customers.
-                                    Our team is fully insured, background-checked, and committed to delivering exceptional results.
-                                </p>
-                            </div>
-
-                            <div>
-                                <h3 className="text-xl font-bold text-gray-800 mb-3">Specialties</h3>
-                                <div className="flex flex-wrap gap-2">
-                                    {provider.specialties || ['Paint Correction', 'Ceramic Coating', 'Interior Detailing', 'Exterior Polish'].map((specialty, idx) => (
-                                        <span
-                                            key={idx}
-                                            className="bg-cyan-100 text-cyan-700 px-4 py-2 rounded-lg font-semibold"
-                                        >
-                                            {specialty}
-                                        </span>
-                                    ))}
-                                </div>
-                            </div>
-
-                            <div className="grid grid-cols-3 gap-4">
-                                <div className="bg-gray-50 rounded-lg p-4 text-center">
-                                    <div className="text-3xl font-bold text-cyan-600 mb-1">{provider.rating}</div>
-                                    <div className="text-sm text-gray-600">Average Rating</div>
-                                </div>
-                                <div className="bg-gray-50 rounded-lg p-4 text-center">
-                                    <div className="text-3xl font-bold text-cyan-600 mb-1">{provider.completedJobs || '0'}</div>
-                                    <div className="text-sm text-gray-600">Jobs Completed</div>
-                                </div>
-                                <div className="bg-gray-50 rounded-lg p-4 text-center">
-                                    <div className="text-3xl font-bold text-cyan-600 mb-1">{provider.responseTime || '24 hours'}</div>
-                                    <div className="text-sm text-gray-600">Response Time</div>
-                                </div>
-                            </div>
-
-                            <div>
-                                <h3 className="text-xl font-bold text-gray-800 mb-3">Service Area</h3>
-                                <p className="text-gray-600">
-                                    Serving Eagle Mountain, Saratoga Springs, Lehi, and surrounding areas within a 25-mile radius.
-                                </p>
-                            </div>
-                        </div>
-                    )}
-
-                    {/* Services Tab */}
-                    {activeTab === 'services' && (
-                        <div className="space-y-4">
-                            <h3 className="text-xl font-bold text-gray-800 mb-4">Services & Pricing</h3>
-
-                            {(provider.services && provider.services.length > 0 ? provider.services.filter(service => service.active === true) : [
-                                { name: 'Basic Wash & Vacuum', price: 50, duration: '1 hour', description: 'Exterior hand wash and interior vacuum', active: true },
-                                { name: 'Interior Detail', price: 120, duration: '2 hours', description: 'Deep clean all interior surfaces, carpets, and upholstery', active: true },
-                                { name: 'Exterior Detail', price: 150, duration: '2.5 hours', description: 'Wash, clay bar treatment, polish, and wax', active: true },
-                                { name: 'Full Detail', price: 200, duration: '4 hours', description: 'Complete interior and exterior detailing service', active: true },
-                                { name: 'Paint Correction', price: 400, duration: '6 hours', description: 'Multi-stage paint correction to remove swirls and scratches', active: true },
-                                { name: 'Ceramic Coating', price: 800, duration: '8 hours', description: 'Professional grade ceramic coating with 5-year warranty', active: true }
-                            ]).map((service, idx) => (
-                                <div key={idx} className="border border-gray-200 rounded-lg p-4 hover:border-cyan-500 transition-colors">
-                                    <div className="flex items-start justify-between mb-2">
-                                        <div>
-                                            <h4 className="font-bold text-gray-800 text-lg">{service.name}</h4>
-                                            <p className="text-sm text-gray-600">{service.description}</p>
-                                        </div>
-                                        <div className="text-right">
-                                            <p className="text-2xl font-bold text-cyan-600">${service.price}</p>
-                                            <p className="text-xs text-gray-500">{service.duration}</p>
-                                        </div>
-                                    </div>
-                                    <button
-                                        onClick={() => {
-                                            setBookingData(prev => ({ ...prev, service: service }));
-                                            setShowModal(false);
-                                            onBookNow();
-                                        }}
-                                        className="mt-3 w-full bg-cyan-500 hover:bg-cyan-600 text-white font-semibold py-2 rounded-lg transition-colors"
-                                    >
-                                        Book This Service
-                                    </button>
-                                </div>
-                            ))}
-                        </div>
-                    )}
-
-                    {/* Gallery Tab */}
-                    {activeTab === 'gallery' && (
-                        <div>
-                            <h3 className="text-xl font-bold text-gray-800 mb-4">Before & After Gallery</h3>
-                            <div className="grid grid-cols-2 gap-4">
-                                {provider.beforeAfter && provider.beforeAfter.map((img, idx) => (
-                                    <div key={idx} className="relative rounded-lg overflow-hidden group cursor-pointer">
-                                        <img
-                                            src={img}
-                                            alt={`Gallery ${idx + 1}`}
-                                            className="w-full h-64 object-cover group-hover:scale-110 transition-transform duration-300"
-                                        />
-                                        <div className="absolute inset-0 bg-black/0 group-hover:bg-black/20 transition-all"></div>
-                                    </div>
-                                ))}
-                                {/* Provider can add their own work samples */}
-                                <div className="relative rounded-lg overflow-hidden bg-gray-100 border-2 border-dashed border-gray-300">
-                                    <div className="w-full h-64 flex items-center justify-center">
-                                        <div className="text-center text-gray-500">
-                                            <div className="text-4xl mb-2">📸</div>
-                                            <p className="text-sm">Add your work samples</p>
-                                        </div>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                    )}
-
-                    {/* Reviews Tab */}
-                    {activeTab === 'reviews' && (
-                        <div className="space-y-6">
-                            <div>
-                                <h3 className="text-xl font-bold text-gray-800 mb-4">Customer Reviews</h3>
-
-                                {/* Rating Summary */}
-                                <div className="bg-gray-50 rounded-lg p-6 mb-6">
-                                    <div className="flex items-center gap-6">
-                                        <div className="text-center">
-                                            <div className="text-5xl font-bold text-gray-800 mb-2">{provider.rating}</div>
-                                            <div className="flex items-center gap-1 mb-1">
-                                                {[1, 2, 3, 4, 5].map(star => (
-                                                    <Star key={star} className="fill-yellow-400 text-yellow-400" size={20} />
-                                                ))}
-                                            </div>
-                                            <div className="text-sm text-gray-600">{provider.reviews} reviews</div>
-                                        </div>
-                                        <div className="flex-1 space-y-2">
-                                            {[5, 4, 3, 2, 1].map(rating => (
-                                                <div key={rating} className="flex items-center gap-3">
-                                                    <span className="text-sm text-gray-600 w-12">{rating} stars</span>
-                                                    <div className="flex-1 bg-gray-200 rounded-full h-2">
-                                                        <div
-                                                            className="bg-yellow-400 h-2 rounded-full"
-                                                            style={{ width: rating === 5 ? '85%' : rating === 4 ? '10%' : '5%' }}
-                                                        ></div>
-                                                    </div>
-                                                    <span className="text-sm text-gray-600 w-8">{rating === 5 ? '85%' : rating === 4 ? '10%' : '5%'}</span>
-                                                </div>
-                                            ))}
-                                        </div>
-                                    </div>
-                                </div>
-
-                                {/* Individual Reviews */}
-                                <div className="text-center py-12">
-                                    <div className="text-6xl mb-4">⭐</div>
-                                    <h3 className="text-xl font-bold text-gray-800 mb-2">No Reviews Yet</h3>
-                                    <p className="text-gray-600">Be the first to review this provider!</p>
-                                </div>
-                            </div>
-                        </div>
-                    )}
-                </div>
-
-                {/* Footer - Sticky CTA */}
-                <div className="border-t border-gray-200 p-6 bg-gray-50">
-                    <div className="flex items-center justify-between">
-                        <div>
-                            <p className="text-sm text-gray-600">Starting at</p>
-                            <p className="text-2xl font-bold text-gray-800">${provider.startingPrice || 50}</p>
-                        </div>
-                        <div className="flex gap-3">
-                            <button
-                                onClick={() => {
-                                    if (provider.phone) {
-                                        // Check if it's a mobile device
-                                        const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
-
-                                        if (isMobile) {
-                                            // On mobile, try to open phone dialer
-                                            const cleanPhone = provider.phone.replace(/[^\d+]/g, '');
-                                            window.open(`tel:${cleanPhone}`, '_self');
-                                        } else {
-                                            // On desktop, show contact info
-                                            alert(`Contact Information:\n\nPhone: ${provider.phone}\nEmail: ${provider.email || 'Not available'}\n\nYou can copy the phone number to call manually.`);
-                                        }
-                                    } else if (provider.email) {
-                                        window.open(`mailto:${provider.email}`, '_self');
-                                    } else {
-                                        alert('Contact information not available');
-                                    }
-                                }}
-                                className="px-6 py-3 border-2 border-cyan-500 text-cyan-600 hover:bg-cyan-50 rounded-lg font-bold transition-colors"
-                            >
-                                Contact Provider
-                            </button>
-                            <button
-                                onClick={() => {
-                                    setReviewData(prev => ({ ...prev, providerId: provider.id }));
-                                    setShowReviewModal(true);
-                                }}
-                                className="px-6 py-3 border-2 border-cyan-500 text-cyan-600 hover:bg-cyan-50 rounded-lg font-bold transition-colors"
-                            >
-                                Write Review
-                            </button>
-                            <button
-                                onClick={() => {
-                                    setShowModal(false);
-                                    setSelectedProvider(provider);
-                                    setBookingData(prev => ({
-                                        ...prev,
-                                        service: {
-                                            name: provider.name || provider.businessName,
-                                            price: provider.startingPrice || 120,
-                                            provider: provider.businessName || provider.name
-                                        }
-                                    }));
-                                    setShowBookingModal(true);
-                                }}
-                                className="px-8 py-3 bg-cyan-500 hover:bg-cyan-600 text-white rounded-lg font-bold transition-colors"
-                            >
-                                Book Now
-                            </button>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
-    );
-});
-
-const ProviderDashboard = memo(({ showDashboard, setShowDashboard, triggerProviderRefresh }) => {
-    const [dashboardTab, setDashboardTab] = useState('overview');
-    const [isAuthorized, setIsAuthorized] = useState(false);
-    const [checkingAuth, setCheckingAuth] = useState(true);
-    const [realBookings, setRealBookings] = useState([]);
-    const [bookingsLoading, setBookingsLoading] = useState(true);
-    const [providerInfo, setProviderInfo] = useState(null);
-    const [showUpdateServices, setShowUpdateServices] = useState(false);
-    const [showBlockTimeOff, setShowBlockTimeOff] = useState(false);
-    const [showMessages, setShowMessages] = useState(false);
-    const [services, setServices] = useState([
-        { id: 1, name: 'Basic Wash & Vacuum', price: 50, duration: '1 hour', active: true },
-        { id: 2, name: 'Interior Detail', price: 120, duration: '2 hours', active: true },
-        { id: 3, name: 'Exterior Detail', price: 150, duration: '2.5 hours', active: true },
-        { id: 4, name: 'Full Detail', price: 200, duration: '4 hours', active: true },
-        { id: 5, name: 'Paint Correction', price: 400, duration: '6 hours', active: false },
-        { id: 6, name: 'Ceramic Coating', price: 800, duration: '8 hours', active: true }
-    ]);
-    const [editingService, setEditingService] = useState(null);
-    const [showAddService, setShowAddService] = useState(false);
-
-    // Service management functions
-    const toggleServiceActive = async (serviceId) => {
-        try {
-            // Update local state
-            const updatedServices = services.map(service =>
-                service.id === serviceId
-                    ? { ...service, active: !service.active }
-                    : service
-            );
-            setServices(updatedServices);
-
-            // Save to database - save to both users and providers collections
-            if (auth.currentUser) {
-                // Save to users collection for dashboard
-                await updateDoc(doc(db, 'users', auth.currentUser.uid), {
-                    services: updatedServices
-                });
-
-                // Also save to providers collection for public access
-                const providerQuery = query(collection(db, 'providers'), where('userId', '==', auth.currentUser.uid));
-                const providerSnapshot = await getDocs(providerQuery);
-                if (!providerSnapshot.empty) {
-                    const providerDoc = providerSnapshot.docs[0];
-                    await updateDoc(providerDoc.ref, {
-                        services: updatedServices
-                    });
-                    console.log('Services saved to providers collection:', updatedServices);
-                } else {
-                    console.log('No provider document found for user:', auth.currentUser.uid);
-                }
-
-                console.log('Services updated in database');
-
-                // Trigger provider data refresh
-                if (triggerProviderRefresh) {
-                    triggerProviderRefresh();
-                }
-            }
-        } catch (error) {
-            console.error('Error updating services:', error);
-            // Revert local state on error
-            setServices(services);
-            alert('Failed to update service. Please try again.');
-        }
-    };
-
-    const editService = (service) => {
-        setEditingService(service);
-    };
-
-    const saveServiceEdit = async (updatedService) => {
-        try {
-            const updatedServices = services.map(service =>
-                service.id === updatedService.id ? updatedService : service
-            );
-            setServices(updatedServices);
-
-            // Save to database - save to both users and providers collections
-            if (auth.currentUser) {
-                // Save to users collection for dashboard
-                await updateDoc(doc(db, 'users', auth.currentUser.uid), {
-                    services: updatedServices
-                });
-
-                // Also save to providers collection for public access
-                const providerQuery = query(collection(db, 'providers'), where('userId', '==', auth.currentUser.uid));
-                const providerSnapshot = await getDocs(providerQuery);
-                if (!providerSnapshot.empty) {
-                    const providerDoc = providerSnapshot.docs[0];
-                    await updateDoc(providerDoc.ref, {
-                        services: updatedServices
-                    });
-                }
-
-                console.log('Service edit saved to database');
-
-                // Trigger provider data refresh
-                if (triggerProviderRefresh) {
-                    triggerProviderRefresh();
-                }
-            }
-            setEditingService(null);
-        } catch (error) {
-            console.error('Error saving service edit:', error);
-            alert('Failed to save service changes. Please try again.');
-        }
-    };
-
-    const addNewService = async (newService) => {
-        try {
-            const serviceWithId = { ...newService, id: Date.now() };
-            const updatedServices = [...services, serviceWithId];
-            setServices(updatedServices);
-
-            // Save to database - save to both users and providers collections
-            if (auth.currentUser) {
-                // Save to users collection for dashboard
-                await updateDoc(doc(db, 'users', auth.currentUser.uid), {
-                    services: updatedServices
-                });
-
-                // Also save to providers collection for public access
-                const providerQuery = query(collection(db, 'providers'), where('userId', '==', auth.currentUser.uid));
-                const providerSnapshot = await getDocs(providerQuery);
-                if (!providerSnapshot.empty) {
-                    const providerDoc = providerSnapshot.docs[0];
-                    await updateDoc(providerDoc.ref, {
-                        services: updatedServices
-                    });
-                }
-
-                console.log('New service added to database');
-
-                // Trigger provider data refresh
-                if (triggerProviderRefresh) {
-                    triggerProviderRefresh();
-                }
-            }
-            setShowAddService(false);
-        } catch (error) {
-            console.error('Error adding service:', error);
-            alert('Failed to add service. Please try again.');
-        }
-    };
-
-    const deleteService = async (serviceId) => {
-        try {
-            const updatedServices = services.filter(service => service.id !== serviceId);
-            setServices(updatedServices);
-
-            // Save to database - save to both users and providers collections
-            if (auth.currentUser) {
-                // Save to users collection for dashboard
-                await updateDoc(doc(db, 'users', auth.currentUser.uid), {
-                    services: updatedServices
-                });
-
-                // Also save to providers collection for public access
-                const providerQuery = query(collection(db, 'providers'), where('userId', '==', auth.currentUser.uid));
-                const providerSnapshot = await getDocs(providerQuery);
-                if (!providerSnapshot.empty) {
-                    const providerDoc = providerSnapshot.docs[0];
-                    await updateDoc(providerDoc.ref, {
-                        services: updatedServices
-                    });
-                }
-
-                console.log('Service deleted from database');
-
-                // Trigger provider data refresh
-                if (triggerProviderRefresh) {
-                    triggerProviderRefresh();
-                }
-            }
-        } catch (error) {
-            console.error('Error deleting service:', error);
-            alert('Failed to delete service. Please try again.');
-        }
-    };
-
-    // Check authentication when dashboard opens
-    React.useEffect(() => {
-        if (showDashboard) {
-            document.body.style.overflow = 'hidden';
-
-            // Check if user is authenticated and has provider role
-            if (auth.currentUser) {
-                getDoc(doc(db, 'users', auth.currentUser.uid)).then(userDoc => {
-                    if (userDoc.exists() && userDoc.data().accountType === 'provider') {
-                        setIsAuthorized(true);
-                    } else {
-                        alert('Provider access required. Please sign up as a provider first.');
-                        setShowDashboard(false);
-                    }
-                    setCheckingAuth(false);
-                }).catch(() => {
-                    alert('Authentication error. Please sign in again.');
-                    setShowDashboard(false);
-                    setCheckingAuth(false);
-                });
-            } else {
-                alert('Please sign in first to access provider dashboard.');
-                setShowDashboard(false);
-                setCheckingAuth(false);
-            }
-        } else {
-            setIsAuthorized(false);
-            setCheckingAuth(true);
-        }
-
-        return () => {
-            document.body.style.overflow = 'unset';
-        };
-    }, [showDashboard]);
-
-    // Load provider info and bookings
-    React.useEffect(() => {
-        if (showDashboard && isAuthorized && auth.currentUser) {
-            const loadProviderData = async () => {
-                try {
-                    setBookingsLoading(true);
-
-                    // Load provider info from users collection
-                    const userDoc = await getDoc(doc(db, 'users', auth.currentUser.uid));
-                    if (userDoc.exists()) {
-                        const userData = userDoc.data();
-                        setProviderInfo(userData);
-
-                        // Load services from database if they exist
-                        if (userData.services && userData.services.length > 0) {
-                            setServices(userData.services);
-                        }
-                    }
-
-                    // Load bookings
-                    const bookingsQuery = query(
-                        collection(db, 'bookings'),
-                        where('providerId', '==', auth.currentUser.uid)
-                    );
-                    const bookingsSnapshot = await getDocs(bookingsQuery);
-                    const bookings = [];
-
-                    bookingsSnapshot.forEach((doc) => {
-                        const data = doc.data();
-                        bookings.push({
-                            id: doc.id,
-                            ...data
-                        });
-                    });
-
-                    setRealBookings(bookings);
-                    console.log('Loaded provider data:', { providerInfo: userDoc.data(), bookings });
-                } catch (error) {
-                    console.error('Error loading provider data:', error);
-                } finally {
-                    setBookingsLoading(false);
-                }
-            };
-
-            loadProviderData();
-        }
-    }, [showDashboard, isAuthorized]);
-
-    if (!showDashboard) return null;
-
-    if (checkingAuth) {
-        return (
-            <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center">
-                <div className="bg-white rounded-xl p-8 text-center">
-                    <div className="w-8 h-8 border-4 border-cyan-500 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
-                    <p className="text-gray-600">Verifying access...</p>
-                </div>
-            </div>
-        );
-    }
-
-    if (!isAuthorized) {
-        return null;
-    }
-
-    // Calculate real stats from bookings
-    const today = new Date().toDateString();
-    const thisWeek = new Date();
-    thisWeek.setDate(thisWeek.getDate() - 7);
-
-    const todayBookings = realBookings.filter(booking =>
-        new Date(booking.date).toDateString() === today
-    ).length;
-
-    const weekBookings = realBookings.filter(booking =>
-        new Date(booking.date) >= thisWeek
-    );
-
-    const weekRevenue = weekBookings.reduce((sum, booking) => sum + (booking.providerAmount || 0), 0);
-    const totalJobs = realBookings.length;
-
-    const stats = {
-        todayBookings,
-        weekRevenue,
-        totalJobs,
-        rating: providerInfo?.rating || 0, // Use real rating or 0 for new providers
-        reviewCount: providerInfo?.reviewCount || 0 // Use real review count
-    };
-
-    // Use real bookings instead of mock data
-    const upcomingBookings = realBookings
-        .filter(booking => new Date(booking.date) >= new Date())
-        .sort((a, b) => new Date(a.date) - new Date(b.date))
-        .slice(0, 5)
-        .map(booking => ({
-            id: booking.id,
-            customer: booking.customerName || 'Customer',
-            service: booking.service?.name || 'Service',
-            vehicle: booking.vehicle ? `${booking.vehicle.year} ${booking.vehicle.make} ${booking.vehicle.model}` : 'Vehicle',
-            time: booking.time,
-            date: new Date(booking.date).toDateString() === today ? 'Today' :
-                new Date(booking.date).toDateString() === new Date(Date.now() + 86400000).toDateString() ? 'Tomorrow' :
-                    new Date(booking.date).toLocaleDateString(),
-            address: booking.address,
-            price: booking.providerAmount || 0,
-            status: booking.status,
-            paymentStatus: booking.paymentStatus
-        }));
-
-    return (
-        <>
-            {/* Backdrop */}
-            <div
-                className="fixed inset-0 bg-black/50 backdrop-blur-sm z-40"
-                onClick={() => setShowDashboard(false)}
-            />
-
-            {/* Dashboard Panel */}
-            <div className="fixed inset-0 sm:left-auto sm:right-0 w-full sm:w-[95vw] lg:w-[85vw] xl:w-[1200px] bg-gray-50 shadow-2xl z-50 flex">
-
-                {/* Sidebar */}
-                <div className="hidden md:flex flex-col w-64 bg-white border-r border-gray-200">
-                    <div className="p-6 border-b border-gray-200">
-                        <div className="flex items-center gap-3 mb-4">
-                            <div className="w-12 h-12 bg-gradient-to-br from-cyan-500 to-blue-600 rounded-full flex items-center justify-center text-white font-bold text-xl">
-                                {providerInfo?.businessName ? providerInfo.businessName.substring(0, 2).toUpperCase() : 'P'}
-                            </div>
-                            <div>
-                                <h3 className="font-bold text-gray-800">{providerInfo?.businessName || 'Provider'}</h3>
-                                <p className="text-xs text-gray-500">Provider Account</p>
-                            </div>
-                        </div>
-                    </div>
-
-                    <nav className="flex-1 p-4">
-                        <div className="space-y-1">
-                            {[
-                                { id: 'overview', icon: '📊', label: 'Overview' },
-                                { id: 'bookings', icon: '📅', label: 'Bookings' },
-                                { id: 'services', icon: '🔧', label: 'Services & Pricing' },
-                                { id: 'calendar', icon: '📆', label: 'Calendar' },
-                                { id: 'earnings', icon: '💰', label: 'Earnings' },
-                                { id: 'reviews', icon: '⭐', label: 'Reviews' },
-                                { id: 'profile', icon: '👤', label: 'Profile' }
-                            ].map(tab => (
-                                <button
-                                    key={tab.id}
-                                    onClick={() => setDashboardTab(tab.id)}
-                                    className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg font-semibold transition-colors ${dashboardTab === tab.id
-                                        ? 'bg-cyan-500 text-white'
-                                        : 'text-gray-600 hover:bg-gray-100'
-                                        }`}
-                                >
-                                    <span className="text-xl">{tab.icon}</span>
-                                    {tab.label}
-                                </button>
-                            ))}
-                        </div>
-                    </nav>
-
-                    <div className="p-4 border-t border-gray-200">
-                        <button
-                            onClick={() => setShowDashboard(false)}
-                            className="w-full flex items-center gap-3 px-4 py-3 rounded-lg font-semibold text-gray-600 hover:bg-gray-100 transition-colors"
-                        >
-                            <span className="text-xl">←</span>
-                            Back to Site
-                        </button>
-                    </div>
-                </div>
-
-                {/* Main Content */}
-                <div className="flex-1 overflow-y-auto">
-                    {/* Header */}
-                    <div className="bg-white border-b border-gray-200 p-4 sm:p-6 sticky top-0 z-10">
-                        <div className="flex items-center justify-between">
-                            <div>
-                                <h1 className="text-2xl sm:text-3xl font-bold text-gray-800">
-                                    {dashboardTab.charAt(0).toUpperCase() + dashboardTab.slice(1)}
-                                </h1>
-                                <p className="text-sm text-gray-600 mt-1">
-                                    {new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}
-                                </p>
-                            </div>
-                            <button
-                                onClick={() => setShowDashboard(false)}
-                                className="text-gray-400 hover:text-gray-600 p-2 md:hidden"
-                            >
-                                ✕
-                            </button>
-                        </div>
-                    </div>
-
-                    {/* Content Area */}
-                    <div className="p-4 sm:p-6">
-
-                        {/* Overview Tab */}
-                        {dashboardTab === 'overview' && (
-                            <div className="space-y-6">
-                                {/* Stats Grid */}
-                                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-                                    <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-                                        <div className="flex items-center justify-between mb-2">
-                                            <span className="text-gray-600 text-sm font-semibold">Today's Bookings</span>
-                                            <span className="text-2xl">📅</span>
-                                        </div>
-                                        <p className="text-3xl font-bold text-gray-800">{stats.todayBookings}</p>
-                                        <p className="text-xs text-green-600 mt-2">+2 from yesterday</p>
-                                    </div>
-
-                                    <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-                                        <div className="flex items-center justify-between mb-2">
-                                            <span className="text-gray-600 text-sm font-semibold">This Week</span>
-                                            <span className="text-2xl">💰</span>
-                                        </div>
-                                        <p className="text-3xl font-bold text-gray-800">${stats.weekRevenue}</p>
-                                        <p className="text-xs text-green-600 mt-2">+15% from last week</p>
-                                    </div>
-
-                                    <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-                                        <div className="flex items-center justify-between mb-2">
-                                            <span className="text-gray-600 text-sm font-semibold">Total Jobs</span>
-                                            <span className="text-2xl">🚗</span>
-                                        </div>
-                                        <p className="text-3xl font-bold text-gray-800">{stats.totalJobs}</p>
-                                        <p className="text-xs text-gray-600 mt-2">All time</p>
-                                    </div>
-
-                                    <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-                                        <div className="flex items-center justify-between mb-2">
-                                            <span className="text-gray-600 text-sm font-semibold">Rating</span>
-                                            <span className="text-2xl">⭐</span>
-                                        </div>
-                                        <p className="text-3xl font-bold text-gray-800">{stats.rating > 0 ? stats.rating.toFixed(1) : 'N/A'}</p>
-                                        <p className="text-xs text-gray-600 mt-2">From {stats.reviewCount} reviews</p>
-                                    </div>
-                                </div>
-
-                                {/* Upcoming Bookings */}
-                                <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-                                    <div className="flex items-center justify-between mb-4">
-                                        <h3 className="text-xl font-bold text-gray-800">Upcoming Bookings</h3>
-                                        <button
-                                            onClick={() => setDashboardTab('bookings')}
-                                            className="text-cyan-600 hover:text-cyan-700 font-semibold text-sm"
-                                        >
-                                            View All
-                                        </button>
-                                    </div>
-
-                                    <div className="space-y-3">
-                                        {upcomingBookings.map(booking => (
-                                            <div key={booking.id} className="border border-gray-200 rounded-lg p-4 hover:border-cyan-500 transition-colors">
-                                                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                                                    <div className="flex-1">
-                                                        <div className="flex items-center gap-2 mb-1">
-                                                            <h4 className="font-bold text-gray-800">{booking.customer}</h4>
-                                                            <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${booking.date === 'Today' ? 'bg-green-100 text-green-700' : 'bg-blue-100 text-blue-700'
-                                                                }`}>
-                                                                {booking.date}
-                                                            </span>
-                                                            <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${booking.paymentStatus === 'paid' ? 'bg-green-100 text-green-700' :
-                                                                booking.paymentStatus === 'pending' ? 'bg-yellow-100 text-yellow-700' :
-                                                                    'bg-red-100 text-red-700'
-                                                                }`}>
-                                                                {booking.paymentStatus === 'paid' ? '💰 Paid' :
-                                                                    booking.paymentStatus === 'pending' ? '⏳ Pending' : '❌ Failed'}
-                                                            </span>
-                                                        </div>
-                                                        <p className="text-sm text-gray-600">{booking.service} • {booking.vehicle}</p>
-                                                        <p className="text-xs text-gray-500 mt-1">📍 {booking.address}</p>
-                                                    </div>
-                                                    <div className="flex items-center gap-3">
-                                                        <div className="text-right">
-                                                            <p className="text-sm font-semibold text-gray-600">{booking.time}</p>
-                                                            <p className="text-lg font-bold text-gray-800">${booking.price}</p>
-                                                        </div>
-                                                        <button className="bg-cyan-500 hover:bg-cyan-600 text-white px-4 py-2 rounded-lg font-semibold text-sm transition-colors whitespace-nowrap">
-                                                            View Details
-                                                        </button>
-                                                    </div>
-                                                </div>
-                                            </div>
-                                        ))}
-                                    </div>
-                                </div>
-
-                                {/* Quick Actions */}
-                                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-                                    <button
-                                        onClick={() => setShowUpdateServices(true)}
-                                        className="bg-white border-2 border-cyan-500 text-cyan-600 hover:bg-cyan-50 rounded-xl p-6 font-bold transition-colors"
-                                    >
-                                        📋 Update Services
-                                    </button>
-                                    <button
-                                        onClick={() => setShowBlockTimeOff(true)}
-                                        className="bg-white border-2 border-blue-500 text-blue-600 hover:bg-blue-50 rounded-xl p-6 font-bold transition-colors"
-                                    >
-                                        📆 Block Time Off
-                                    </button>
-                                    <button
-                                        onClick={() => setShowMessages(true)}
-                                        className="bg-white border-2 border-purple-500 text-purple-600 hover:bg-purple-50 rounded-xl p-6 font-bold transition-colors"
-                                    >
-                                        💬 View Messages
-                                    </button>
-                                </div>
-                            </div>
-                        )}
-
-                        {/* Bookings Tab */}
-                        {dashboardTab === 'bookings' && (
-                            <div className="space-y-4">
-                                <div className="flex flex-wrap gap-2 mb-6">
-                                    {['All', 'Upcoming', 'In Progress', 'Completed', 'Cancelled'].map(filter => (
-                                        <button
-                                            key={filter}
-                                            className="px-4 py-2 rounded-lg font-semibold text-sm bg-white border border-gray-300 hover:border-cyan-500 hover:text-cyan-600 transition-colors"
-                                        >
-                                            {filter}
-                                        </button>
-                                    ))}
-                                </div>
-
-                                <div className="space-y-3">
-                                    {upcomingBookings.length > 0 ? upcomingBookings.map(booking => (
-                                        <div key={booking.id} className="bg-white rounded-xl shadow-sm border border-gray-200 p-4 sm:p-6">
-                                            <div className="flex flex-col sm:flex-row justify-between gap-4">
-                                                <div className="flex-1">
-                                                    <div className="flex flex-wrap items-center gap-2 mb-2">
-                                                        <h4 className="font-bold text-gray-800 text-lg">{booking.customer}</h4>
-                                                        <span className={`px-3 py-1 rounded-full text-xs font-semibold ${booking.status === 'completed'
-                                                            ? 'bg-green-100 text-green-700'
-                                                            : booking.date === 'Today'
-                                                                ? 'bg-orange-100 text-orange-700'
-                                                                : 'bg-blue-100 text-blue-700'
-                                                            }`}>
-                                                            {booking.status === 'completed' ? 'Completed' : 'Upcoming'}
-                                                        </span>
-                                                    </div>
-                                                    <div className="space-y-1 text-sm text-gray-600">
-                                                        <p><strong>Service:</strong> {booking.service}</p>
-                                                        <p><strong>Vehicle:</strong> {booking.vehicle}</p>
-                                                        <p><strong>Location:</strong> {booking.address}</p>
-                                                        <p><strong>Time:</strong> {booking.date} at {booking.time}</p>
-                                                    </div>
-                                                </div>
-                                                <div className="flex flex-col justify-between items-end">
-                                                    <p className="text-2xl font-bold text-gray-800 mb-2">${booking.price}</p>
-                                                    <div className="flex gap-2">
-                                                        {booking.status !== 'completed' && (
-                                                            <>
-                                                                <button className="px-4 py-2 bg-cyan-500 hover:bg-cyan-600 text-white rounded-lg font-semibold text-sm transition-colors">
-                                                                    Start Job
-                                                                </button>
-                                                                <button className="px-4 py-2 border border-gray-300 hover:border-red-500 text-gray-600 hover:text-red-600 rounded-lg font-semibold text-sm transition-colors">
-                                                                    Cancel
-                                                                </button>
-                                                            </>
-                                                        )}
-                                                        {booking.status === 'completed' && (
-                                                            <button className="px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg font-semibold text-sm transition-colors">
-                                                                View Receipt
-                                                            </button>
-                                                        )}
-                                                    </div>
-                                                </div>
-                                            </div>
-                                        </div>
-                                    )) : (
-                                        <div className="text-center py-12">
-                                            <div className="text-6xl mb-4">📅</div>
-                                            <h3 className="text-xl font-bold text-gray-800 mb-2">No Bookings Yet</h3>
-                                            <p className="text-gray-600">Your upcoming bookings will appear here</p>
-                                        </div>
-                                    )}
-                                </div>
-                            </div>
-                        )}
-
-                        {/* Services & Pricing Tab */}
-                        {dashboardTab === 'services' && (
-                            <div className="space-y-6">
-                                <div className="flex items-center justify-between">
-                                    <p className="text-gray-600">Manage your service offerings and pricing</p>
-                                    <button
-                                        onClick={() => setShowAddService(true)}
-                                        className="bg-cyan-500 hover:bg-cyan-600 text-white px-6 py-3 rounded-lg font-bold transition-colors"
-                                    >
-                                        + Add Service
-                                    </button>
-                                </div>
-
-                                <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-                                    {services.map((service) => (
-                                        <div key={service.id} className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-                                            <div className="flex items-start justify-between mb-3">
-                                                <div>
-                                                    <h4 className="font-bold text-gray-800 text-lg">{service.name}</h4>
-                                                    <p className="text-sm text-gray-600">{service.duration}</p>
-                                                </div>
-                                                <label className="relative inline-flex items-center cursor-pointer">
-                                                    <input
-                                                        type="checkbox"
-                                                        checked={service.active}
-                                                        onChange={() => toggleServiceActive(service.id)}
-                                                        className="sr-only peer"
-                                                    />
-                                                    <div className="w-11 h-6 bg-gray-200 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-cyan-300 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-cyan-500"></div>
-                                                </label>
-                                            </div>
-                                            <div className="flex items-center justify-between">
-                                                <div>
-                                                    <p className="text-3xl font-bold text-gray-800">${service.price}</p>
-                                                    <p className="text-xs text-gray-500 mt-1">You earn: ${(service.price * 0.85).toFixed(0)} (after 15% fee)</p>
-                                                </div>
-                                                <div className="flex gap-2">
-                                                    <button
-                                                        onClick={() => editService(service)}
-                                                        className="text-cyan-600 hover:text-cyan-700 font-semibold text-sm"
-                                                    >
-                                                        Edit
-                                                    </button>
-                                                    <button
-                                                        onClick={() => deleteService(service.id)}
-                                                        className="text-red-600 hover:text-red-700 font-semibold text-sm"
-                                                    >
-                                                        Delete
-                                                    </button>
-                                                </div>
-                                            </div>
-                                        </div>
-                                    ))}
-                                </div>
-                            </div>
-                        )}
-
-                        {/* Calendar Tab */}
-                        {dashboardTab === 'calendar' && (
-                            <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-                                <h3 className="text-xl font-bold text-gray-800 mb-4">Schedule & Availability</h3>
-                                <p className="text-gray-600 mb-6">Calendar integration coming soon! Manage your availability and block off time.</p>
-                                <div className="bg-gray-50 rounded-lg p-12 text-center">
-                                    <div className="text-6xl mb-4">📆</div>
-                                    <p className="text-gray-600">Calendar feature in development</p>
-                                </div>
-                            </div>
-                        )}
-
-                        {/* Earnings Tab */}
-                        {dashboardTab === 'earnings' && (
-                            <div className="space-y-6">
-                                {/* Summary Cards */}
-                                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                                    <div className="bg-gradient-to-br from-green-500 to-green-600 text-white rounded-xl p-6">
-                                        <p className="text-green-100 text-sm mb-2">This Week</p>
-                                        <p className="text-4xl font-bold">${stats.weekRevenue}</p>
-                                        <p className="text-green-100 text-xs mt-2">From {stats.todayBookings} bookings</p>
-                                    </div>
-                                    <div className="bg-gradient-to-br from-blue-500 to-blue-600 text-white rounded-xl p-6">
-                                        <p className="text-blue-100 text-sm mb-2">This Month</p>
-                                        <p className="text-4xl font-bold">${Math.round(stats.weekRevenue * 4.3)}</p>
-                                        <p className="text-blue-100 text-xs mt-2">Estimated from weekly data</p>
-                                    </div>
-                                    <div className="bg-gradient-to-br from-purple-500 to-purple-600 text-white rounded-xl p-6">
-                                        <p className="text-purple-100 text-sm mb-2">All Time</p>
-                                        <p className="text-4xl font-bold">${providerInfo?.totalEarnings || 0}</p>
-                                        <p className="text-purple-100 text-xs mt-2">{stats.totalJobs} completed jobs</p>
-                                    </div>
-                                </div>
-
-                                {/* Payment History */}
-                                <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-                                    <h3 className="text-xl font-bold text-gray-800 mb-4">Payment History</h3>
-                                    <div className="space-y-3">
-                                        {realBookings.filter(booking => booking.paymentStatus === 'paid').length > 0 ? realBookings.filter(booking => booking.paymentStatus === 'paid').map((payment, idx) => (
-                                            <div key={idx} className="flex items-center justify-between py-3 border-b border-gray-200 last:border-0">
-                                                <div>
-                                                    <p className="font-semibold text-gray-800">{new Date(payment.date).toLocaleDateString()}</p>
-                                                    <p className="text-sm text-gray-600">Service: {payment.service}</p>
-                                                </div>
-                                                <div className="text-right">
-                                                    <p className="text-xl font-bold text-green-600">${payment.providerAmount || payment.totalAmount}</p>
-                                                    <span className="text-xs bg-green-100 text-green-700 px-2 py-1 rounded-full font-semibold">
-                                                        Paid
-                                                    </span>
-                                                </div>
-                                            </div>
-                                        )) : (
-                                            <div className="text-center py-8">
-                                                <div className="text-4xl mb-2">💰</div>
-                                                <h3 className="text-lg font-bold text-gray-800 mb-1">No Payments Yet</h3>
-                                                <p className="text-gray-600">Your payment history will appear here</p>
-                                            </div>
-                                        )}
-                                    </div>
-                                </div>
-                            </div>
-                        )}
-
-                        {/* Reviews Tab */}
-                        {dashboardTab === 'reviews' && (
-                            <div className="space-y-6">
-                                <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-                                    <div className="flex items-center gap-6">
-                                        <div className="text-center">
-                                            <div className="text-5xl font-bold text-gray-800 mb-2">{stats.rating > 0 ? stats.rating.toFixed(1) : 'N/A'}</div>
-                                            <div className="flex items-center gap-1 mb-1">
-                                                {[1, 2, 3, 4, 5].map(star => (
-                                                    <Star key={star} className={`${star <= Math.round(stats.rating) ? 'fill-yellow-400 text-yellow-400' : 'fill-gray-300 text-gray-300'}`} size={20} />
-                                                ))}
-                                            </div>
-                                            <div className="text-sm text-gray-600">{stats.reviewCount} reviews</div>
-                                        </div>
-                                        <div className="flex-1 space-y-2">
-                                            {[5, 4, 3, 2, 1].map(rating => (
-                                                <div key={rating} className="flex items-center gap-3">
-                                                    <span className="text-sm text-gray-600 w-12">{rating} stars</span>
-                                                    <div className="flex-1 bg-gray-200 rounded-full h-2">
-                                                        <div
-                                                            className="bg-yellow-400 h-2 rounded-full"
-                                                            style={{ width: rating === 5 ? '85%' : rating === 4 ? '10%' : '5%' }}
-                                                        ></div>
-                                                    </div>
-                                                </div>
-                                            ))}
-                                        </div>
-                                    </div>
-                                </div>
-
-                                <div className="space-y-4">
-                                    {realBookings.filter(booking => booking.review).length > 0 ? realBookings.filter(booking => booking.review).map((review, idx) => (
-                                        <div key={idx} className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-                                            <div className="flex items-start justify-between mb-3">
-                                                <div>
-                                                    <div className="font-bold text-gray-800">{review.customer}</div>
-                                                    <div className="flex items-center gap-1 mt-1">
-                                                        {[...Array(review.review?.rating || 5)].map((_, i) => (
-                                                            <Star key={i} className="fill-yellow-400 text-yellow-400" size={14} />
-                                                        ))}
-                                                    </div>
-                                                </div>
-                                                <span className="text-sm text-gray-500">{new Date(review.date).toLocaleDateString()}</span>
-                                            </div>
-                                            <p className="text-gray-700">{review.review?.comment || 'No comment provided'}</p>
-                                            <button className="mt-3 text-cyan-600 hover:text-cyan-700 font-semibold text-sm">
-                                                Reply to Review
-                                            </button>
-                                        </div>
-                                    )) : (
-                                        <div className="text-center py-12">
-                                            <div className="text-6xl mb-4">⭐</div>
-                                            <h3 className="text-xl font-bold text-gray-800 mb-2">No Reviews Yet</h3>
-                                            <p className="text-gray-600">Customer reviews will appear here</p>
-                                        </div>
-                                    )}
-                                </div>
-                            </div>
-                        )}
-
-                        {/* Profile Tab */}
-                        {dashboardTab === 'profile' && (
-                            <div className="space-y-6">
-                                <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-                                    <h3 className="text-xl font-bold text-gray-800 mb-4">Business Profile</h3>
-                                    <div className="space-y-4">
-                                        <div>
-                                            <label className="block text-sm font-bold text-gray-700 mb-2">Business Name</label>
-                                            <input
-                                                type="text"
-                                                defaultValue={providerInfo?.businessName || ''}
-                                                className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                            />
-                                        </div>
-                                        <div>
-                                            <label className="block text-sm font-bold text-gray-700 mb-2">Bio</label>
-                                            <textarea
-                                                rows={4}
-                                                defaultValue="Professional mobile auto detailing service with over 5 years of experience. We specialize in premium detailing services."
-                                                className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                            />
-                                        </div>
-                                        <div className="grid grid-cols-2 gap-4">
-                                            <div>
-                                                <label className="block text-sm font-bold text-gray-700 mb-2">Phone</label>
-                                                <input
-                                                    type="tel"
-                                                    defaultValue="(555) 123-4567"
-                                                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                                />
-                                            </div>
-                                            <div>
-                                                <label className="block text-sm font-bold text-gray-700 mb-2">Email</label>
-                                                <input
-                                                    type="email"
-                                                    defaultValue="contact@eliteautospa.com"
-                                                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                                />
-                                            </div>
-                                        </div>
-                                        <button className="bg-cyan-500 hover:bg-cyan-600 text-white px-6 py-3 rounded-lg font-bold transition-colors">
-                                            Save Changes
-                                        </button>
-                                    </div>
-                                </div>
-                            </div>
-                        )}
-                    </div>
-                </div>
-            </div>
-
-            {/* Update Services Modal */}
-            {showUpdateServices && (
-                <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-                    <div className="bg-white rounded-xl max-w-2xl w-full max-h-[90vh] overflow-y-auto">
-                        <div className="p-6">
-                            <div className="flex justify-between items-center mb-6">
-                                <h2 className="text-2xl font-bold text-gray-800">Update Services</h2>
-                                <button
-                                    onClick={() => setShowUpdateServices(false)}
-                                    className="text-gray-500 hover:text-gray-700 text-2xl"
-                                >
-                                    ×
-                                </button>
-                            </div>
-                            <div className="space-y-4">
-                                <div>
-                                    <label className="block text-sm font-semibold text-gray-700 mb-2">Available Services</label>
-                                    <div className="space-y-2">
-                                        {['Car Wash', 'Interior Cleaning', 'Waxing', 'Detailing', 'Paint Correction'].map(service => (
-                                            <label key={service} className="flex items-center">
-                                                <input type="checkbox" className="mr-3" defaultChecked />
-                                                <span className="text-gray-700">{service}</span>
-                                            </label>
-                                        ))}
-                                    </div>
-                                </div>
-                                <div>
-                                    <label className="block text-sm font-semibold text-gray-700 mb-2">Service Pricing</label>
-                                    <div className="grid grid-cols-2 gap-4">
-                                        <div>
-                                            <label className="block text-xs text-gray-600 mb-1">Basic Wash</label>
-                                            <input type="number" placeholder="$25" className="w-full px-3 py-2 border border-gray-300 rounded-lg" />
-                                        </div>
-                                        <div>
-                                            <label className="block text-xs text-gray-600 mb-1">Full Detail</label>
-                                            <input type="number" placeholder="$150" className="w-full px-3 py-2 border border-gray-300 rounded-lg" />
-                                        </div>
-                                    </div>
-                                </div>
-                                <div className="flex gap-3 pt-4">
-                                    <button
-                                        onClick={() => setShowUpdateServices(false)}
-                                        className="flex-1 bg-gray-500 hover:bg-gray-600 text-white py-3 rounded-lg font-semibold transition-colors"
-                                    >
-                                        Cancel
-                                    </button>
-                                    <button
-                                        onClick={() => {
-                                            alert('Services updated successfully!');
-                                            setShowUpdateServices(false);
-                                        }}
-                                        className="flex-1 bg-cyan-500 hover:bg-cyan-600 text-white py-3 rounded-lg font-semibold transition-colors"
-                                    >
-                                        Save Changes
-                                    </button>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            )}
-
-            {/* Block Time Off Modal */}
-            {showBlockTimeOff && (
-                <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-                    <div className="bg-white rounded-xl max-w-2xl w-full max-h-[90vh] overflow-y-auto">
-                        <div className="p-6">
-                            <div className="flex justify-between items-center mb-6">
-                                <h2 className="text-2xl font-bold text-gray-800">Block Time Off</h2>
-                                <button
-                                    onClick={() => setShowBlockTimeOff(false)}
-                                    className="text-gray-500 hover:text-gray-700 text-2xl"
-                                >
-                                    ×
-                                </button>
-                            </div>
-                            <div className="space-y-4">
-                                <div className="grid grid-cols-2 gap-4">
-                                    <div>
-                                        <label className="block text-sm font-semibold text-gray-700 mb-2">Start Date</label>
-                                        <input type="date" className="w-full px-3 py-2 border border-gray-300 rounded-lg" />
-                                    </div>
-                                    <div>
-                                        <label className="block text-sm font-semibold text-gray-700 mb-2">End Date</label>
-                                        <input type="date" className="w-full px-3 py-2 border border-gray-300 rounded-lg" />
-                                    </div>
-                                </div>
-                                <div>
-                                    <label className="block text-sm font-semibold text-gray-700 mb-2">Reason (Optional)</label>
-                                    <textarea
-                                        placeholder="Vacation, personal time, etc."
-                                        className="w-full px-3 py-2 border border-gray-300 rounded-lg h-20 resize-none"
-                                    />
-                                </div>
-                                <div className="flex gap-3 pt-4">
-                                    <button
-                                        onClick={() => setShowBlockTimeOff(false)}
-                                        className="flex-1 bg-gray-500 hover:bg-gray-600 text-white py-3 rounded-lg font-semibold transition-colors"
-                                    >
-                                        Cancel
-                                    </button>
-                                    <button
-                                        onClick={() => {
-                                            alert('Time off blocked successfully!');
-                                            setShowBlockTimeOff(false);
-                                        }}
-                                        className="flex-1 bg-blue-500 hover:bg-blue-600 text-white py-3 rounded-lg font-semibold transition-colors"
-                                    >
-                                        Block Time
-                                    </button>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            )}
-
-            {/* View Messages Modal */}
-            {showMessages && (
-                <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-                    <div className="bg-white rounded-xl max-w-4xl w-full max-h-[90vh] overflow-y-auto">
-                        <div className="p-6">
-                            <div className="flex justify-between items-center mb-6">
-                                <h2 className="text-2xl font-bold text-gray-800">Messages</h2>
-                                <button
-                                    onClick={() => setShowMessages(false)}
-                                    className="text-gray-500 hover:text-gray-700 text-2xl"
-                                >
-                                    ×
-                                </button>
-                            </div>
-                            <div className="space-y-4">
-                                <div className="bg-gray-50 rounded-lg p-4">
-                                    <div className="flex items-center gap-3 mb-2">
-                                        <div className="w-8 h-8 bg-cyan-500 rounded-full flex items-center justify-center text-white font-bold text-sm">
-                                            J
-                                        </div>
-                                        <div>
-                                            <h4 className="font-semibold text-gray-800">John Smith</h4>
-                                            <p className="text-sm text-gray-600">2 hours ago</p>
-                                        </div>
-                                    </div>
-                                    <p className="text-gray-700">Hi! I'm interested in booking a full detail for my car. What's your availability this weekend?</p>
-                                </div>
-                                <div className="bg-gray-50 rounded-lg p-4">
-                                    <div className="flex items-center gap-3 mb-2">
-                                        <div className="w-8 h-8 bg-blue-500 rounded-full flex items-center justify-center text-white font-bold text-sm">
-                                            S
-                                        </div>
-                                        <div>
-                                            <h4 className="font-semibold text-gray-800">Sarah Johnson</h4>
-                                            <p className="text-sm text-gray-600">1 day ago</p>
-                                        </div>
-                                    </div>
-                                    <p className="text-gray-700">Thank you for the excellent service! My car looks amazing. I'll definitely book again.</p>
-                                </div>
-                                <div className="bg-gray-50 rounded-lg p-4">
-                                    <div className="flex items-center gap-3 mb-2">
-                                        <div className="w-8 h-8 bg-green-500 rounded-full flex items-center justify-center text-white font-bold text-sm">
-                                            M
-                                        </div>
-                                        <div>
-                                            <h4 className="font-semibold text-gray-800">Mike Davis</h4>
-                                            <p className="text-sm text-gray-600">3 days ago</p>
-                                        </div>
-                                    </div>
-                                    <p className="text-gray-700">Can you provide a quote for ceramic coating? I have a 2020 BMW M3.</p>
-                                </div>
-                                <div className="flex gap-3 pt-4">
-                                    <button
-                                        onClick={() => setShowMessages(false)}
-                                        className="flex-1 bg-gray-500 hover:bg-gray-600 text-white py-3 rounded-lg font-semibold transition-colors"
-                                    >
-                                        Close
-                                    </button>
-                                    <button
-                                        onClick={() => {
-                                            alert('All messages marked as read!');
-                                        }}
-                                        className="flex-1 bg-purple-500 hover:bg-purple-600 text-white py-3 rounded-lg font-semibold transition-colors"
-                                    >
-                                        Mark All Read
-                                    </button>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            )}
-
-            {/* Edit Service Modal */}
-            {editingService && (
-                <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-                    <div className="bg-white rounded-xl max-w-2xl w-full max-h-[90vh] overflow-y-auto">
-                        <div className="p-6">
-                            <div className="flex justify-between items-center mb-6">
-                                <h2 className="text-2xl font-bold text-gray-800">Edit Service</h2>
-                                <button
-                                    onClick={() => setEditingService(null)}
-                                    className="text-gray-500 hover:text-gray-700 text-2xl"
-                                >
-                                    ×
-                                </button>
-                            </div>
-                            <div className="space-y-4">
-                                <div>
-                                    <label className="block text-sm font-semibold text-gray-700 mb-2">Service Name</label>
-                                    <input
-                                        type="text"
-                                        defaultValue={editingService.name}
-                                        className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                        onChange={(e) => setEditingService({ ...editingService, name: e.target.value })}
-                                    />
-                                </div>
-                                <div className="grid grid-cols-2 gap-4">
-                                    <div>
-                                        <label className="block text-sm font-semibold text-gray-700 mb-2">Price ($)</label>
-                                        <input
-                                            type="number"
-                                            defaultValue={editingService.price}
-                                            className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                            onChange={(e) => setEditingService({ ...editingService, price: parseInt(e.target.value) })}
-                                        />
-                                    </div>
-                                    <div>
-                                        <label className="block text-sm font-semibold text-gray-700 mb-2">Duration</label>
-                                        <input
-                                            type="text"
-                                            defaultValue={editingService.duration}
-                                            placeholder="e.g., 2 hours"
-                                            className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                            onChange={(e) => setEditingService({ ...editingService, duration: e.target.value })}
-                                        />
-                                    </div>
-                                </div>
-                                <div className="flex items-center">
-                                    <input
-                                        type="checkbox"
-                                        id="active"
-                                        checked={editingService.active}
-                                        onChange={(e) => setEditingService({ ...editingService, active: e.target.checked })}
-                                        className="mr-3"
-                                    />
-                                    <label htmlFor="active" className="text-sm font-semibold text-gray-700">Service is active</label>
-                                </div>
-                                <div className="flex gap-3 pt-4">
-                                    <button
-                                        onClick={() => setEditingService(null)}
-                                        className="flex-1 bg-gray-500 hover:bg-gray-600 text-white py-3 rounded-lg font-semibold transition-colors"
-                                    >
-                                        Cancel
-                                    </button>
-                                    <button
-                                        onClick={() => {
-                                            saveServiceEdit(editingService);
-                                            alert('Service updated successfully!');
-                                        }}
-                                        className="flex-1 bg-cyan-500 hover:bg-cyan-600 text-white py-3 rounded-lg font-semibold transition-colors"
-                                    >
-                                        Save Changes
-                                    </button>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            )}
-
-            {/* Add Service Modal */}
-            {showAddService && (
-                <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-                    <div className="bg-white rounded-xl max-w-2xl w-full max-h-[90vh] overflow-y-auto">
-                        <div className="p-6">
-                            <div className="flex justify-between items-center mb-6">
-                                <h2 className="text-2xl font-bold text-gray-800">Add New Service</h2>
-                                <button
-                                    onClick={() => setShowAddService(false)}
-                                    className="text-gray-500 hover:text-gray-700 text-2xl"
-                                >
-                                    ×
-                                </button>
-                            </div>
-                            <div className="space-y-4">
-                                <div>
-                                    <label className="block text-sm font-semibold text-gray-700 mb-2">Service Name</label>
-                                    <input
-                                        type="text"
-                                        placeholder="e.g., Premium Detailing"
-                                        className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                        id="newServiceName"
-                                    />
-                                </div>
-                                <div className="grid grid-cols-2 gap-4">
-                                    <div>
-                                        <label className="block text-sm font-semibold text-gray-700 mb-2">Price ($)</label>
-                                        <input
-                                            type="number"
-                                            placeholder="150"
-                                            className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                            id="newServicePrice"
-                                        />
-                                    </div>
-                                    <div>
-                                        <label className="block text-sm font-semibold text-gray-700 mb-2">Duration</label>
-                                        <input
-                                            type="text"
-                                            placeholder="e.g., 3 hours"
-                                            className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                            id="newServiceDuration"
-                                        />
-                                    </div>
-                                </div>
-                                <div className="flex items-center">
-                                    <input
-                                        type="checkbox"
-                                        id="newServiceActive"
-                                        defaultChecked
-                                        className="mr-3"
-                                    />
-                                    <label htmlFor="newServiceActive" className="text-sm font-semibold text-gray-700">Service is active</label>
-                                </div>
-                                <div className="flex gap-3 pt-4">
-                                    <button
-                                        onClick={() => setShowAddService(false)}
-                                        className="flex-1 bg-gray-500 hover:bg-gray-600 text-white py-3 rounded-lg font-semibold transition-colors"
-                                    >
-                                        Cancel
-                                    </button>
-                                    <button
-                                        onClick={() => {
-                                            const name = document.getElementById('newServiceName').value;
-                                            const price = parseInt(document.getElementById('newServicePrice').value);
-                                            const duration = document.getElementById('newServiceDuration').value;
-                                            const active = document.getElementById('newServiceActive').checked;
-
-                                            if (!name || !price || !duration) {
-                                                alert('Please fill in all required fields.');
-                                                return;
-                                            }
-
-                                            addNewService({ name, price, duration, active });
-                                            alert('Service added successfully!');
-                                        }}
-                                        className="flex-1 bg-cyan-500 hover:bg-cyan-600 text-white py-3 rounded-lg font-semibold transition-colors"
-                                    >
-                                        Add Service
-                                    </button>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            )}
-        </>
-    );
-});
-
-
-const BRNNOMarketplace = () => {
-    const [selectedArea, setSelectedArea] = useState('All Areas');
-    const [selectedType, setSelectedType] = useState('All Types');
-    const [activeFilters, setActiveFilters] = useState([]);
-    const [userLocation, setUserLocation] = useState(null);
-    const [locationLoading, setLocationLoading] = useState(false);
-    const [showLoginModal, setShowLoginModal] = useState(false);
-    const [showSignupModal, setShowSignupModal] = useState(false);
-    const [showProfilePanel, setShowProfilePanel] = useState(false);
-    const [showBookingModal, setShowBookingModal] = useState(false);
-    const [authMode, setAuthMode] = useState('customer');
-    const [profileTab, setProfileTab] = useState('personal');
-    const [bookingStep, setBookingStep] = useState(1);
-    const [bookingData, setBookingData] = useState({
-        service: null,
-        date: '',
-        time: '',
-        vehicle: null,
-        address: ''
+    // Form data
+    const [address, setAddress] = useState('');
+    const [answers, setAnswers] = useState({
+        vehicleType: '',
+        serviceType: '',
+        timeSlot: ''
     });
-    const [showProviderModal, setShowProviderModal] = useState(false);
-    const [providerStep, setProviderStep] = useState(1); // 1-5 steps
-    const [providerData, setProviderData] = useState({
+    const [signupData, setSignupData] = useState({
+        name: '',
+        email: '',
+        password: '',
+        accountType: 'customer'
+    });
+
+    // Provider onboarding form state
+    const [providerOnboardingData, setProviderOnboardingData] = useState({
         businessName: '',
-        businessType: '',
-        ein: '',
-        ownerName: '',
-        phone: '',
-        email: '',
-        services: [],
-        insurance: null,
-        certifications: [],
+        businessAddress: '',
         serviceArea: '',
-        portfolio: [],
-        bankAccount: '',
-        routingNumber: '',
-        bankAccountHolder: '',
-        backgroundCheck: false,
-        skipPayment: false,
-        skipInsurance: false,
-        image: ''
+        phone: '',
+        email: ''
     });
-    const [selectedProvider, setSelectedProvider] = useState(null);
-    const [showProviderDetail, setShowProviderDetail] = useState(false);
-    const [showMobileMenu, setShowMobileMenu] = useState(false);
-    const [showProviderDashboard, setShowProviderDashboard] = useState(false);
-    const [showReviewModal, setShowReviewModal] = useState(false);
-    const [reviewData, setReviewData] = useState({
-        rating: 5,
-        comment: '',
-        providerId: null
-    });
-    const [userVehicles, setUserVehicles] = useState([]);
-    const [showAddVehicle, setShowAddVehicle] = useState(false);
-    const [newVehicle, setNewVehicle] = useState({
-        make: '',
-        model: '',
-        year: '',
-        color: '',
-        licensePlate: ''
-    });
-    const [dashboardTab, setDashboardTab] = useState('overview'); // overview, bookings, services, calendar, earnings, reviews, profile
-    const [showAdminDashboard, setShowAdminDashboard] = useState(false);
-    const [isAdmin, setIsAdmin] = useState(false);
 
-    // Authentication state
-    const [user, setUser] = useState(null);
-    const [userData, setUserData] = useState(null);
-    const [authLoading, setAuthLoading] = useState(true);
+    // Reference for address input and autocomplete
+    const addressInputRef = React.useRef(null);
+    const autocompleteRef = React.useRef(null);
 
-    // Real providers from Firebase
-    const [realProviders, setRealProviders] = useState([]);
-    const [providersLoading, setProvidersLoading] = useState(true);
-    const [refreshProviders, setRefreshProviders] = useState(0);
+    // Track when Google Maps JS API is loaded
+    const [googleMapsLoaded, setGoogleMapsLoaded] = useState(false);
 
-    // Function to refresh provider data
-    const triggerProviderRefresh = () => {
-        setRefreshProviders(prev => prev + 1);
-    };
+    // Marketplace data
+    const [selectedDetailer, setSelectedDetailer] = useState(null);
+    const [detailers, setDetailers] = useState([]);
 
-    // Authentication state listener
-    React.useEffect(() => {
-        // First, handle Google redirect result (for environments blocking popups)
+    // Filter and sort detailers based on search query, distance filter, and sort option
+    const filteredDetailers = React.useMemo(() => {
+        let filtered = [...detailers];
+
+        // Search filter (by service area/city)
+        if (searchQuery.trim()) {
+            filtered = filtered.filter(d =>
+                d.serviceArea?.toLowerCase().includes(searchQuery.toLowerCase()) ||
+                d.name?.toLowerCase().includes(searchQuery.toLowerCase())
+            );
+        }
+
+        // Distance filter
+        if (distanceFilter < 999) {
+            filtered = filtered.filter(d => d.distance <= distanceFilter);
+        }
+
+        // Sort
+        switch (sortBy) {
+            case 'distance':
+                filtered.sort((a, b) => a.distance - b.distance);
+                break;
+            case 'price':
+                filtered.sort((a, b) => a.price - b.price);
+                break;
+            case 'rating':
+                filtered.sort((a, b) => b.rating - a.rating);
+                break;
+            case 'reviews':
+                filtered.sort((a, b) => b.reviews - a.reviews);
+                break;
+            default:
+                // Default to distance
+                filtered.sort((a, b) => a.distance - b.distance);
+        }
+
+        return filtered;
+    }, [detailers, searchQuery, distanceFilter, sortBy]);
+
+    // Load Google Maps script once and set loaded flag
+    useEffect(() => {
+        let isActive = true;
         (async () => {
             try {
-                const redirectResult = await getRedirectResult(auth);
-                if (redirectResult && redirectResult.user) {
-                    const user = redirectResult.user;
-                    // Ensure user doc exists
-                    const userDoc = await getDoc(doc(db, 'users', user.uid));
-                    if (!userDoc.exists()) {
-                        await setDoc(doc(db, 'users', user.uid), {
-                            uid: user.uid,
-                            email: user.email,
-                            displayName: user.displayName || '',
-                            accountType: 'customer',
-                            createdAt: serverTimestamp(),
-                            role: 'user'
-                        });
-                    }
+                await loadGoogleMapsApi();
+                if (isActive) {
+                    setGoogleMapsLoaded(true);
                 }
             } catch (e) {
-                console.error('Google redirect handling error:', e);
+                console.error('Failed to load Google Maps:', e);
             }
         })();
+        return () => { isActive = false; };
+    }, []);
 
-        const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
-            setAuthLoading(false);
-            if (firebaseUser) {
-                setUser(firebaseUser);
-                try {
-                    // Load user data from Firestore
-                    const userDoc = await getDoc(doc(db, 'users', firebaseUser.uid));
-                    if (userDoc.exists()) {
-                        setUserData(userDoc.data());
+    // Initialize Google Places Autocomplete on the address input (for both address and provider onboarding modals)
+    useEffect(() => {
+        if ((modalType !== 'address' && modalType !== 'providerOnboarding') || !googleMapsLoaded) return;
+
+        let listener = null;
+        try {
+            if (!addressInputRef.current || !window.google?.maps?.places) return;
+
+            const ac = new window.google.maps.places.Autocomplete(addressInputRef.current, {
+                componentRestrictions: { country: 'us' },
+                fields: ['formatted_address', 'geometry', 'address_components']
+            });
+            autocompleteRef.current = ac;
+
+            listener = ac.addListener('place_changed', () => {
+                const place = ac.getPlace();
+                if (place?.formatted_address) {
+                    const formattedAddr = place.formatted_address;
+                    // Get full coordinate details from Places API (includes city, state, zip)
+                    const byType = (type) => place.address_components?.find(c => c.types.includes(type));
+                    const coords = place.geometry ? {
+                        lat: place.geometry.location.lat(),
+                        lng: place.geometry.location.lng(),
+                        formattedAddress: formattedAddr,
+                        city: byType('locality')?.long_name || '',
+                        state: byType('administrative_area_level_1')?.short_name || '',
+                        zip: byType('postal_code')?.long_name || ''
+                    } : null;
+
+                    // Update based on which modal is open
+                    if (modalType === 'providerOnboarding') {
+                        setProviderOnboardingData(prev => ({
+                            ...prev,
+                            businessAddress: formattedAddr
+                        }));
+                        if (coords) {
+                            setUserCoordinates(coords);
+                        }
                     } else {
-                        // Create user document if it doesn't exist
-                        await setDoc(doc(db, 'users', firebaseUser.uid), {
-                            uid: firebaseUser.uid,
-                            email: firebaseUser.email,
-                            displayName: firebaseUser.displayName || '',
-                            accountType: 'customer',
+                        // Address modal
+                        setAddress(formattedAddr);
+                        if (coords) {
+                            setUserCoordinates(coords);
+                        }
+                    }
+                }
+            });
+        } catch (e) {
+            console.error('Autocomplete init failed:', e);
+        }
+
+        return () => {
+            if (listener && listener.remove) listener.remove();
+            autocompleteRef.current = null;
+        };
+    }, [modalType, googleMapsLoaded]); // Don't include providerOnboardingData to avoid recreating autocomplete
+
+    // Profile dropdown
+    const [showProfileDropdown, setShowProfileDropdown] = useState(false);
+
+    // Questions removed - users go directly from address to signup
+
+    // ==================== CLEAR ORPHANED SESSIONS ON LOAD ====================
+    // Check and clear any orphaned Firebase Auth sessions on page load
+    useEffect(() => {
+        const checkAndClearOrphanedSession = async () => {
+            try {
+                const currentAuthUser = auth.currentUser;
+                if (currentAuthUser) {
+                    // Check both customer and detailer collections
+                    const customerDoc = await getDoc(doc(db, 'customer', currentAuthUser.uid));
+                    const detailerDoc = await getDoc(doc(db, 'detailer', currentAuthUser.uid));
+
+                    if (!customerDoc.exists() && !detailerDoc.exists()) {
+                        // Clear Firebase Auth storage
+                        try {
+                            if (window.indexedDB) {
+                                indexedDB.deleteDatabase('firebaseLocalStorageDb');
+                            }
+                            Object.keys(localStorage).forEach(key => {
+                                if (key.startsWith('firebase:authUser:')) {
+                                    localStorage.removeItem(key);
+                                }
+                            });
+                        } catch (e) {
+                            console.warn('Could not clear storage:', e);
+                        }
+                        // Sign out
+                        await signOut(auth);
+                    }
+                }
+            } catch (error) {
+                console.error('Error checking orphaned session:', error);
+            }
+        };
+
+        // Run check after a short delay to ensure Firebase is initialized
+        const timeout = setTimeout(checkAndClearOrphanedSession, 500);
+        return () => clearTimeout(timeout);
+    }, []);
+
+    // ==================== AUTH LISTENER ====================
+    useEffect(() => {
+        let isSigningOut = false; // Flag to prevent infinite loop
+
+        const unsubscribe = onAuthStateChanged(auth, async (user) => {
+            // Prevent infinite loop if we're already signing out
+            if (isSigningOut) {
+                return;
+            }
+            if (user) {
+                try {
+                    // 1. Check if they exist as a CUSTOMER
+                    const customerRef = doc(db, 'customer', user.uid);
+                    const customerDoc = await getDoc(customerRef);
+
+                    // 2. Check if they exist as a DETAILER
+                    const detailerRef = doc(db, 'detailer', user.uid);
+                    const detailerDoc = await getDoc(detailerRef);
+
+                    // 3. Check if they are a NEW USER
+                    if (!customerDoc.exists() && !detailerDoc.exists()) {
+                        // This is a BRAND NEW user. They don't exist in either collection.
+
+                        // 4. Get the role we saved from the button click
+                        const role = localStorage.getItem('pendingUserRole') || 'customer'; // Default to 'customer'
+
+                        // 5. IMPORTANT: Clear the note
+                        localStorage.removeItem('pendingUserRole');
+
+                        // 6. Set flag to prevent auth listener from signing out during creation
+                        isCreatingAccountRef.current = true;
+
+                        // 7. Create their document in the correct collection
+                        const userData = {
+                            uid: user.uid,
+                            email: user.email,
+                            displayName: user.displayName,
+                            photoURL: user.photoURL,
                             createdAt: serverTimestamp(),
-                            role: 'user'
-                        });
-                        setUserData({
-                            uid: firebaseUser.uid,
-                            email: firebaseUser.email,
-                            displayName: firebaseUser.displayName || '',
-                            accountType: 'customer',
-                            role: 'user'
-                        });
+                        };
+
+                        if (role === 'detailer') {
+                            // Create a new DETAILER document
+                            await setDoc(detailerRef, {
+                                ...userData,
+                                businessName: user.displayName || 'New Business',
+                                businessAddress: '',
+                                serviceArea: '',
+                                phone: '',
+                                services: [],
+                                offeredPackages: [],
+                                addOns: [],
+                                packagePrices: {},
+                                defaultAvailability: {
+                                    monday: { enabled: false, start: '09:00', end: '17:00' },
+                                    tuesday: { enabled: false, start: '09:00', end: '17:00' },
+                                    wednesday: { enabled: false, start: '09:00', end: '17:00' },
+                                    thursday: { enabled: false, start: '09:00', end: '17:00' },
+                                    friday: { enabled: false, start: '09:00', end: '17:00' },
+                                    saturday: { enabled: false, start: '09:00', end: '17:00' },
+                                    sunday: { enabled: false, start: '09:00', end: '17:00' }
+                                },
+                                dateOverrides: {},
+                                rating: 0,
+                                reviewCount: 0,
+                                employeeCount: 1,
+                                backgroundCheck: false,
+                                status: 'pending',
+                                onboarded: false
+                            });
+
+                            // Set user info and route to detailer onboarding
+                            const userInfo = {
+                                uid: user.uid,
+                                email: user.email,
+                                name: user.displayName || user.email.split('@')[0],
+                                photoURL: user.photoURL,
+                                initials: getInitials(user.displayName || user.email)
+                            };
+                            setCurrentUser(userInfo);
+                            setUserAccountType('detailer');
+                            setIsProvider(true);
+                            setCurrentPage('landing');
+                            setProviderOnboardingData({
+                                businessName: '',
+                                businessAddress: '',
+                                serviceArea: '',
+                                phone: '',
+                                email: user.email || ''
+                            });
+                            setModalType('providerOnboarding');
+
+                            // Clear the flag after a delay
+                            setTimeout(() => {
+                                isCreatingAccountRef.current = false;
+                            }, 3000);
+                        } else {
+                            // Create a new CUSTOMER document
+                            await setDoc(customerRef, {
+                                ...userData,
+                                savedAddresses: [],
+                                favoriteProviders: [],
+                                address: '',
+                                coordinates: null,
+                                preferences: {},
+                                onboarded: false
+                            });
+
+                            // Set user info and route to address modal
+                            const userInfo = {
+                                uid: user.uid,
+                                email: user.email,
+                                name: user.displayName || user.email.split('@')[0],
+                                photoURL: user.photoURL,
+                                initials: getInitials(user.displayName || user.email)
+                            };
+                            setCurrentUser(userInfo);
+                            setUserAccountType('customer');
+                            setIsProvider(false);
+                            setCurrentPage('landing');
+                            setModalType('address');
+
+                            // Clear the flag after a delay
+                            setTimeout(() => {
+                                isCreatingAccountRef.current = false;
+                            }, 3000);
+                        }
+                    } else {
+                        // This is an EXISTING user.
+                        const userInfo = {
+                            uid: user.uid,
+                            email: user.email,
+                            name: user.displayName || user.email.split('@')[0],
+                            photoURL: user.photoURL,
+                            initials: getInitials(user.displayName || user.email)
+                        };
+                        setCurrentUser(userInfo);
+
+                        if (customerDoc.exists()) {
+                            setUserAccountType('customer');
+                            setIsProvider(false);
+                            // Check onboarding will handle routing
+                            if (!isCreatingAccountRef.current) {
+                                await checkUserOnboarding(user.uid, 'customer');
+                            }
+                        } else if (detailerDoc.exists()) {
+                            setUserAccountType('detailer');
+                            setIsProvider(true);
+                            // Check onboarding will handle routing
+                            if (!isCreatingAccountRef.current) {
+                                await checkUserOnboarding(user.uid, 'detailer');
+                            }
+                        }
                     }
                 } catch (error) {
-                    console.error('Error loading user data:', error);
+                    console.error('❌ Error checking user documents on auth:', error);
+                    // Set flag to prevent loop
+                    isSigningOut = true;
+                    // If we can't check, sign out to be safe
+                    await signOut(auth);
+                    setCurrentUser(null);
+                    setUserAccountType(null);
+                    setIsProvider(false);
+                    setCurrentPage('landing');
+                    setLoading(false);
+                    // Reset flag after a delay
+                    setTimeout(() => { isSigningOut = false; }, 2000);
+                    return;
                 }
             } else {
-                setUser(null);
-                setUserData(null);
+                // User is not logged in - show landing page
+                setCurrentUser(null);
+                setUserAccountType(null);
+                setIsProvider(false);
+                setCurrentPage('landing');
             }
+            setLoading(false);
         });
 
         return () => unsubscribe();
     }, []);
 
-    // Load real providers from Firebase
-    React.useEffect(() => {
-        const loadProviders = async () => {
-            try {
-                setProvidersLoading(true);
-
-                // First, let's see what's actually in the providers collection
-                const allProvidersQuery = query(collection(db, 'providers'));
-                const allProvidersSnapshot = await getDocs(allProvidersQuery);
-                console.log('All providers in collection:', allProvidersSnapshot.size);
-                allProvidersSnapshot.forEach((doc) => {
-                    console.log('Provider doc:', doc.id, doc.data());
-                    console.log('Status field:', doc.data().status);
-                });
-
-                // Try without status filter first to see all providers
-                const providersQuery = query(collection(db, 'providers'));
-                const providersSnapshot = await getDocs(providersQuery);
-                const providers = [];
-
-                // Load providers and their services
-                for (const providerDoc of providersSnapshot.docs) {
-                    const data = providerDoc.data();
-
-                    // Get services from providers collection (publicly accessible)
-                    const activeServices = data.services ? data.services.filter(service => service.active === true) : [];
-                    console.log(`Provider ${data.businessName} services:`, data.services);
-                    console.log(`Active services for ${data.businessName}:`, activeServices);
-
-                    providers.push({
-                        id: providerDoc.id,
-                        name: data.businessName || 'Unknown Business',
-                        provider: data.businessName || 'Unknown Business',
-                        rating: 4.8, // Default rating for new providers
-                        reviews: 0, // New providers start with 0 reviews
-                        tags: activeServices.map(service => service.name), // Only show active service names
-                        description: `Professional mobile detailing service by ${data.businessName}`,
-                        startingPrice: activeServices.length > 0 ? Math.min(...activeServices.map(s => s.price)) : 120, // Use lowest active service price
-                        certified: data.backgroundCheck || false,
-                        image: data.image || "/BRNNO_logov3.jpg", // Use custom image or BRNNO logo as default
-                        serviceArea: data.serviceArea || 'Local Area',
-                        phone: data.phone || '',
-                        email: data.email || '',
-                        services: activeServices, // Include full service data
-                        ...data
-                    });
-                }
-
-                setRealProviders(providers);
-                console.log('Loaded providers:', providers);
-                console.log('Number of providers found:', providers.length);
-                console.log('Provider query status:', providersQuery);
-                console.log('Provider data structure:', providers.length > 0 ? providers[0] : 'No providers found');
-
-                // Debug each provider's services
-                providers.forEach(provider => {
-                    console.log(`Provider ${provider.name} final data:`, {
-                        tags: provider.tags,
-                        services: provider.services,
-                        startingPrice: provider.startingPrice
-                    });
-                });
-            } catch (error) {
-                console.error('Error loading providers:', error);
-            } finally {
-                setProvidersLoading(false);
-            }
-        };
-
-        loadProviders();
-    }, [refreshProviders]);
-
-    // Admin access with authentication
-    React.useEffect(() => {
-        const params = new URLSearchParams(window.location.search);
-
-        if (params.get('admin') === 'brnno2025') {
-            if (user && userData && userData.role === 'admin') {
-                console.log('Admin access granted');
-                setShowAdminDashboard(true);
-                setIsAdmin(true);
-            } else if (user && userData && userData.role !== 'admin') {
-                console.log('Access denied - not admin');
-                alert('Access denied. Admin privileges required.');
-                setShowAdminDashboard(false);
-                setIsAdmin(false);
-            } else if (!user) {
-                console.log('User not logged in - showing login modal');
-                alert('Please log in first to access admin dashboard');
-                setShowLoginModal(true);
-            }
-        }
-    }, [user, userData]);
-
-    // Use only real providers from Firebase
-    const services = realProviders;
-
-    const toggleFilter = (filter) => {
-        setActiveFilters(prev =>
-            prev.includes(filter)
-                ? prev.filter(f => f !== filter)
-                : [...prev, filter]
-        );
-    };
-
-    // Submit a review
-    const handleSubmitReview = async () => {
-        if (!auth.currentUser) {
-            alert('Please sign in to submit a review.');
-            return;
-        }
-
-        if (!reviewData.comment.trim()) {
-            alert('Please write a review comment.');
-            return;
-        }
-
-        try {
-            const review = {
-                providerId: reviewData.providerId,
-                customerId: auth.currentUser.uid,
-                customerName: userData?.firstName ? `${userData.firstName} ${userData.lastName}` : 'Anonymous',
-                rating: reviewData.rating,
-                comment: reviewData.comment.trim(),
-                createdAt: serverTimestamp(),
-                verified: false // Could be set to true if verified through booking system
-            };
-
-            // Save review to Firebase
-            await addDoc(collection(db, 'reviews'), review);
-
-            // Update provider's average rating
-            await updateProviderRating(reviewData.providerId);
-
-            alert('Review submitted successfully! Thank you for your feedback.');
-            setShowReviewModal(false);
-            setReviewData({ rating: 5, comment: '', providerId: null });
-
-        } catch (error) {
-            console.error('Error submitting review:', error);
-            alert('Failed to submit review. Please try again.');
-        }
-    };
-
-    // Update provider's average rating
-    const updateProviderRating = async (providerId) => {
-        try {
-            // Get all reviews for this provider
-            const reviewsQuery = query(
-                collection(db, 'reviews'),
-                where('providerId', '==', providerId)
-            );
-            const reviewsSnapshot = await getDocs(reviewsQuery);
-
-            let totalRating = 0;
-            let reviewCount = 0;
-
-            reviewsSnapshot.forEach(doc => {
-                const data = doc.data();
-                totalRating += data.rating;
-                reviewCount++;
-            });
-
-            const averageRating = reviewCount > 0 ? totalRating / reviewCount : 0;
-
-            // Update provider document
-            await updateDoc(doc(db, 'providers', providerId), {
-                rating: Math.round(averageRating * 10) / 10, // Round to 1 decimal
-                reviewCount: reviewCount
-            });
-
-            // Also update user document if they have provider info
-            const userQuery = query(
-                collection(db, 'users'),
-                where('accountType', '==', 'provider'),
-                where('businessName', '!=', null)
-            );
-            const userSnapshot = await getDocs(userQuery);
-
-            userSnapshot.forEach(async (userDoc) => {
-                const userData = userDoc.data();
-                if (userData.businessName) {
-                    await updateDoc(doc(db, 'users', userDoc.id), {
-                        rating: Math.round(averageRating * 10) / 10,
-                        reviewCount: reviewCount
-                    });
-                }
-            });
-
-        } catch (error) {
-            console.error('Error updating provider rating:', error);
-        }
-    };
-
-    // Load user vehicles
-    const loadUserVehicles = async () => {
-        if (!auth.currentUser) return;
-
-        try {
-            const vehiclesQuery = query(
-                collection(db, 'vehicles'),
-                where('userId', '==', auth.currentUser.uid)
-            );
-            const vehiclesSnapshot = await getDocs(vehiclesQuery);
-            const vehicles = [];
-
-            vehiclesSnapshot.forEach((doc) => {
-                vehicles.push({
-                    id: doc.id,
-                    ...doc.data()
-                });
-            });
-
-            setUserVehicles(vehicles);
-            console.log('Loaded user vehicles:', vehicles);
-        } catch (error) {
-            console.error('Error loading vehicles:', error);
-        }
-    };
-
-    // Add new vehicle
-    const handleAddVehicle = async () => {
-        if (!auth.currentUser) {
-            alert('Please sign in to add a vehicle.');
-            return;
-        }
-
-        if (!newVehicle.make || !newVehicle.model || !newVehicle.year) {
-            alert('Please fill in make, model, and year.');
-            return;
-        }
-
-        try {
-            const vehicleData = {
-                ...newVehicle,
-                userId: auth.currentUser.uid,
-                createdAt: serverTimestamp()
-            };
-
-            await addDoc(collection(db, 'vehicles'), vehicleData);
-
-            // Reload vehicles
-            await loadUserVehicles();
-
-            // Reset form
-            setNewVehicle({
-                make: '',
-                model: '',
-                year: '',
-                color: '',
-                licensePlate: ''
-            });
-            setShowAddVehicle(false);
-
-            alert('Vehicle added successfully!');
-        } catch (error) {
-            console.error('Error adding vehicle:', error);
-            alert('Failed to add vehicle. Please try again.');
-        }
-    };
-
-    // Initialize Google Maps API
-    React.useEffect(() => {
-        const initializeLocation = async () => {
-            try {
-                // Try to get API key from window object or use fallback
-                const API_KEY = config.googleMapsApiKey;
-
-                if (!API_KEY) {
-                    console.log('Google Maps API key not configured. Using fallback location service.');
-                    return;
-                }
-
-                await locationService.initialize(API_KEY);
-                console.log('Google Maps API initialized for location services');
-            } catch (error) {
-                console.error('Failed to initialize location service:', error);
-                console.log('Using fallback location service');
-            }
-        };
-
-        initializeLocation();
+    // ==================== AUTO-INITIALIZE PACKAGES ====================
+    useEffect(() => {
+        // Auto-create packages if they don't exist (runs once on app load)
+        initializePackagesIfEmpty().catch(error => {
+            console.error('Failed to auto-initialize packages:', error);
+        });
     }, []);
 
-    // Load user vehicles when authenticated
-    React.useEffect(() => {
-        const loadVehicles = async () => {
-            if (!auth.currentUser) {
-                console.log('No user authenticated');
+    // Check if returning user has already completed onboarding
+    async function checkUserOnboarding(uid, role) {
+        try {
+            // Determine which collection to check based on role
+            const collectionName = role === 'detailer' ? 'detailer' : 'customer';
+            const userDocRef = doc(db, collectionName, uid);
+
+            let userDoc;
+            try {
+                userDoc = await getDoc(userDocRef);
+            } catch (docError) {
+                console.error('❌ Error reading user document:', docError);
+                console.error('Document read error details:', {
+                    code: docError.code,
+                    message: docError.message,
+                    stack: docError.stack
+                });
+                throw docError;
+            }
+
+            if (!userDoc.exists()) {
+                // User is authenticated but has no Firestore document - sign them out
+                // This happens when Firebase Auth session exists but Firestore document was deleted
+                await signOut(auth);
+                setCurrentPage('landing');
+                setCurrentUser(null);
+                setUserAccountType(null);
+                setIsProvider(false);
                 return;
             }
 
-            try {
-                const vehiclesQuery = query(
-                    collection(db, 'vehicles'),
-                    where('userId', '==', auth.currentUser.uid)
-                );
-                const vehiclesSnapshot = await getDocs(vehiclesQuery);
-                const vehicles = [];
+            const userData = userDoc.data();
 
-                vehiclesSnapshot.forEach((doc) => {
-                    vehicles.push({
-                        id: doc.id,
-                        ...doc.data()
-                    });
+            if (role === 'detailer') {
+                // Detailer/Provider flow
+                setIsProvider(true);
+                setAddress(
+                    userData.businessAddress ||
+                    userData.serviceArea ||
+                    ''
+                );
+                setUserCoordinates(userData.coordinates || null);
+                setAnswers({
+                    vehicleType: userData.vehicleSpecialty || 'All Vehicles',
+                    serviceType: userData.primaryService || 'Multiple Services',
+                    timeSlot: 'Flexible'
                 });
 
-                setUserVehicles(vehicles);
-                console.log('Loaded user vehicles:', vehicles);
-            } catch (error) {
-                console.error('Error loading vehicles:', error);
+                // Check if detailer needs to complete onboarding
+                if (!userData.onboarded || !userData.businessName || !userData.businessAddress) {
+                    setCurrentPage('landing');
+                    setModalType('providerOnboarding');
+                    return;
+                }
+
+                setCurrentPage('dashboard');
+            } else {
+                // Customer flow
+                setIsProvider(false);
+
+                // Customers - check if they have an address
+                if (userData.address || userData.coordinates) {
+                    setAddress(userData.coordinates?.formattedAddress || userData.address || '');
+                    setUserCoordinates(userData.coordinates || null);
+                    setAnswers({
+                        vehicleType: userData.preferences?.vehicleType || 'Sedan',
+                        serviceType: userData.preferences?.serviceType || 'Full Detail',
+                        timeSlot: userData.preferences?.timeSlot || 'Flexible'
+                    });
+
+                    setCurrentPage('marketplace');
+                } else {
+                    // Customer exists but needs to enter address - show address modal
+                    setCurrentPage('landing');
+                    setModalType('address');
+                }
             }
-        };
-
-        loadVehicles();
-    }, [auth.currentUser?.uid]); // Changed: Only depend on UID, not user object
-
-    // Get user's current location (simplified version)
-    const getUserLocation = async () => {
-        if (!navigator.geolocation) {
-            alert('Geolocation is not supported by this browser.');
-            return;
-        }
-
-        setLocationLoading(true);
-        try {
-            const position = await new Promise((resolve, reject) => {
-                navigator.geolocation.getCurrentPosition(resolve, reject);
+        } catch (error) {
+            console.error('❌ Error checking user onboarding:', error);
+            console.error('Onboarding error details:', {
+                code: error.code,
+                message: error.message,
+                stack: error.stack,
+                name: error.name
+            });
+            console.error('🔐 Auth state at error:', {
+                isAuthenticated: !!auth.currentUser,
+                uid: auth.currentUser?.uid,
+                email: auth.currentUser?.email
             });
 
-            const userCoords = {
-                lat: position.coords.latitude,
-                lng: position.coords.longitude
+            if (error.code === 'permission-denied') {
+                console.error('🚨 PERMISSION DENIED when reading own user document!');
+                console.error('This suggests Firestore rules may not be deployed or are incorrect.');
+                console.error('Please deploy the updated firestore.rules file to Firebase Console.');
+            }
+
+            // On error, default to landing page
+            setCurrentPage('landing');
+        }
+    }
+
+    // Load detailers when marketplace opens (and when coordinates become available)
+    useEffect(() => {
+        if (currentPage === 'marketplace') {
+            // Always reload when navigating to marketplace to get latest data
+            // Use a small delay to ensure Firebase is ready
+            const loadTimeout = setTimeout(() => {
+                loadDetailers().catch(error => {
+                    console.error('Error loading detailers:', error);
+                });
+            }, 100);
+
+            return () => clearTimeout(loadTimeout);
+        }
+    }, [currentPage, userCoordinates]);
+
+    // Real-time listener for provider updates - reloads detailers when providers change
+    useEffect(() => {
+        if (currentPage === 'marketplace') {
+            let isInitialLoad = true;
+            let loadTimeout = null;
+
+            // Listen for changes to users collection (providers) - unified structure
+
+            const unsubscribe = onSnapshot(
+                query(collection(db, 'detailer')),
+                async (snapshot) => {
+                    // Skip the initial load - let the manual loadDetailers() handle it
+                    if (isInitialLoad) {
+                        isInitialLoad = false;
+                        return;
+                    }
+
+                    // Debounce rapid updates
+                    if (loadTimeout) {
+                        clearTimeout(loadTimeout);
+                    }
+
+                    loadTimeout = setTimeout(async () => {
+                        try {
+                            await loadDetailers();
+                        } catch (error) {
+                            console.error('❌ Error reloading detailers from listener:', error);
+                            console.error('Error details:', {
+                                code: error.code,
+                                message: error.message,
+                                stack: error.stack
+                            });
+                        }
+                    }, 500); // Wait 500ms before reloading
+                },
+                (error) => {
+                    console.error('❌ Error in real-time listener:', error);
+                    console.error('Listener error details:', {
+                        code: error.code,
+                        message: error.message,
+                        stack: error.stack,
+                        name: error.name
+                    });
+                    console.error('🔐 Auth state at listener error:', {
+                        isAuthenticated: !!auth.currentUser,
+                        uid: auth.currentUser?.uid
+                    });
+                    // Don't reload on error - let manual load handle it
+                }
+            );
+
+            // Mark initial load as complete after a short delay
+            setTimeout(() => {
+                isInitialLoad = false;
+            }, 1000);
+
+            // Cleanup listener when leaving marketplace
+            return () => {
+                if (loadTimeout) {
+                    clearTimeout(loadTimeout);
+                }
+                unsubscribe();
+            };
+        }
+    }, [currentPage, address, userCoordinates]);
+
+    // ==================== HELPER FUNCTIONS ====================
+    function getInitials(name) {
+        if (!name) return '?';
+        const parts = name.split(' ');
+        if (parts.length >= 2) {
+            return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+        }
+        return name.substring(0, 2).toUpperCase();
+    }
+
+    async function loadDetailers() {
+        try {
+            // Load packages from Firestore
+            const packagesQuery = collection(db, 'packages');
+            const packagesSnapshot = await getDocs(packagesQuery);
+            const packagesMap = {};
+            packagesSnapshot.docs.forEach(doc => {
+                packagesMap[doc.id] = { id: doc.id, ...doc.data() };
+            });
+
+            // Fallback to local packages if Firestore is empty
+            if (Object.keys(packagesMap).length === 0) {
+
+                // Try to auto-create packages
+                try {
+                    await initializePackagesIfEmpty();
+                    // Reload packages after creation
+                    const retrySnapshot = await getDocs(collection(db, 'packages'));
+                    retrySnapshot.docs.forEach(doc => {
+                        packagesMap[doc.id] = { id: doc.id, ...doc.data() };
+                    });
+
+                    if (Object.keys(packagesMap).length === 0) {
+                        // Still empty, use local fallback
+                        PACKAGES_DATA.forEach(pkg => {
+                            packagesMap[pkg.id] = pkg;
+                        });
+                    }
+                } catch (error) {
+                    console.error('Error auto-creating packages:', error);
+                    // Fallback to local packages
+                    PACKAGES_DATA.forEach(pkg => {
+                        packagesMap[pkg.id] = pkg;
+                    });
+                }
+            }
+
+            // Query detailer collection
+
+            const providersQuery = query(
+                collection(db, 'detailer')
+            );
+
+            let snapshot;
+            try {
+                snapshot = await getDocs(providersQuery);
+            } catch (queryError) {
+                console.error('Firestore Query Error:', queryError);
+                throw queryError; // Re-throw to be caught by outer catch
+            }
+
+            const loadedDetailers = await Promise.all(snapshot.docs.map(async (docSnapshot) => {
+                const data = docSnapshot.data();
+
+                // Load packages for this provider
+                const offeredPackages = data.offeredPackages || [];
+                const customPrices = data.packagePrices || {};
+
+                const packages = offeredPackages
+                    .map(pkgId => {
+                        const pkg = packagesMap[pkgId];
+                        if (!pkg) {
+                            console.warn(`⚠️ Package ${pkgId} not found in packagesMap for provider ${data.businessName}`);
+                            return undefined;
+                        }
+                        // Merge custom prices if they exist
+                        if (customPrices[pkgId]) {
+                            return {
+                                ...pkg,
+                                price: customPrices[pkgId].price
+                            };
+                        }
+                        return pkg;
+                    })
+                    .filter(pkg => pkg !== undefined);
+
+                // Calculate real distance if both user and provider have coordinates
+                let distance = 999; // Default high value
+                if (userCoordinates && data.coordinates) {
+                    distance = calculateRealDistance(
+                        userCoordinates.lat,
+                        userCoordinates.lng,
+                        data.coordinates.lat,
+                        data.coordinates.lng
+                    );
+                } else {
+                    console.warn(`Missing coordinates for distance calculation:`, {
+                        provider: data.businessName,
+                        hasUserCoords: !!userCoordinates,
+                        hasProviderCoords: !!data.coordinates
+                    });
+                }
+
+                // Generate available times based on defaultAvailability
+                const availableTimes = generateAvailableTimes(data.defaultAvailability);
+
+                // Use bio field if it exists, otherwise use a neutral default without provider address
+                const aboutText = data.bio || data.about ||
+                    'Professional mobile detailing service. Background checked and insured.';
+
+                return {
+                    id: docSnapshot.id,
+                    userId: data.uid, // Provider's user UID (now same as document ID)
+                    name: data.businessName || data.name || 'Professional Detailer',
+                    ownerName: data.name,
+                    rating: (data.reviewCount && data.reviewCount > 0) ? (data.rating || null) : null,
+                    reviews: data.reviewCount || 0,
+                    distance: distance,
+                    available: data.status === 'approved' && packages.length > 0, // Must be approved and have packages!
+                    price: getStartingPriceFromPackages(packages),
+                    image: data.image || null,
+                    about: aboutText,
+                    packages: packages, // New: packages array
+                    addOns: data.addOns || [], // Available add-ons
+                    photos: data.portfolio || [],
+                    availableTimes: availableTimes,
+                    status: data.status,
+                    phone: data.phone,
+                    email: data.email,
+                    serviceArea: data.serviceArea,
+                    employeeCount: data.employeeCount || 1,
+                    backgroundCheck: data.backgroundCheck,
+                    defaultAvailability: data.defaultAvailability,
+                    dateOverrides: data.dateOverrides || {},
+                    coordinates: data.coordinates,
+                    hasPackages: packages.length > 0
+                };
+            }));
+
+            // Show providers that are APPROVED
+            // Note: We'll show approved providers even if they don't have packages yet
+            // (they can add packages in their dashboard)
+            let availableDetailers = loadedDetailers.filter(d => {
+                const isApproved = d.status === 'approved';
+                if (!isApproved) {
+                    console.log(`❌ Filtered out: ${d.name} - Status: ${d.status}`);
+                } else if (!d.hasPackages) {
+                    console.warn(`⚠️ Approved provider ${d.name} has no packages yet`);
+                }
+                return isApproved;
+            });
+
+            console.log('✅ Filtered detailers:', {
+                total: loadedDetailers.length,
+                approved: availableDetailers.length,
+                withPackages: availableDetailers.filter(d => d.hasPackages).length,
+                withoutPackages: availableDetailers.filter(d => !d.hasPackages).length,
+                detailerNames: availableDetailers.map(d => d.name),
+                detailerIds: availableDetailers.map(d => d.id)
+            });
+
+            // Sort by distance (closest first) by default
+            availableDetailers.sort((a, b) => a.distance - b.distance);
+
+            setDetailers(availableDetailers);
+        } catch (error) {
+            // Enhanced error logging
+            console.error('Error loading detailers:', error);
+
+            // More specific error messages
+            let errorMessage = 'Error loading detailers. ';
+            if (error.code === 'permission-denied') {
+                errorMessage += 'Permission denied. Check Firestore rules.';
+                console.error('PERMISSION DENIED - Check Firestore rules and authentication');
+            } else if (error.code === 'unavailable') {
+                errorMessage += 'Firebase is unavailable. Check your connection.';
+            } else if (error.code === 'failed-precondition') {
+                errorMessage += 'Query requires an index. Check Firebase Console.';
+            } else {
+                errorMessage += `Error: ${error.message}`;
+            }
+
+            // Always show alert and log to console
+            alert(`${errorMessage}\n\nCheck console (F12) for details.`);
+
+            // Fallback to mock data if error
+            console.warn('Falling back to mock data');
+            setDetailers(getMockDetailers());
+        }
+    }
+
+    function getStartingPrice(services) {
+        if (!services || services.length === 0) return 65;
+        const prices = services.map(s => s.price || 0).filter(p => p > 0);
+        return prices.length > 0 ? Math.min(...prices) : 65;
+    }
+
+    function getStartingPriceFromPackages(packages) {
+        if (!packages || packages.length === 0) return 150;
+        const prices = packages.map(pkg => pkg.price || 0).filter(p => p > 0);
+        return prices.length > 0 ? Math.min(...prices) : 150;
+    }
+
+    function generateAvailableTimes(availability) {
+        if (!availability) return ['9:00 AM', '11:00 AM', '2:00 PM', '4:00 PM'];
+
+        // Find first enabled day to show times
+        const days = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
+        for (const day of days) {
+            if (availability[day]?.enabled && availability[day]?.start) {
+                const start = availability[day].start; // e.g., "10:00"
+                const end = availability[day].end; // e.g., "18:00"
+
+                // Generate time slots between start and end
+                const times = [];
+                let currentHour = parseInt(start.split(':')[0]);
+                const endHour = parseInt(end.split(':')[0]);
+
+                while (currentHour < endHour && times.length < 4) {
+                    const hour12 = currentHour > 12 ? currentHour - 12 : currentHour;
+                    const ampm = currentHour >= 12 ? 'PM' : 'AM';
+                    times.push(`${hour12}:00 ${ampm}`);
+                    currentHour += 2; // 2 hour intervals
+                }
+
+                return times.length > 0 ? times : ['9:00 AM', '11:00 AM', '2:00 PM', '4:00 PM'];
+            }
+        }
+
+        return ['9:00 AM', '11:00 AM', '2:00 PM', '4:00 PM'];
+    }
+
+    function calculateDistance(userAddress, serviceArea) {
+        // Implement actual distance calculation or return estimate
+        return (Math.random() * 10 + 0.5).toFixed(1);
+    }
+
+    function getMockDetailers() {
+        return [
+            {
+                id: '1',
+                name: 'Premium Auto Spa',
+                rating: null,
+                reviews: 0,
+                distance: '2.3',
+                available: true,
+                price: 75,
+                image: null,
+                about: 'We specialize in premium detailing services with 10+ years of experience.',
+                services: [
+                    { name: 'Full Detail', price: 150, duration: '3 hours' },
+                    { name: 'Exterior Only', price: 75, duration: '1.5 hours' },
+                    { name: 'Interior Only', price: 85, duration: '2 hours' }
+                ],
+                photos: [],
+                availableTimes: ['9:00 AM', '11:00 AM', '2:00 PM', '4:00 PM']
+            },
+            {
+                id: '2',
+                name: 'Elite Mobile Detail',
+                rating: null,
+                reviews: 0,
+                distance: '3.1',
+                available: true,
+                price: 65,
+                image: null,
+                about: 'Mobile detailing done right. We come to you with all professional equipment.',
+                services: [
+                    { name: 'Basic Wash', price: 65, duration: '1 hour' },
+                    { name: 'Full Detail', price: 140, duration: '3 hours' },
+                    { name: 'Ceramic Coating', price: 350, duration: '5 hours' }
+                ],
+                photos: [],
+                availableTimes: ['8:00 AM', '10:00 AM', '1:00 PM', '3:00 PM']
+            }
+        ];
+    }
+
+    // ==================== AUTH FUNCTIONS ====================
+    async function handleEmailSignup() {
+        try {
+            const userCredential = await createUserWithEmailAndPassword(
+                auth,
+                signupData.email,
+                signupData.password
+            );
+
+            // Determine which collection to use based on account type
+            const accountType = signupData.accountType || 'customer';
+            const collectionName = accountType === 'provider' ? 'detailer' : 'customer';
+
+            // Create user document data
+            const userData = {
+                uid: userCredential.user.uid,
+                email: userCredential.user.email,
+                displayName: signupData.name,
+                photoURL: userCredential.user.photoURL,
+                createdAt: serverTimestamp(),
             };
 
-            setUserLocation(userCoords);
-            console.log('User location coordinates:', userCoords);
+            // Create document in the appropriate collection
+            if (accountType === 'provider') {
+                // Create detailer document
+                await setDoc(doc(db, 'detailer', userCredential.user.uid), {
+                    ...userData,
+                    businessName: signupData.name || 'New Business',
+                    businessAddress: '',
+                    serviceArea: '',
+                    phone: '',
+                    services: [],
+                    offeredPackages: [],
+                    addOns: [],
+                    packagePrices: {},
+                    defaultAvailability: {
+                        monday: { enabled: false, start: '09:00', end: '17:00' },
+                        tuesday: { enabled: false, start: '09:00', end: '17:00' },
+                        wednesday: { enabled: false, start: '09:00', end: '17:00' },
+                        thursday: { enabled: false, start: '09:00', end: '17:00' },
+                        friday: { enabled: false, start: '09:00', end: '17:00' },
+                        saturday: { enabled: false, start: '09:00', end: '17:00' },
+                        sunday: { enabled: false, start: '09:00', end: '17:00' }
+                    },
+                    dateOverrides: {},
+                    rating: 0,
+                    reviewCount: 0,
+                    employeeCount: 1,
+                    backgroundCheck: false,
+                    status: 'pending',
+                    onboarded: false
+                });
+            } else {
+                // Create customer document
+                await setDoc(doc(db, 'customer', userCredential.user.uid), {
+                    ...userData,
+                    savedAddresses: [],
+                    favoriteProviders: [],
+                    address: address || '',
+                    coordinates: userCoordinates || null,
+                    preferences: answers || {},
+                    onboarded: false
+                });
+            }
 
-            // For now, just show a success message
-            alert('Location detected! Showing providers in your area.');
+            // Set user info immediately
+            const userInfo = {
+                uid: userCredential.user.uid,
+                email: userCredential.user.email,
+                name: signupData.name || userCredential.user.email.split('@')[0],
+                photoURL: userCredential.user.photoURL,
+                initials: getInitials(signupData.name || userCredential.user.email)
+            };
+            setCurrentUser(userInfo);
 
+            // Set account type for routing
+            setUserAccountType(signupData.accountType || 'customer');
+            if (signupData.accountType === 'provider') {
+                // Providers need to complete onboarding (business credentials)
+                setIsProvider(true);
+                setCurrentPage('landing');
+                // Pre-fill email in onboarding form
+                setProviderOnboardingData({
+                    businessName: '',
+                    businessAddress: '',
+                    serviceArea: '',
+                    phone: '',
+                    email: signupData.email || userCredential.user.email || ''
+                });
+                setModalType('providerOnboarding');
+            } else {
+                // Customers need to enter address after signup
+                setModalType('address');
+            }
         } catch (error) {
-            console.error('Error getting location:', error);
-            alert('Unable to get your location. Please select your city from the dropdown.');
-        } finally {
-            setLocationLoading(false);
+            console.error('Signup error:', error);
+            alert(error.message);
+        }
+    }
+
+    // Email/password login function
+    async function handleEmailLogin() {
+        try {
+            if (!loginData.email || !loginData.password) {
+                alert('Please enter your email and password');
+                return;
+            }
+
+            const result = await signInWithEmailAndPassword(auth, loginData.email, loginData.password);
+
+            // Check if user exists in customer or detailer collection
+            const customerDoc = await getDoc(doc(db, 'customer', result.user.uid));
+            const detailerDoc = await getDoc(doc(db, 'detailer', result.user.uid));
+
+            if (!customerDoc.exists() && !detailerDoc.exists()) {
+                // User doesn't exist - create a basic customer account automatically
+
+                // Set flag to prevent auth listener from signing out during creation
+                isCreatingAccountRef.current = true;
+
+                const userData = {
+                    uid: result.user.uid,
+                    email: result.user.email,
+                    displayName: result.user.displayName || loginData.email.split('@')[0],
+                    photoURL: result.user.photoURL,
+                    createdAt: serverTimestamp(),
+                    savedAddresses: [],
+                    favoriteProviders: [],
+                    address: '',
+                    coordinates: null,
+                    preferences: {},
+                    onboarded: false
+                };
+
+                await setDoc(doc(db, 'customer', result.user.uid), userData);
+
+                // Clear the flag after a short delay to allow auth listener to process
+                setTimeout(() => {
+                    isCreatingAccountRef.current = false;
+                }, 2000);
+
+                // Set account type and show address modal (same flow as signup)
+                setUserAccountType('customer');
+                setModalType('address');
+                setLoginData({ email: '', password: '' });
+                return;
+            }
+
+            // Close login modal - auth listener will handle routing
+            setModalType(null);
+            setLoginData({ email: '', password: '' });
+        } catch (error) {
+            console.error('❌ Email login error:', error.code, error.message);
+
+            if (error.code === 'auth/user-not-found') {
+                // No account found - redirect to signup with email pre-filled
+                setSignupData({ ...signupData, email: loginData.email });
+                setModalType('signup');
+                // Clear password from login data for security
+                setLoginData({ email: loginData.email, password: '' });
+            } else {
+                // Other errors - show alert
+                let errorMessage = 'Login failed. ';
+                if (error.code === 'auth/wrong-password') {
+                    errorMessage += 'Incorrect password.';
+                } else if (error.code === 'auth/invalid-email') {
+                    errorMessage += 'Invalid email address.';
+                } else {
+                    errorMessage += error.message;
+                }
+                alert(errorMessage);
+            }
+        }
+    }
+
+    // Generic Google sign-in function
+    const startGoogleSignIn = async () => {
+        try {
+            await signInWithPopup(auth, googleProvider);
+        } catch (error) {
+            console.error('Google Popup Error', error);
+            if (error.code === 'permission-denied') {
+                alert('Permission error. Please check Firestore rules.');
+            } else {
+                alert(`Sign-in failed: ${error.message}`);
+            }
         }
     };
 
-    // Advanced location-based filtering
-    const filteredServices = services.filter(service => {
-        // If "All Areas" is selected, show all providers
-        if (selectedArea === 'All Areas') {
-            return true;
+    // Login function - for existing users
+    async function handleGoogleLogin() {
+        // Clear any pending role (login doesn't create new accounts)
+        localStorage.removeItem('pendingUserRole');
+        await startGoogleSignIn();
+    }
+
+    // Signup function - for new users going through onboarding
+    async function handleGoogleSignup() {
+        // Role is already stored in localStorage by SignupModal
+        // Just trigger Google sign-in, auth listener will handle account creation
+        await startGoogleSignIn();
+    }
+
+    async function handleLogout() {
+        try {
+            // Clear all local state first
+            setCurrentUser(null);
+            setUserAccountType(null);
+            setIsProvider(false);
+            setShowProfileDropdown(false);
+            setAddress('');
+            setAnswers({
+                vehicleType: '',
+                serviceType: '',
+                timeSlot: ''
+            });
+            setUserCoordinates(null);
+            setDetailers([]);
+
+            // Sign out from Firebase
+            await signOut(auth);
+
+            // Clear Firebase Auth storage from browser
+            try {
+                // Clear Firebase Auth persistence
+                if (typeof window !== 'undefined' && window.indexedDB) {
+                    // Clear IndexedDB Firebase Auth storage
+                    const deleteReq = indexedDB.deleteDatabase('firebaseLocalStorageDb');
+                    deleteReq.onsuccess = () => {
+                    };
+                    deleteReq.onerror = () => {
+                        console.warn('⚠️ Could not clear Firebase Auth storage');
+                    };
+                }
+                // Also clear localStorage Firebase keys
+                Object.keys(localStorage).forEach(key => {
+                    if (key.startsWith('firebase:authUser:')) {
+                        localStorage.removeItem(key);
+                    }
+                });
+            } catch (storageError) {
+                console.warn('⚠️ Could not clear browser storage:', storageError);
+            }
+
+            // Navigate to landing page
+            setCurrentPage('landing');
+
+            // Clear any modals
+            setModalType(null);
+
+            // Force page reload to clear any cached state
+            window.location.reload();
+        } catch (error) {
+            console.error('❌ Error during logout:', error);
+            // Still navigate to landing page even if signOut fails
+            setCurrentPage('landing');
+            setCurrentUser(null);
+            // Force reload to clear state
+            window.location.reload();
+        }
+    }
+
+    // ==================== ONBOARDING FLOW ====================
+    const startOnboarding = useCallback(() => {
+        // If user is already logged in but needs address, show address modal
+        if (currentUser && userAccountType === 'customer' && !address) {
+            setModalType('address');
+        } else {
+            // Show signup modal first - users can choose customer or provider
+            setModalType('signup');
+        }
+    }, [currentUser, userAccountType, address]);
+
+    const startLogin = useCallback(() => {
+        // Show login modal for returning users
+        setModalType('login');
+    }, []);
+
+    async function handleAddressSubmit() {
+        if (!address.trim()) return;
+
+        // Show loading state
+        const originalModalType = modalType;
+        setModalType('loading');
+
+        try {
+            // Prefer coordinates from autocomplete if available
+            let coords = userCoordinates;
+            if (!coords || !coords.formattedAddress || coords.formattedAddress !== address) {
+                coords = await geocodeAddress(address);
+            }
+
+            if (!coords) {
+                alert('Could not find that address. Please check and try again.');
+                setModalType(originalModalType);
+                return;
+            }
+
+            // Save coordinates
+            setUserCoordinates(coords);
+
+            // Use formatted address from Google
+            if (coords.formattedAddress) {
+                setAddress(coords.formattedAddress);
+            }
+
+            // Save address to customer's document and subcollection if user is logged in
+            if (currentUser && currentUser.uid) {
+                try {
+                    // Update customer document with address (customers only, detailers don't need this)
+                    const customerDocRef = doc(db, 'customer', currentUser.uid);
+                    const customerDoc = await getDoc(customerDocRef);
+                    if (customerDoc.exists()) {
+                        await updateDoc(customerDocRef, {
+                            address: coords.formattedAddress || address,
+                            coordinates: coords,
+                            updatedAt: serverTimestamp()
+                        });
+
+                        // Save to addresses subcollection
+                        const addrDoc = doc(collection(db, 'customer', currentUser.uid, 'addresses'));
+                        await setDoc(addrDoc, {
+                            label: 'Home',
+                            address: coords.formattedAddress || address,
+                            coordinates: coords,
+                            createdAt: serverTimestamp(),
+                            updatedAt: serverTimestamp()
+                        });
+                    }
+                } catch (e) {
+                    console.warn('Could not save address:', e?.message || e);
+                }
+            }
+
+            // Close modal and go to marketplace
+            setModalType(null);
+            setCurrentPage('marketplace');
+        } catch (error) {
+            console.error('Error geocoding address:', error);
+            alert('Error validating address. Please try again.');
+            setModalType(originalModalType);
+        }
+    }
+
+    // Question handlers removed - questions flow removed
+
+    // ==================== PROVIDER ONBOARDING ====================
+    async function handleProviderOnboarding() {
+        if (!currentUser || !currentUser.uid) {
+            alert('You must be logged in to complete provider onboarding');
+            return;
         }
 
-        // If user has location and provider has coordinates, use distance-based filtering
-        if (userLocation && service.coordinates) {
-            const distance = locationService.calculateDistance(userLocation, service.coordinates);
-            return distance <= 50; // 50km radius
+        if (!providerOnboardingData.businessName || !providerOnboardingData.businessAddress) {
+            alert('Please fill in all required fields (Business Name and Business Address)');
+            return;
         }
 
-        // Fallback to text-based matching
-        const serviceArea = service.serviceArea?.toLowerCase() || '';
-        const selectedAreaLower = selectedArea.toLowerCase();
+        try {
+            // Use coordinates from Google Places Autocomplete if available
+            let coords = userCoordinates;
 
-        return serviceArea.includes(selectedAreaLower) ||
-            serviceArea.includes('local') ||
-            serviceArea.includes('all areas');
-    });
+            // Check if we already have coordinates from Google Places Autocomplete
+            // The coordinates should match the business address if user selected from autocomplete
+            if (coords && coords.lat && coords.lng && coords.formattedAddress) {
+                // Verify the address matches (allowing for slight variations)
+                const addressMatches = coords.formattedAddress === providerOnboardingData.businessAddress ||
+                    providerOnboardingData.businessAddress.includes(coords.formattedAddress.split(',')[0]) ||
+                    coords.formattedAddress.includes(providerOnboardingData.businessAddress.split(',')[0]);
 
-    // Debug logging
-    console.log('Services array:', services);
-    console.log('Filtered services:', filteredServices);
-    console.log('Selected area:', selectedArea);
+                if (addressMatches) {
+                } else {
+                    console.warn('⚠️ Address mismatch, but using existing coordinates');
+                    // Still use the coordinates but update the formatted address
+                    coords = {
+                        ...coords,
+                        formattedAddress: providerOnboardingData.businessAddress
+                    };
+                }
+            } else {
+                // No coordinates available - user must select from autocomplete
+                if (!providerOnboardingData.businessAddress || !providerOnboardingData.businessAddress.trim()) {
+                    alert('Please enter a valid business address.');
+                    return;
+                }
 
-    const ServiceCard = ({ service }) => (
-        <div className="bg-white rounded-xl shadow-md overflow-hidden hover:shadow-xl transition-all duration-300">
-            <div className="relative h-48 overflow-hidden">
-                <img
-                    src={service.image}
-                    alt={service.name}
-                    className="w-full h-full object-cover"
-                />
-                <div className="absolute top-3 right-3 bg-cyan-500 text-white px-3 py-1 rounded-full flex items-center gap-1 font-semibold text-sm">
-                    <Star size={14} className="fill-white" />
-                    {service.rating}
+                alert('Please select an address from the suggestions dropdown. This ensures accurate location data.');
+                return;
+            }
+
+            // Update detailer document with provider business information
+            const detailerDocRef = doc(db, 'detailer', currentUser.uid);
+            await updateDoc(detailerDocRef, {
+                businessName: providerOnboardingData.businessName,
+                businessAddress: providerOnboardingData.businessAddress,
+                serviceArea: providerOnboardingData.serviceArea || providerOnboardingData.businessAddress,
+                phone: providerOnboardingData.phone || '',
+                email: providerOnboardingData.email || currentUser.email,
+                coordinates: coords,
+                onboarded: true,
+                updatedAt: serverTimestamp()
+            });
+
+
+            // Close modal and go to dashboard
+            setModalType(null);
+            setCurrentPage('dashboard');
+
+            // Update local state
+            setAddress(providerOnboardingData.businessAddress);
+            setUserCoordinates(coords);
+        } catch (error) {
+            console.error('Error completing provider onboarding:', error);
+            alert(`Error saving business information: ${error.message}`);
+        }
+    }
+
+    // ==================== RENDER FUNCTIONS ====================
+    if (loading) {
+        return (
+            <div className="min-h-screen bg-gray-50 flex items-center justify-center">
+                <div className="text-center">
+                    <div className="w-16 h-16 border-4 border-blue-600 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
+                    <p className="text-gray-600">Loading...</p>
                 </div>
             </div>
-            <div className="p-5">
-                <h3 className="text-xl font-bold text-gray-800 mb-2">{service.name}</h3>
-                <div className="flex items-center gap-2 mb-3">
-                    <span className="text-sm text-gray-600">{service.provider}</span>
-                    {service.certified && (
-                        <span className="flex items-center gap-1 text-xs bg-blue-50 text-blue-700 px-2 py-1 rounded-full">
-                            <Shield size={12} />
-                            Certified
-                        </span>
+        );
+    }
+
+    return (
+        <div className="min-h-screen bg-gray-50">
+            {/* Landing Page */}
+            {currentPage === 'landing' && (
+                <LandingPage
+                    onGetStarted={startOnboarding}
+                    onLogin={startLogin}
+                    onSupport={() => setCurrentPage("support")}
+                />
+            )}
+
+            {/* Support Page */}
+            {currentPage === "support" && (
+                <SupportPage onBack={() => setCurrentPage("landing")} />
+            )}
+
+            {/* Marketplace */}
+            {currentPage === 'marketplace' && (
+                <MarketplacePage
+                    detailers={filteredDetailers}
+                    allDetailersCount={detailers.length}
+                    onSelectDetailer={(detailer) => {
+                        setSelectedDetailer(detailer);
+                        setCurrentPage('detailerProfile');
+                    }}
+                    currentUser={currentUser}
+                    onGoToDashboard={() => { setShowProfileDropdown(false); setCurrentPage('dashboard'); }}
+                    onLogout={handleLogout}
+                    showProfileDropdown={showProfileDropdown}
+                    setShowProfileDropdown={setShowProfileDropdown}
+                    address={address}
+                    onChangeLocation={() => setModalType('address')}
+                    searchQuery={searchQuery}
+                    onSearchChange={setSearchQuery}
+                    distanceFilter={distanceFilter}
+                    onDistanceChange={setDistanceFilter}
+                    sortBy={sortBy}
+                    onSortChange={setSortBy}
+                />
+            )}
+
+            {/* Detailer Profile */}
+            {currentPage === 'detailerProfile' && selectedDetailer && (
+                <DetailerProfilePage
+                    detailer={selectedDetailer}
+                    answers={answers}
+                    address={address}
+                    setAddress={setAddress}
+                    setAnswers={setAnswers}
+                    currentUser={currentUser}
+                    onBack={() => setCurrentPage('marketplace')}
+                    onBook={() => {
+                        alert('Booking functionality - integrate with your Stripe!');
+                    }}
+                />
+            )}
+
+            {/* Dashboard - conditional based on account type */}
+            {currentPage === 'dashboard' && (
+                (userAccountType === 'provider' || isProvider || currentUser?.role === 'admin') ? (
+                    <ProviderDashboard
+                        currentUser={currentUser}
+                        onBackToMarketplace={() => setCurrentPage('marketplace')}
+                        onLogout={handleLogout}
+                        showProfileDropdown={showProfileDropdown}
+                        setShowProfileDropdown={setShowProfileDropdown}
+                    />
+                ) : (
+                    <CustomerDashboard
+                        currentUser={currentUser}
+                        onBackToMarketplace={() => setCurrentPage('marketplace')}
+                        onLogout={handleLogout}
+                        showProfileDropdown={showProfileDropdown}
+                        setShowProfileDropdown={setShowProfileDropdown}
+                        address={address}
+                        answers={answers}
+                        userCoordinates={userCoordinates}
+                    />
+                )
+            )}
+
+
+            {/* Modals */}
+            {modalType === 'address' && (
+                <AddressModal
+                    address={address}
+                    setAddress={setAddress}
+                    addressInputRef={addressInputRef}
+                    onSubmit={handleAddressSubmit}
+                    onClose={() => setModalType(null)}
+                />
+            )}
+
+            {modalType === 'login' && (
+                <LoginModal
+                    loginData={loginData}
+                    setLoginData={setLoginData}
+                    onEmailLogin={handleEmailLogin}
+                    onGoogleLogin={handleGoogleLogin}
+                    onClose={() => setModalType(null)}
+                    onSwitchToSignup={() => {
+                        setModalType('signup');
+                        // Pre-fill email if they entered it
+                        if (loginData.email) {
+                            setSignupData({ ...signupData, email: loginData.email });
+                        }
+                    }}
+                />
+            )}
+
+            {modalType === 'signup' && (
+                <SignupModal
+                    signupData={signupData}
+                    setSignupData={setSignupData}
+                    onEmailSignup={handleEmailSignup}
+                    onGoogleSignup={handleGoogleSignup}
+                    onBack={null}
+                    onClose={() => setModalType(null)}
+                    onSwitchToLogin={() => {
+                        setModalType('login');
+                        // Pre-fill email if they entered it
+                        if (signupData.email) {
+                            setLoginData({ ...loginData, email: signupData.email });
+                        }
+                    }}
+                />
+            )}
+
+            {modalType === 'providerOnboarding' && (
+                <ProviderOnboardingModal
+                    providerOnboardingData={providerOnboardingData}
+                    setProviderOnboardingData={setProviderOnboardingData}
+                    addressInputRef={addressInputRef}
+                    onSubmit={handleProviderOnboarding}
+                    onClose={() => setModalType(null)}
+                />
+            )}
+        </div>
+    );
+}
+
+// ==================== LANDING PAGE ====================
+function LandingPage({ onGetStarted, onLogin, onSupport }) {
+    return (
+        <div className="min-h-screen bg-gradient-to-br from-blue-600 via-blue-700 to-blue-900 text-white">
+            <div className="max-w-6xl mx-auto px-4 py-12 sm:py-20">
+                <div className="text-center mb-12 sm:mb-16">
+                    <h1 className="text-4xl sm:text-5xl md:text-6xl font-bold mb-4 sm:mb-6">Welcome to Brnno</h1>
+                    <p className="text-lg sm:text-xl md:text-2xl text-blue-100 mb-8 sm:mb-12 px-4">
+                        Premium mobile detailing at your fingertips
+                    </p>
+                    <div className="flex flex-col sm:flex-row items-center justify-center gap-3 sm:gap-4 px-4">
+                        <button
+                            onClick={onGetStarted}
+                            className="w-full sm:w-auto bg-white text-blue-600 px-8 sm:px-12 py-3 sm:py-4 rounded-xl text-lg sm:text-xl font-semibold hover:bg-blue-50 transition-all transform hover:scale-105 shadow-2xl"
+                        >
+                            Get Started
+                        </button>
+                        {onLogin && (
+                            <button
+                                onClick={onLogin}
+                                className="w-full sm:w-auto bg-transparent border-2 border-white text-white px-8 sm:px-12 py-3 sm:py-4 rounded-xl text-lg sm:text-xl font-semibold hover:bg-white/10 transition-all transform hover:scale-105"
+                            >
+                                Sign In
+                            </button>
+                        )}
+                    </div>
+                </div>
+
+                <div className="grid sm:grid-cols-2 md:grid-cols-3 gap-6 sm:gap-8 mt-12 sm:mt-20 px-4">
+                    <FeatureCard
+                        icon={Shield}
+                        title="Vetted Professionals"
+                        description="All detailers are background checked and insured"
+                    />
+                    <FeatureCard
+                        icon={MapPin}
+                        title="Mobile Service"
+                        description="They come to you - home, office, or anywhere"
+                    />
+                    <FeatureCard
+                        icon={Star}
+                        title="Quality Guaranteed"
+                        description="Read reviews and choose the best for your needs"
+                    />
+                </div>
+
+                {/* Support link */}
+                <button
+                    className="mt-12 text-white underline text-sm opacity-90 hover:opacity-100"
+                    onClick={onSupport}
+                >
+                    Pricing & Payments Information
+                </button>
+            </div>
+        </div>
+    );
+}
+
+
+{/* SUPPORT PAGE */}
+function SupportPage({ onBack }) {
+    return (
+        <div className="min-h-screen bg-gray-50 text-gray-800 p-8">
+            <div className="max-w-3xl mx-auto">
+
+                <h1 className="text-3xl font-bold mb-8 text-gray-900">
+                    Brnno Marketplace Pricing & Payout Guide
+                </h1>
+
+                {/* Section 1 */}
+                <h2 className="text-xl font-semibold mb-2">1. Marketplace Fee Structure</h2>
+                <p className="mb-4">
+                    Brnno charges a <strong>15% marketplace service fee</strong> on each completed job.
+                    This fee supports customer acquisition, platform hosting, booking tools,
+                    customer communications, and payment processing.
+                </p>
+
+                <p className="font-medium mb-2">Example Breakdown:</p>
+                <ul className="list-disc ml-6 mb-6 text-gray-700">
+                    <li>Customer pays: $100</li>
+                    <li>Brnno fee (15%): $15</li>
+                    <li>Payout to detailer: $85</li>
+                </ul>
+
+                {/* Section 2 */}
+                <h2 className="text-xl font-semibold mb-2">2. Stripe Payment Processing</h2>
+                <p className="mb-4">
+                    Brnno uses Stripe, a secure global payment processor, to handle all customer
+                    payments and dispatch payouts directly to your bank. Stripe ensures encrypted
+                    transactions and transparent payment handling.
+                </p>
+
+                <p className="font-medium mb-2">How Stripe Works:</p>
+                <ul className="list-disc ml-6 mb-6 text-gray-700">
+                    <li>Customer completes payment online.</li>
+                    <li>Stripe receives and verifies the payment.</li>
+                    <li>Stripe deducts Brnno’s 15% marketplace fee automatically.</li>
+                    <li>Stripe deposits your remaining balance into your bank account.</li>
+                </ul>
+
+                {/* Section 3 */}
+                <h2 className="text-xl font-semibold mb-2">3. How Detailers Get Paid</h2>
+                <p className="mb-4">
+                    To receive payouts, detailers must complete Stripe onboarding. This is a quick,
+                    one-time setup that enables secure transfers.
+                </p>
+
+                <p className="font-medium mb-2">What You Must Do:</p>
+                <ul className="list-disc ml-6 mb-6 text-gray-700">
+                    <li>Set up your Stripe Connected Account.</li>
+                    <li>Add your bank account details.</li>
+                    <li>Complete identity verification (required by law).</li>
+                </ul>
+
+                <p className="mb-6">
+                    Once your Stripe account is verified, payouts are fully automatic and can be
+                    tracked through your Brnno dashboard.
+                </p>
+
+                {/* Section 4 */}
+                <h2 className="text-xl font-semibold mb-2">4. Stripe Bank Compatibility</h2>
+                <p className="mb-4">
+                    Stripe can connect to most major banks. Your bank account must be located in the
+                    same country as your Stripe account and must be a checking account registered to
+                    the verified individual or business.
+                </p>
+
+                <p className="font-medium mb-2">Supported Bank Types:</p>
+                <ul className="list-disc ml-6 mb-4 text-gray-700">
+                    <li>Major U.S. banks (Chase, Wells Fargo, Bank of America, etc.)</li>
+                    <li>Most credit unions</li>
+                    <li>Online banks (Chime, Ally, Capital One 360)</li>
+                </ul>
+
+                <p className="font-medium mb-2">Not Supported:</p>
+                <ul className="list-disc ml-6 mb-8 text-gray-700">
+                    <li>PayPal accounts</li>
+                    <li>Savings-only accounts</li>
+                    <li>Prepaid debit cards</li>
+                    <li>International accounts outside your country</li>
+                </ul>
+
+                {/* Summary */}
+                <h2 className="text-xl font-semibold mb-2">Summary</h2>
+                <p className="mb-12 text-gray-700">
+                    Customer pays → Stripe processes payment → Brnno takes 15% → You receive the
+                    remaining balance automatically.
+                </p>
+
+                <a href="mailto:sam@brnno.com,adrian@brnno.com">
+                    <button
+                        className="mt-4 bg-green-600 text-white px-6 py-3 rounded-xl font-semibold hover:bg-green-700 transition"
+                    >
+                        For additional help, please reach out.
+                    </button>
+                </a>
+
+
+                {/* back button */}
+                <button
+                    className="mt-4 bg-blue-600 text-white px-6 py-3 rounded-xl font-semibold hover:bg-blue-700 transition"
+                    onClick={onBack}
+                >
+                    Back to Home
+                </button>
+
+            </div>
+        </div>
+    );
+}
+
+
+
+function FeatureCard({ icon: Icon, title, description }) {
+    return (
+        <div className="bg-white/10 backdrop-blur-lg p-6 sm:p-8 rounded-2xl border border-white/20">
+            <Icon className="w-10 h-10 sm:w-12 sm:h-12 mb-3 sm:mb-4" />
+            <h3 className="text-lg sm:text-xl font-bold mb-2">{title}</h3>
+            <p className="text-sm sm:text-base text-blue-100">{description}</p>
+        </div>
+    );
+}
+
+// ==================== MODALS ====================
+function AddressModal({ address, setAddress, addressInputRef, onSubmit, onClose }) {
+    return (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
+            <div className="bg-white rounded-2xl max-w-md w-full p-8 relative animate-fadeIn">
+                <button
+                    onClick={onClose}
+                    className="absolute top-4 right-4 text-gray-400 hover:text-gray-600"
+                >
+                    <X className="w-6 h-6" />
+                </button>
+
+                <div className="mb-6">
+                    <MapPin className="w-12 h-12 text-blue-600 mb-4" />
+                    <h2 className="text-2xl font-bold text-gray-900 mb-2">
+                        Where should we come?
+                    </h2>
+                    <p className="text-gray-600">
+                        Enter your address to find nearby detailers
+                    </p>
+                </div>
+
+                <input
+                    ref={addressInputRef}
+                    type="text"
+                    value={address}
+                    onChange={(e) => setAddress(e.target.value)}
+                    placeholder="Start typing your address..."
+                    className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none mb-6"
+                />
+
+                <button
+                    onClick={onSubmit}
+                    disabled={!address.trim()}
+                    className="w-full bg-blue-600 text-white py-3 rounded-xl font-semibold hover:bg-blue-700 transition-colors disabled:bg-gray-300 disabled:cursor-not-allowed"
+                >
+                    Continue
+                </button>
+            </div>
+        </div>
+    );
+}
+
+// QuestionsModal component removed - questions flow removed
+
+// ==================== LOGIN MODAL ====================
+function LoginModal({ loginData, setLoginData, onEmailLogin, onGoogleLogin, onClose, onSwitchToSignup }) {
+    return (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50 overflow-y-auto">
+            <div className="bg-white rounded-2xl max-w-md w-full p-8 relative my-8 animate-fadeIn">
+                <button
+                    onClick={onClose}
+                    className="absolute top-4 right-4 text-gray-400 hover:text-gray-600"
+                >
+                    <X className="w-6 h-6" />
+                </button>
+
+                <div className="mb-6">
+                    <h2 className="text-2xl font-bold text-gray-900 mb-2">
+                        Welcome back
+                    </h2>
+                    <p className="text-gray-600">
+                        Sign in to your account
+                    </p>
+                </div>
+
+                <div className="space-y-4 mb-6">
+                    <input
+                        type="email"
+                        value={loginData.email}
+                        onChange={(e) => setLoginData({ ...loginData, email: e.target.value })}
+                        placeholder="Email"
+                        className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                        onKeyPress={(e) => {
+                            if (e.key === 'Enter' && loginData.email && loginData.password) {
+                                onEmailLogin();
+                            }
+                        }}
+                    />
+                    <input
+                        type="password"
+                        value={loginData.password}
+                        onChange={(e) => setLoginData({ ...loginData, password: e.target.value })}
+                        placeholder="Password"
+                        className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                        onKeyPress={(e) => {
+                            if (e.key === 'Enter' && loginData.email && loginData.password) {
+                                onEmailLogin();
+                            }
+                        }}
+                    />
+                </div>
+
+                <button
+                    onClick={onEmailLogin}
+                    disabled={!loginData.email || !loginData.password}
+                    className="w-full bg-blue-600 text-white py-3 rounded-xl font-semibold hover:bg-blue-700 transition-colors mb-4 disabled:bg-gray-300 disabled:cursor-not-allowed"
+                >
+                    Sign In
+                </button>
+
+                <div className="relative my-6">
+                    <div className="absolute inset-0 flex items-center">
+                        <div className="w-full border-t border-gray-200"></div>
+                    </div>
+                    <div className="relative flex justify-center text-sm">
+                        <span className="px-4 bg-white text-gray-500">or</span>
+                    </div>
+                </div>
+
+                <button
+                    onClick={onGoogleLogin}
+                    className="w-full bg-white border-2 border-gray-200 text-gray-700 py-3 rounded-xl font-semibold hover:bg-gray-50 transition-colors flex items-center justify-center gap-2 mb-4"
+                >
+                    <svg className="w-5 h-5" viewBox="0 0 24 24">
+                        <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
+                        <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" />
+                        <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" />
+                        <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" />
+                    </svg>
+                    Continue with Google
+                </button>
+
+                <div className="text-center">
+                    <button
+                        onClick={onSwitchToSignup}
+                        className="text-blue-600 font-medium hover:text-blue-700"
+                    >
+                        Don't have an account? Sign up
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+}
+
+// ==================== PROVIDER ONBOARDING MODAL ====================
+function ProviderOnboardingModal({ providerOnboardingData, setProviderOnboardingData, addressInputRef, onSubmit, onClose }) {
+    return (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50 overflow-y-auto">
+            <div className="bg-white rounded-2xl max-w-2xl w-full p-8 relative my-8 animate-fadeIn">
+                <button
+                    onClick={onClose}
+                    className="absolute top-4 right-4 text-gray-400 hover:text-gray-600"
+                >
+                    <X className="w-6 h-6" />
+                </button>
+
+                <div className="mb-6">
+                    <h2 className="text-2xl font-bold text-gray-900 mb-2">
+                        Complete Your Provider Profile
+                    </h2>
+                    <p className="text-gray-600">
+                        Please provide your business information to get started
+                    </p>
+                </div>
+
+                <div className="space-y-4 mb-6">
+                    <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                            Business Name <span className="text-red-500">*</span>
+                        </label>
+                        <input
+                            type="text"
+                            value={providerOnboardingData.businessName}
+                            onChange={(e) => setProviderOnboardingData({ ...providerOnboardingData, businessName: e.target.value })}
+                            placeholder="Your Business Name"
+                            className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                        />
+                    </div>
+
+                    <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                            Business Address <span className="text-red-500">*</span>
+                        </label>
+                        <input
+                            ref={addressInputRef}
+                            type="text"
+                            value={providerOnboardingData.businessAddress}
+                            onChange={(e) => setProviderOnboardingData({ ...providerOnboardingData, businessAddress: e.target.value })}
+                            placeholder="Start typing your business address..."
+                            className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                        />
+                        <p className="mt-1 text-xs text-gray-500">
+                            This address will be used to help customers find you
+                        </p>
+                    </div>
+
+                    <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                            Service Area (Optional)
+                        </label>
+                        <input
+                            type="text"
+                            value={providerOnboardingData.serviceArea}
+                            onChange={(e) => setProviderOnboardingData({ ...providerOnboardingData, serviceArea: e.target.value })}
+                            placeholder="e.g., Los Angeles, CA or 25 miles radius"
+                            className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                        />
+                    </div>
+
+                    <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                            Business Phone (Optional)
+                        </label>
+                        <input
+                            type="tel"
+                            value={providerOnboardingData.phone}
+                            onChange={(e) => setProviderOnboardingData({ ...providerOnboardingData, phone: e.target.value })}
+                            placeholder="(555) 123-4567"
+                            className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                        />
+                    </div>
+
+                    <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                            Business Email (Optional)
+                        </label>
+                        <input
+                            type="email"
+                            value={providerOnboardingData.email}
+                            onChange={(e) => setProviderOnboardingData({ ...providerOnboardingData, email: e.target.value })}
+                            placeholder="business@example.com"
+                            className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                        />
+                    </div>
+                </div>
+
+                <button
+                    onClick={onSubmit}
+                    disabled={!providerOnboardingData.businessName || !providerOnboardingData.businessAddress}
+                    className="w-full bg-blue-600 text-white py-3 rounded-xl font-semibold hover:bg-blue-700 transition-colors disabled:bg-gray-300 disabled:cursor-not-allowed"
+                >
+                    Complete Setup
+                </button>
+            </div>
+        </div>
+    );
+}
+
+function SignupModal({ signupData, setSignupData, onEmailSignup, onGoogleSignup, onBack, onClose, onSwitchToLogin }) {
+    return (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50 overflow-y-auto">
+            <div className="bg-white rounded-2xl max-w-md w-full p-8 relative my-8 animate-fadeIn">
+                <button
+                    onClick={onClose}
+                    className="absolute top-4 right-4 text-gray-400 hover:text-gray-600"
+                >
+                    <X className="w-6 h-6" />
+                </button>
+
+                <div className="mb-6">
+                    <h2 className="text-2xl font-bold text-gray-900 mb-2">
+                        Create your account
+                    </h2>
+                    <p className="text-gray-600">
+                        Choose your account type to get started
+                    </p>
+                </div>
+
+                {/* Account Type Selection */}
+                <div className="mb-6">
+                    <label className="block text-sm font-medium text-gray-700 mb-3">
+                        I want to sign up as:
+                    </label>
+                    <div className="grid grid-cols-2 gap-3">
+                        <button
+                            type="button"
+                            onClick={() => setSignupData({ ...signupData, accountType: 'customer' })}
+                            className={`px-4 py-3 rounded-xl border-2 font-medium transition-all ${signupData.accountType === 'customer'
+                                ? 'border-blue-600 bg-blue-50 text-blue-700'
+                                : 'border-gray-200 text-gray-700 hover:border-gray-300'
+                                }`}
+                        >
+                            Customer
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => setSignupData({ ...signupData, accountType: 'provider' })}
+                            className={`px-4 py-3 rounded-xl border-2 font-medium transition-all ${signupData.accountType === 'provider'
+                                ? 'border-blue-600 bg-blue-50 text-blue-700'
+                                : 'border-gray-200 text-gray-700 hover:border-gray-300'
+                                }`}
+                        >
+                            Provider
+                        </button>
+                    </div>
+                    {signupData.accountType === 'provider' && (
+                        <p className="mt-2 text-xs text-gray-500">
+                            Providers will need to complete additional information after signup
+                        </p>
                     )}
                 </div>
-                <div className="flex flex-wrap gap-2 mb-3">
-                    {service.tags.map((tag, idx) => (
-                        <span key={idx} className="text-xs bg-gray-100 text-gray-700 px-3 py-1 rounded-full">
-                            {tag}
-                        </span>
-                    ))}
+
+                <div className="space-y-4 mb-6">
+                    <input
+                        type="text"
+                        value={signupData.name}
+                        onChange={(e) => setSignupData({ ...signupData, name: e.target.value })}
+                        placeholder="Full Name"
+                        className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                    />
+                    <input
+                        type="email"
+                        value={signupData.email}
+                        onChange={(e) => setSignupData({ ...signupData, email: e.target.value })}
+                        placeholder="Email"
+                        className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                    />
+                    <input
+                        type="password"
+                        value={signupData.password}
+                        onChange={(e) => setSignupData({ ...signupData, password: e.target.value })}
+                        placeholder="Password"
+                        className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                    />
                 </div>
-                <p className="text-sm text-gray-600 mb-4 line-clamp-2">
-                    {service.description}
-                </p>
-                <div className="flex items-center justify-between pt-4 border-t border-gray-100">
-                    <div>
-                        <p className="text-xs text-gray-500">Starting at</p>
-                        <p className="text-2xl font-bold text-gray-800">${service.startingPrice}</p>
+
+                <button
+                    onClick={onEmailSignup}
+                    disabled={!signupData.name || !signupData.email || !signupData.password}
+                    className="w-full bg-blue-600 text-white py-3 rounded-xl font-semibold hover:bg-blue-700 transition-colors mb-4 disabled:bg-gray-300 disabled:cursor-not-allowed"
+                >
+                    Sign Up with Email
+                </button>
+
+                <div className="relative my-6">
+                    <div className="absolute inset-0 flex items-center">
+                        <div className="w-full border-t border-gray-200"></div>
                     </div>
+                    <div className="relative flex justify-center text-sm">
+                        <span className="px-4 bg-white text-gray-500">or</span>
+                    </div>
+                </div>
+
+                <button
+                    onClick={() => {
+                        // Store role in localStorage before Google sign-in
+                        const role = signupData.accountType === 'provider' ? 'detailer' : 'customer';
+                        localStorage.setItem('pendingUserRole', role);
+                        onGoogleSignup();
+                    }}
+                    className="w-full bg-white border-2 border-gray-200 text-gray-700 py-3 rounded-xl font-semibold hover:bg-gray-50 transition-colors flex items-center justify-center gap-2"
+                >
+                    <svg className="w-5 h-5" viewBox="0 0 24 24">
+                        <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
+                        <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" />
+                        <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" />
+                        <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" />
+                    </svg>
+                    Continue with Google
+                </button>
+
+                <div className="flex items-center justify-center mt-4">
+                    {onSwitchToLogin && (
+                        <button
+                            onClick={onSwitchToLogin}
+                            className="text-blue-600 font-medium hover:text-blue-700"
+                        >
+                            Already have an account? Sign in
+                        </button>
+                    )}
+                </div>
+            </div>
+        </div>
+    );
+}
+
+// ==================== BOOKING SIDEBAR COMPONENT ====================
+function BookingSidebar({
+    detailer,
+    selectedPackage: selectedPackageProp,
+    setSelectedPackage: setSelectedPackageProp,
+    selectedAddOns: selectedAddOnsProp,
+    setSelectedAddOns: setSelectedAddOnsProp,
+    selectedDate: selectedDateProp,
+    setSelectedDate: setSelectedDateProp,
+    selectedTime: selectedTimeProp,
+    setSelectedTime: setSelectedTimeProp,
+    onBookNow,
+    isBooking: isBookingProp,
+    currentUser: currentUserProp,
+    address,
+    answers,
+    setAddress,
+    setAnswers,
+    onBook // backward compatibility
+}) {
+    // Local state fallbacks if parent doesn't control these
+    const [selectedPackageState, setSelectedPackageState] = useState(selectedPackageProp || null);
+    const [selectedAddOnsState, setSelectedAddOnsState] = useState(selectedAddOnsProp || []);
+    const [selectedTimeState, setSelectedTimeState] = useState(selectedTimeProp || '');
+    const [selectedDateState, setSelectedDateState] = useState(selectedDateProp || '');
+    const [isBookingState, setIsBookingState] = useState(!!isBookingProp);
+    const [packageExpanded, setPackageExpanded] = useState(true);
+    const [showPayment, setShowPayment] = useState(false);
+    const [bookingData, setBookingData] = useState(null);
+
+    const selectedPackage = selectedPackageProp ?? selectedPackageState;
+    const setSelectedPackage = setSelectedPackageProp ?? setSelectedPackageState;
+    const selectedAddOns = selectedAddOnsProp ?? selectedAddOnsState;
+    const setSelectedAddOns = setSelectedAddOnsProp ?? setSelectedAddOnsState;
+    const selectedTime = selectedTimeProp ?? selectedTimeState;
+    const setSelectedTime = setSelectedTimeProp ?? setSelectedTimeState;
+    const selectedDate = selectedDateProp ?? selectedDateState;
+    const setSelectedDate = setSelectedDateProp ?? setSelectedDateState;
+    const isBooking = isBookingProp ?? isBookingState;
+
+    // Get current user from auth if not provided
+    const currentUser = currentUserProp || auth.currentUser;
+
+    // Available packages from detailer, sorted by price (low to high)
+    const availablePackages = useMemo(() => {
+        if (!detailer.packages || detailer.packages.length === 0) return [];
+        // Create a copy to avoid mutating the original array
+        const sorted = [...detailer.packages].sort((a, b) => {
+            const priceA = Number(a.price) || 0;
+            const priceB = Number(b.price) || 0;
+            return priceA - priceB; // Sort low to high
+        });
+        return sorted;
+    }, [detailer.packages]);
+
+    // Available add-ons (from detailer or all add-ons)
+    const availableAddOnsList = detailer.addOns
+        ? ADD_ONS.filter(addon => detailer.addOns.includes(addon.id))
+        : ADD_ONS;
+
+    // Calculate total price: package price + add-ons
+    const totalPrice = useMemo(() => {
+        let price = 0;
+        if (selectedPackage) {
+            // Use single price
+            price = selectedPackage.price;
+        }
+        // Add selected add-ons
+        selectedAddOns.forEach(addOnId => {
+            const addOn = ADD_ONS.find(a => a.id === addOnId);
+            if (addOn) {
+                price += addOn.price;
+            }
+        });
+        return price;
+    }, [selectedPackage, selectedAddOns]);
+
+    useEffect(() => {
+        // Reset selection when detailer changes
+        setSelectedPackage(null);
+        setSelectedAddOns([]);
+        setPackageExpanded(true);
+    }, [detailer]);
+
+    // Calculate available times based on selected date
+    const availableTimesForSelectedDate = useMemo(() => {
+        if (!selectedDate) {
+            return [];
+        }
+
+        // If provider has defaultAvailability, use it for dynamic times
+        if (detailer.defaultAvailability) {
+            return generateAvailableTimesForDate(
+                detailer.defaultAvailability,
+                detailer.dateOverrides || {},
+                selectedDate
+            );
+        }
+
+        // Fallback to static availableTimes if defaultAvailability is not set
+        // This handles providers who haven't set up their schedule yet
+        if (detailer.availableTimes && detailer.availableTimes.length > 0) {
+            return detailer.availableTimes;
+        }
+
+        return [];
+    }, [selectedDate, detailer.defaultAvailability, detailer.dateOverrides, detailer.availableTimes]);
+
+    // Clear selected time when date changes and no times available
+    useEffect(() => {
+        if (selectedDate && availableTimesForSelectedDate.length === 0) {
+            setSelectedTime('');
+        }
+    }, [selectedDate, availableTimesForSelectedDate]);
+
+    // Toggle add-on selection
+    const toggleAddOn = (addOnId) => {
+        setSelectedAddOns(prev =>
+            prev.includes(addOnId)
+                ? prev.filter(id => id !== addOnId)
+                : [...prev, addOnId]
+        );
+    };
+
+    async function handleBookNow() {
+        if (!currentUser) {
+            alert('Please log in to book a service');
+            return;
+        }
+
+        // Prevent providers from booking services
+        try {
+            // Check if user is a detailer
+            const detailerDoc = await getDoc(doc(db, 'detailer', currentUser.uid));
+            if (detailerDoc.exists()) {
+                alert('Providers cannot book services. Please use your provider dashboard to manage bookings.');
+                return;
+            }
+        } catch (err) {
+            console.warn('Could not check if user is provider:', err);
+        }
+
+        if (!selectedPackage) {
+            alert('Please select a package');
+            return;
+        }
+
+        if (!selectedTime) {
+            alert('Please select a time');
+            return;
+        }
+
+        if (!selectedDate) {
+            alert('Please select a date');
+            return;
+        }
+
+        // Get the actual provider userId from the provider document
+        let actualProviderUserId = detailer.userId;
+        if (!actualProviderUserId) {
+            try {
+                const providerDocRef = doc(db, 'providers', detailer.id);
+                const providerDocSnap = await getDoc(providerDocRef);
+                if (providerDocSnap.exists()) {
+                    actualProviderUserId = providerDocSnap.data().userId;
+                }
+            } catch (err) {
+                console.warn('Could not fetch provider userId:', err);
+            }
+        }
+
+        if (!actualProviderUserId) {
+            console.error('ERROR: No provider userId found! Cannot create booking without providerUserId.');
+            alert('Error: Could not determine provider information. Please try again.');
+            return;
+        }
+
+        // Store booking data and show payment modal
+        const bookingDataToStore = {
+            customerId: currentUser.uid,
+            customerEmail: currentUser.email,
+            providerId: detailer.id,
+            providerUserId: actualProviderUserId,
+            providerName: detailer.name,
+            // Store package data
+            packageId: selectedPackage.id,
+            packageName: selectedPackage.name,
+            packagePrice: selectedPackage.price,
+            exteriorServices: selectedPackage.exteriorServices || [],
+            interiorServices: selectedPackage.interiorServices || [],
+            addOns: selectedAddOns.map(addOnId => {
+                const addOn = ADD_ONS.find(a => a.id === addOnId);
+                return addOn ? { id: addOn.id, name: addOn.name, price: addOn.price } : null;
+            }).filter(Boolean),
+            // Keep serviceName for backward compatibility
+            serviceName: selectedPackage.name,
+            // Store total price
+            price: totalPrice,
+            date: selectedDate,
+            time: selectedTime,
+            address: address,
+            vehicleType: answers.vehicleType,
+            preferredTimeSlot: answers.timeSlot,
+            status: 'pending',
+        };
+
+        setBookingData(bookingDataToStore);
+        setShowPayment(true);
+    }
+
+    // Handle payment completion
+    async function handlePaymentComplete(paymentResult) {
+        if (paymentResult.status !== 'succeeded') {
+            alert('Payment failed. Please try again.');
+            setShowPayment(false);
+            return;
+        }
+
+        setIsBookingState(true);
+        try {
+            // Create booking after payment succeeds
+            const finalBookingData = {
+                ...bookingData,
+                ...(paymentResult.paymentIntent?.id && { paymentIntentId: paymentResult.paymentIntent.id }),
+                paymentStatus: 'paid',
+                createdAt: serverTimestamp(),
+                updatedAt: serverTimestamp()
+            };
+
+            const bookingRef = await addDoc(collection(db, 'bookings'), finalBookingData);
+            const bookingId = bookingRef.id;
+
+            // Create notifications for provider
+            try {
+                const bookingWithId = { ...finalBookingData, id: bookingId };
+                // Notify provider of new booking
+                await notifyNewBooking(bookingData.providerUserId, bookingWithId);
+                // Notify provider of payment received
+                await notifyPaymentReceived(bookingData.providerUserId, bookingWithId);
+                // Notify provider of booking confirmed
+                await notifyBookingConfirmed(bookingData.providerUserId, bookingWithId);
+            } catch (notifError) {
+                console.warn('Failed to create notifications:', notifError);
+            }
+
+            const serviceText = bookingData.packageName || bookingData.serviceName || 'service';
+            alert(`Booking confirmed! Your ${serviceText} is scheduled for ${bookingData.date} at ${bookingData.time}.`);
+
+            setShowPayment(false);
+            setBookingData(null);
+
+            // Optionally redirect or refresh
+            window.location.href = '#';
+        } catch (error) {
+            console.error('Error creating booking:', error);
+            alert('Payment succeeded but failed to create booking. Please contact support.');
+        } finally {
+            setIsBookingState(false);
+        }
+    }
+
+    // Simple helper editors for address/vehicle
+    const handleChangeAddress = () => {
+        if (!setAddress) return;
+        const updated = window.prompt('Where should the detailer meet you?', address || '');
+        if (updated !== null) {
+            const trimmed = updated.trim();
+            if (trimmed) {
+                setAddress(trimmed);
+            }
+        }
+    };
+
+    const handleChangeVehicle = () => {
+        if (!setAnswers) return;
+        const updated = window.prompt('What vehicle should we service?', answers?.vehicleType || '');
+        if (updated !== null) {
+            const trimmed = updated.trim();
+            if (trimmed) {
+                setAnswers(prev => ({
+                    ...prev,
+                    vehicleType: trimmed
+                }));
+            }
+        }
+    };
+
+    // Contact handlers
+    const handleEmail = () => {
+        if (!detailer?.email) return;
+        const serviceText = selectedPackage ? selectedPackage.name : 'your booking';
+        window.location.href = `mailto:${detailer.email}?subject=Question about ${serviceText}`;
+    };
+
+    const handleCall = () => {
+        if (!detailer?.phone) return;
+        window.location.href = `tel:${detailer.phone}`;
+    };
+
+    const handleSupport = () => {
+        window.location.href = 'mailto:support@brnno.com?subject=Customer Support Request';
+    };
+
+    return (
+        <div className="bg-white rounded-xl shadow-lg p-6 sticky top-4">
+            {/* Provider Info */}
+            <div className="mb-6 pb-6 border-b border-gray-200">
+                <div className="flex items-center gap-3 mb-3">
+                    <div className="w-12 h-12 bg-blue-600 rounded-full flex items-center justify-center text-white font-bold text-lg">
+                        {detailer.name.charAt(0)}
+                    </div>
+                    <div>
+                        <h3 className="font-bold text-lg">{detailer.name}</h3>
+                        <div className="flex items-center gap-1 text-sm">
+                            <Star className={`w-4 h-4 ${detailer.reviews > 0 ? 'fill-yellow-400 text-yellow-400' : 'fill-gray-300 text-gray-300'}`} />
+                            {detailer.rating && detailer.reviews > 0 ? (
+                                <>
+                                    <span className="font-semibold">{detailer.rating}</span>
+                                    <span className="text-gray-500">({detailer.reviews})</span>
+                                </>
+                            ) : (
+                                <span className="text-gray-500">No reviews yet</span>
+                            )}
+                        </div>
+                    </div>
+                </div>
+
+                <div className="space-y-1 text-sm text-gray-600 mb-3">
+                    <div className="flex items-center gap-2">
+                        <MapPin className="w-4 h-4" />
+                        <span>Serves {detailer.serviceArea || 'your area'}</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                        <div className="w-4 h-4" />
+                        <span>{detailer.distance} miles from you</span>
+                    </div>
+                </div>
+
+                {/* Contact Provider Buttons */}
+                <div className="space-y-2">
+                    <p className="text-xs font-medium text-gray-700">Contact Provider</p>
                     <div className="flex gap-2">
+                        {detailer.email && (
+                            <button onClick={handleEmail} className="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm font-medium text-gray-700 hover:bg-gray-50 flex items-center justify-center gap-2">
+                                <Mail className="w-4 h-4" />
+                                Email
+                            </button>
+                        )}
+                        {detailer.phone && (
+                            <button onClick={handleCall} className="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm font-medium text-gray-700 hover:bg-gray-50 flex items-center justify-center gap-2">
+                                <Phone className="w-4 h-4" />
+                                Call
+                            </button>
+                        )}
+                    </div>
+                </div>
+            </div>
+
+            {/* Customer's Booking Info */}
+            <div className="mb-6">
+                <h3 className="font-semibold text-gray-900 mb-4">{(currentUser?.displayName || currentUser?.email || 'Your').split(' ')[0]}'s Booking</h3>
+
+                {/* Service Location */}
+                <div className="mb-4 p-3 bg-blue-50 rounded-lg">
+                    <div className="flex items-center justify-between mb-1">
+                        <span className="text-xs font-medium text-gray-700">Service Location</span>
+                        {setAddress && (
+                            <button className="text-xs text-blue-600 hover:text-blue-700 font-medium" onClick={handleChangeAddress}>
+                                Change
+                            </button>
+                        )}
+                    </div>
+                    <div className="flex items-start gap-2">
+                        <MapPin className="w-4 h-4 text-gray-600 mt-0.5 flex-shrink-0" />
+                        <p className="text-sm text-gray-800">{address}</p>
+                    </div>
+                </div>
+
+                {/* Vehicle */}
+                <div className="mb-4 p-3 bg-blue-50 rounded-lg">
+                    <div className="flex items-center justify-between mb-1">
+                        <span className="text-xs font-medium text-gray-700">Your Vehicle</span>
+                        {setAnswers && (
+                            <button className="text-xs text-blue-600 hover:text-blue-700 font-medium" onClick={handleChangeVehicle}>
+                                Change
+                            </button>
+                        )}
+                    </div>
+                    <div className="flex items-center gap-2">
+                        <Car className="w-4 h-4 text-gray-600" />
+                        <p className="text-sm text-gray-800">{answers?.vehicleType}</p>
+                    </div>
+                </div>
+            </div>
+
+            {/* Select Package */}
+            <div className="mb-6">
+                <div className="flex items-center justify-between mb-4">
+                    <h4 className="font-semibold text-gray-900">Select Package</h4>
+                    {selectedPackage && (
+                        <button
+                            onClick={() => setPackageExpanded(!packageExpanded)}
+                            className="text-sm text-blue-600 hover:text-blue-700 font-medium"
+                        >
+                            {packageExpanded ? 'Hide' : 'Show'} Packages
+                        </button>
+                    )}
+                </div>
+
+                {/* Show selected package summary when collapsed */}
+                {selectedPackage && !packageExpanded && (
+                    <div className="mb-4 space-y-2">
+                        <div className="p-4 bg-blue-50 border-2 border-blue-200 rounded-lg">
+                            <div className="flex items-center justify-between mb-2">
+                                <div>
+                                    <div className="font-semibold text-gray-900">{selectedPackage.name}</div>
+                                </div>
+                                <div className="text-right">
+                                    <div className="font-bold text-gray-900">${selectedPackage.price}</div>
+                                </div>
+                            </div>
+                            {selectedAddOns.length > 0 && (
+                                <div className="mt-2 pt-2 border-t border-blue-200">
+                                    <div className="text-xs text-gray-600 mb-1">Add-ons:</div>
+                                    {selectedAddOns.map(addOnId => {
+                                        const addOn = ADD_ONS.find(a => a.id === addOnId);
+                                        return addOn ? (
+                                            <div key={addOnId} className="text-xs text-gray-700">+ {addOn.name} (${addOn.price})</div>
+                                        ) : null;
+                                    })}
+                                </div>
+                            )}
+                        </div>
+                        <div className="p-3 bg-gray-50 border-2 border-gray-200 rounded-lg">
+                            <div className="flex items-center justify-between">
+                                <span className="font-semibold text-gray-900 text-sm">Total:</span>
+                                <span className="font-bold text-gray-900">${totalPrice}</span>
+                            </div>
+                        </div>
+                        <button
+                            onClick={() => setPackageExpanded(true)}
+                            className="w-full text-xs text-blue-600 hover:text-blue-700 font-medium"
+                        >
+                            Change Package
+                        </button>
+                    </div>
+                )}
+
+                {/* Packages list - only show when expanded or no package selected */}
+                {(packageExpanded || !selectedPackage) && (
+                    <div className="space-y-3">
+                        {availablePackages.length === 0 ? (
+                            <p className="text-sm text-gray-500">No packages available.</p>
+                        ) : (
+                            availablePackages.map((pkg) => {
+                                const isSelected = selectedPackage?.id === pkg.id;
+                                return (
+                                    <div
+                                        key={pkg.id}
+                                        onClick={() => setSelectedPackage(pkg)}
+                                        className={`w-full text-left p-4 border-2 rounded-lg transition-all cursor-pointer ${isSelected
+                                            ? 'border-blue-600 bg-blue-50'
+                                            : 'border-gray-200 hover:border-blue-300'
+                                            }`}
+                                    >
+                                        <div className="flex items-start justify-between gap-3 mb-2">
+                                            <div className="flex items-center gap-3 flex-1 min-w-0">
+                                                <input
+                                                    type="radio"
+                                                    checked={isSelected}
+                                                    onChange={() => setSelectedPackage(pkg)}
+                                                    className="w-4 h-4 text-blue-600 border-gray-300 focus:ring-blue-500 flex-shrink-0 mt-1"
+                                                />
+                                                <div className="flex-1 min-w-0">
+                                                    <div className="font-semibold text-gray-900 text-base mb-1">{pkg.name}</div>
+                                                    <div className="text-xs text-gray-500 mb-2">{pkg.description}</div>
+                                                </div>
+                                            </div>
+                                            <div className="text-right flex-shrink-0">
+                                                <div className="font-bold text-gray-900">${pkg.price}</div>
+                                            </div>
+                                        </div>
+
+                                        {/* Show services included when selected */}
+                                        {isSelected && (
+                                            <div className="mt-3 pt-3 border-t border-blue-200">
+                                                <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+                                                    <div>
+                                                        <div className="font-semibold text-gray-700 mb-1">Exterior:</div>
+                                                        <ul className="space-y-1 text-gray-600">
+                                                            {pkg.exteriorServices.map((svc, idx) => (
+                                                                <li key={idx} className="flex items-start">
+                                                                    <CheckCircle2 className="w-3 h-3 text-green-500 mr-1 mt-0.5 flex-shrink-0" />
+                                                                    <span>{svc}</span>
+                                                                </li>
+                                                            ))}
+                                                        </ul>
+                                                    </div>
+                                                    <div>
+                                                        <div className="font-semibold text-gray-700 mb-1">Interior:</div>
+                                                        <ul className="space-y-1 text-gray-600">
+                                                            {pkg.interiorServices.map((svc, idx) => (
+                                                                <li key={idx} className="flex items-start">
+                                                                    <CheckCircle2 className="w-3 h-3 text-green-500 mr-1 mt-0.5 flex-shrink-0" />
+                                                                    <span>{svc}</span>
+                                                                </li>
+                                                            ))}
+                                                        </ul>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        )}
+                                    </div>
+                                );
+                            })
+                        )}
+                    </div>
+                )}
+
+                {/* Add-ons section - only show when package is selected */}
+                {selectedPackage && availableAddOnsList.length > 0 && (
+                    <div className="mt-4 pt-4 border-t border-gray-200">
+                        <h5 className="font-semibold text-gray-900 mb-3 text-sm">Add-ons (Optional)</h5>
+                        <div className="space-y-2">
+                            {availableAddOnsList.map((addOn) => {
+                                const isSelected = selectedAddOns.includes(addOn.id);
+                                return (
+                                    <div
+                                        key={addOn.id}
+                                        onClick={() => toggleAddOn(addOn.id)}
+                                        className={`w-full text-left px-3 py-2 border-2 rounded-lg transition-all cursor-pointer ${isSelected
+                                            ? 'border-blue-600 bg-blue-50'
+                                            : 'border-gray-200 hover:border-blue-300'
+                                            }`}
+                                    >
+                                        <div className="flex items-center justify-between gap-2">
+                                            <div className="flex items-center gap-2 flex-1 min-w-0">
+                                                <input
+                                                    type="checkbox"
+                                                    checked={isSelected}
+                                                    onChange={() => toggleAddOn(addOn.id)}
+                                                    className="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500 flex-shrink-0"
+                                                />
+                                                <div className="flex-1 min-w-0">
+                                                    <div className="font-semibold text-gray-900 text-sm">{addOn.name}</div>
+                                                    <div className="text-xs text-gray-500">{addOn.description}</div>
+                                                </div>
+                                            </div>
+                                            <div className="text-right flex-shrink-0">
+                                                <div className="font-bold text-gray-900 text-sm">+${addOn.price}</div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    </div>
+                )}
+            </div>
+
+            {/* Desktop: Regular date/time selection */}
+            <div className="hidden lg:block">
+                {/* Select Date */}
+                <div className="mb-6">
+                    <label className="block font-semibold text-gray-900 mb-3">Select Date</label>
+                    <input
+                        type="date"
+                        value={selectedDate}
+                        onChange={(e) => setSelectedDate(e.target.value)}
+                        min={new Date().toISOString().split('T')[0]}
+                        className="w-full px-4 py-2 border-2 border-gray-200 rounded-lg focus:border-blue-600 focus:outline-none"
+                    />
+                </div>
+
+                {/* Select Time */}
+                <div className="mb-6">
+                    <label className="block font-semibold text-gray-900 mb-3">Select Time</label>
+                    {availableTimesForSelectedDate.length === 0 ? (
+                        <div className="p-4 bg-gray-100 border-2 border-gray-200 rounded-lg text-center">
+                            <p className="text-gray-600 font-medium">
+                                {selectedDate ? 'Closed - No availability on this day' : 'Please select a date first'}
+                            </p>
+                        </div>
+                    ) : (
+                        <div className="grid grid-cols-2 gap-2">
+                            {availableTimesForSelectedDate.map((time) => (
+                                <button
+                                    key={time}
+                                    onClick={() => setSelectedTime(time)}
+                                    className={`px-4 py-2 border-2 rounded-lg font-medium transition-all ${selectedTime === time ? 'border-blue-600 bg-blue-50 text-blue-700' : 'border-gray-200 text-gray-700 hover:border-blue-300'
+                                        }`}
+                                >
+                                    {time}
+                                </button>
+                            ))}
+                        </div>
+                    )}
+                </div>
+
+                {/* Total */}
+                {selectedPackage && (
+                    <div className="p-4 bg-gray-50 rounded-lg mb-4">
+                        <div className="mb-2 space-y-1">
+                            <div className="flex items-center justify-between text-sm">
+                                <span className="text-gray-600">{selectedPackage.name}:</span>
+                                <span className="text-gray-900 font-medium">${selectedPackage.price}</span>
+                            </div>
+                            {selectedAddOns.map(addOnId => {
+                                const addOn = ADD_ONS.find(a => a.id === addOnId);
+                                return addOn ? (
+                                    <div key={addOnId} className="flex items-center justify-between text-sm">
+                                        <span className="text-gray-600">+ {addOn.name}:</span>
+                                        <span className="text-gray-900 font-medium">${addOn.price}</span>
+                                    </div>
+                                ) : null;
+                            })}
+                        </div>
+                        <div className="flex items-center justify-between pt-2 border-t border-gray-300">
+                            <span className="text-gray-600 font-medium">Total:</span>
+                            <span className="text-3xl font-bold text-gray-900">${totalPrice}</span>
+                        </div>
+                    </div>
+                )}
+
+                {/* Book Button */}
+                <button
+                    onClick={onBookNow || handleBookNow}
+                    disabled={isBooking || !selectedPackage || !selectedTime || !selectedDate}
+                    className="w-full bg-blue-600 text-white py-4 rounded-xl font-bold text-lg hover:bg-blue-700 transition-colors shadow-lg disabled:bg-gray-300 disabled:cursor-not-allowed mb-4"
+                >
+                    {isBooking
+                        ? 'Booking...'
+                        : !selectedPackage
+                            ? 'Select Package'
+                            : `Book ${selectedPackage.name}`
+                    }
+                </button>
+            </div>
+
+            {/* Mobile: Sticky footer with date/time and book button */}
+            <div className="lg:hidden sticky bottom-0 bg-white border-t border-gray-200 p-4 -mx-6 -mb-6 mt-6 shadow-lg">
+                {/* Total */}
+                {selectedPackage && (
+                    <div className="mb-3 p-3 bg-gray-50 rounded-lg">
+                        <div className="mb-2 space-y-1">
+                            <div className="flex items-center justify-between text-xs">
+                                <span className="text-gray-600 truncate pr-2">{selectedPackage.name}:</span>
+                                <span className="text-gray-900 font-medium">${selectedPackage.price}</span>
+                            </div>
+                            {selectedAddOns.map(addOnId => {
+                                const addOn = ADD_ONS.find(a => a.id === addOnId);
+                                return addOn ? (
+                                    <div key={addOnId} className="flex items-center justify-between text-xs">
+                                        <span className="text-gray-600 truncate pr-2">+ {addOn.name}:</span>
+                                        <span className="text-gray-900 font-medium">${addOn.price}</span>
+                                    </div>
+                                ) : null;
+                            })}
+                        </div>
+                        <div className="flex items-center justify-between pt-2 border-t border-gray-300">
+                            <span className="text-gray-600 font-medium text-sm">Total:</span>
+                            <span className="text-2xl font-bold text-gray-900">${totalPrice}</span>
+                        </div>
+                    </div>
+                )}
+
+                {/* Select Date */}
+                <div className="mb-3">
+                    <label className="block font-semibold text-gray-900 mb-2 text-sm">Select Date</label>
+                    <input
+                        type="date"
+                        value={selectedDate}
+                        onChange={(e) => setSelectedDate(e.target.value)}
+                        min={new Date().toISOString().split('T')[0]}
+                        className="w-full px-4 py-2 border-2 border-gray-200 rounded-lg focus:border-blue-600 focus:outline-none text-sm"
+                    />
+                </div>
+
+                {/* Select Time */}
+                <div className="mb-3">
+                    <label className="block font-semibold text-gray-900 mb-2 text-sm">Select Time</label>
+                    {availableTimesForSelectedDate.length === 0 ? (
+                        <div className="p-3 bg-gray-100 border-2 border-gray-200 rounded-lg text-center">
+                            <p className="text-gray-600 font-medium text-sm">
+                                {selectedDate ? 'Closed - No availability on this day' : 'Please select a date first'}
+                            </p>
+                        </div>
+                    ) : (
+                        <div className="grid grid-cols-3 gap-2 max-h-32 overflow-y-auto">
+                            {availableTimesForSelectedDate.map((time) => (
+                                <button
+                                    key={time}
+                                    onClick={() => setSelectedTime(time)}
+                                    className={`px-3 py-2 border-2 rounded-lg font-medium transition-all text-sm ${selectedTime === time ? 'border-blue-600 bg-blue-50 text-blue-700' : 'border-gray-200 text-gray-700 hover:border-blue-300'
+                                        }`}
+                                >
+                                    {time}
+                                </button>
+                            ))}
+                        </div>
+                    )}
+                </div>
+
+                {/* Book Button */}
+                <button
+                    onClick={onBookNow || handleBookNow}
+                    disabled={isBooking || !selectedPackage || !selectedTime || !selectedDate}
+                    className="w-full bg-blue-600 text-white py-3 rounded-xl font-bold text-base hover:bg-blue-700 transition-colors shadow-lg disabled:bg-gray-300 disabled:cursor-not-allowed"
+                >
+                    {isBooking
+                        ? 'Booking...'
+                        : !selectedPackage
+                            ? 'Select Package'
+                            : `Book ${selectedPackage.name}`
+                    }
+                </button>
+            </div>
+
+            {/* Payment Modal */}
+            {showPayment && bookingData && (
+                <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+                    <PaymentForm
+                        amount={bookingData.price}
+                        serviceAddress={bookingData.address}
+                        onClose={() => {
+                            setShowPayment(false);
+                            setBookingData(null);
+                        }}
+                        onComplete={handlePaymentComplete}
+                    />
+                </div>
+            )}
+
+            {/* Support */}
+            <button onClick={handleSupport} className="w-full py-2 text-sm text-gray-600 hover:text-gray-800 flex items-center justify-center gap-2">
+                <MessageSquare className="w-4 h-4" />
+                Need help? Contact Brnno Support
+            </button>
+        </div>
+    );
+}
+
+// ==================== MARKETPLACE PAGE ====================
+function MarketplacePage({
+    detailers,
+    allDetailersCount,
+    onSelectDetailer,
+    currentUser,
+    onGoToDashboard,
+    onLogout,
+    showProfileDropdown,
+    setShowProfileDropdown,
+    address,
+    onChangeLocation,
+    searchQuery,
+    onSearchChange,
+    distanceFilter,
+    onDistanceChange,
+    sortBy,
+    onSortChange
+}) {
+    const profileDropdownRef = React.useRef(null);
+
+    // Close dropdown when clicking outside
+    useEffect(() => {
+        function handleClickOutside(event) {
+            if (profileDropdownRef.current && !profileDropdownRef.current.contains(event.target)) {
+                setShowProfileDropdown(false);
+            }
+        }
+
+        if (showProfileDropdown) {
+            document.addEventListener('mousedown', handleClickOutside);
+        }
+
+        return () => {
+            document.removeEventListener('mousedown', handleClickOutside);
+        };
+    }, [showProfileDropdown, setShowProfileDropdown]);
+
+    return (
+        <div className="min-h-screen bg-gray-50">
+            {/* Glassmorphic Header */}
+            <div className="sticky top-0 z-40 backdrop-blur-xl bg-gradient-to-r from-blue-600/90 via-blue-700/90 to-indigo-600/90 border-b border-blue-400/20 shadow-lg">
+                <div className="max-w-6xl mx-auto px-4 py-4">
+                    <div className="flex items-center justify-between">
+                        <h1 className="text-2xl font-bold text-white drop-shadow-md">Brnno</h1>
+
+                        {currentUser && (
+                            <div className="relative" ref={profileDropdownRef}>
+                                <button
+                                    onClick={() => setShowProfileDropdown(!showProfileDropdown)}
+                                    className="w-11 h-11 bg-gradient-to-br from-purple-500 to-pink-500 rounded-full flex items-center justify-center text-white font-semibold hover:from-purple-600 hover:to-pink-600 transition-all shadow-lg hover:shadow-xl transform hover:scale-105 ring-2 ring-white/30"
+                                >
+                                    {currentUser.initials}
+                                </button>
+                                {showProfileDropdown && (
+                                    <ProfileDropdown
+                                        currentUser={currentUser}
+                                        onGoToDashboard={() => { setShowProfileDropdown(false); onGoToDashboard(); }}
+                                        onLogout={onLogout}
+                                    />
+                                )}
+                            </div>
+                        )}
+                    </div>
+                </div>
+            </div>
+
+            {/* Search & Filter Bar */}
+            <div className="bg-white border-b border-gray-200 py-4">
+                <div className="max-w-6xl mx-auto px-4">
+                    <div className="flex flex-col md:flex-row gap-4 mb-3">
+                        {/* Search Input */}
+                        <div className="flex-1 relative">
+                            <MapPin className="absolute left-3 top-3 w-5 h-5 text-gray-400" />
+                            <input
+                                type="text"
+                                value={searchQuery}
+                                onChange={(e) => onSearchChange(e.target.value)}
+                                placeholder="Search by city or ZIP code..."
+                                className="w-full pl-10 pr-4 py-2.5 border-2 border-gray-200 rounded-lg focus:border-blue-600 focus:outline-none"
+                            />
+                        </div>
+
+                        {/* Distance Filter */}
+                        <select
+                            value={distanceFilter}
+                            onChange={(e) => onDistanceChange(Number(e.target.value))}
+                            className="px-4 py-2.5 border-2 border-gray-200 rounded-lg focus:border-blue-600 focus:outline-none bg-white"
+                        >
+                            <option value={5}>Within 5 miles</option>
+                            <option value={10}>Within 10 miles</option>
+                            <option value={25}>Within 25 miles</option>
+                            <option value={50}>Within 50 miles</option>
+                            <option value={999}>Any distance</option>
+                        </select>
+
+                        {/* Sort Dropdown */}
+                        <select
+                            value={sortBy}
+                            onChange={(e) => onSortChange(e.target.value)}
+                            className="px-4 py-2.5 border-2 border-gray-200 rounded-lg focus:border-blue-600 focus:outline-none bg-white"
+                        >
+                            <option value="distance">Sort: Distance</option>
+                            <option value="price">Sort: Price</option>
+                            <option value="rating">Sort: Rating</option>
+                            <option value="reviews">Sort: Reviews</option>
+                        </select>
+                    </div>
+
+                    {/* Current Location & Results Count */}
+                    <div className="flex items-center justify-between text-sm">
+                        <div className="flex items-center gap-2">
+                            <span className="text-gray-600">
+                                Showing results near:
+                            </span>
+                            <strong className="text-gray-900">{address}</strong>
+                            <button
+                                onClick={onChangeLocation}
+                                className="text-blue-600 hover:text-blue-700 font-medium ml-2"
+                            >
+                                Change
+                            </button>
+                        </div>
+                        <span className="text-gray-500">
+                            {detailers.length} of {allDetailersCount} detailer{allDetailersCount !== 1 ? 's' : ''}
+                        </span>
+                    </div>
+                </div>
+            </div>
+
+            {/* Detailer List */}
+            <div className="max-w-6xl mx-auto px-4 py-8">
+                {detailers.length === 0 ? (
+                    <div className="text-center py-12">
+                        <Search className="w-16 h-16 text-gray-300 mx-auto mb-4" />
+                        <h3 className="text-xl font-semibold text-gray-900 mb-2">No detailers found</h3>
+                        <p className="text-gray-600 mb-4">
+                            Try adjusting your filters or search in a different area
+                        </p>
                         <button
                             onClick={() => {
-                                setSelectedProvider(service);
-                                setShowProviderDetail(true);
+                                onSearchChange('');
+                                onDistanceChange(50);
                             }}
-                            className="border-2 border-cyan-600 text-cyan-600 hover:bg-cyan-50 font-semibold px-4 py-3 rounded-xl transition-colors duration-200"
+                            className="px-6 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700"
                         >
-                            View Details
+                            Clear Filters
                         </button>
+                    </div>
+                ) : (
+                    <>
+                        <h2 className="text-3xl font-bold text-gray-900 mb-6">
+                            Available Detailers
+                        </h2>
+
+                        <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-6">
+                            {detailers.map((detailer) => (
+                                <DetailerCard
+                                    key={detailer.id}
+                                    detailer={detailer}
+                                    onClick={() => onSelectDetailer(detailer)}
+                                />
+                            ))}
+                        </div>
+                    </>
+                )}
+            </div>
+        </div>
+    );
+}
+
+function DetailerCard({ detailer, onClick }) {
+    // Default logo for Cloud Mobile if no image is set
+    const isCloudMobile = detailer.name?.toLowerCase().includes('cloud mobile');
+    const imageUrl = detailer.image || (isCloudMobile ? 'https://via.placeholder.com/400x200/3B82F6/FFFFFF?text=Cloud+Mobile' : null);
+
+    return (
+        <div
+            onClick={onClick}
+            className="bg-white rounded-xl border border-gray-200 overflow-hidden hover:shadow-lg transition-shadow cursor-pointer"
+        >
+            <div className="h-48 bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+                {imageUrl ? (
+                    <img src={imageUrl} alt={detailer.name} className="w-full h-full object-cover" />
+                ) : (
+                    <span className="text-4xl sm:text-5xl md:text-6xl font-bold text-white">
+                        {detailer.name.charAt(0)}
+                    </span>
+                )}
+            </div>
+
+            <div className="p-6">
+                <h3 className="text-xl font-bold text-gray-900 mb-2">
+                    {detailer.name}
+                </h3>
+
+                <div className="flex items-center gap-2 mb-2">
+                    <div className="flex items-center gap-1">
+                        <Star className={`w-4 h-4 ${detailer.reviews > 0 ? 'fill-yellow-400 text-yellow-400' : 'fill-gray-300 text-gray-300'}`} />
+                        {detailer.rating && detailer.reviews > 0 ? (
+                            <>
+                                <span className="font-semibold">{detailer.rating}</span>
+                                <span className="text-sm text-gray-500">({detailer.reviews})</span>
+                            </>
+                        ) : (
+                            <span className="text-sm text-gray-500">No reviews yet</span>
+                        )}
+                    </div>
+                </div>
+                <div className="space-y-1 text-sm text-gray-600 mb-3">
+                    <div className="flex items-center gap-1">
+                        <MapPin className="w-4 h-4" />
+                        <span>{detailer.serviceArea} • {detailer.distance} mi</span>
+                    </div>
+                    <div className="flex items-center gap-1">
+                        <Clock className="w-4 h-4" />
+                        <span>{getProviderHours(detailer.defaultAvailability)}</span>
+                    </div>
+                </div>
+                <div className="flex items-center justify-between">
+                    <span className="text-sm text-gray-500">Starting at</span>
+                    <span className="font-bold text-lg text-gray-900">${detailer.price}</span>
+                </div>
+            </div>
+        </div>
+    );
+}
+
+function ProfileDropdown({ currentUser, onGoToDashboard, onLogout }) {
+    const handleDashboardClick = () => {
+        if (onGoToDashboard) {
+            onGoToDashboard();
+        }
+    };
+
+    const handleLogoutClick = () => {
+        if (onLogout) {
+            onLogout();
+        }
+    };
+
+    return (
+        <div className="absolute right-0 top-12 w-64 bg-white rounded-xl shadow-xl border border-gray-200 py-2 z-50 animate-fadeIn">
+            <div className="px-4 py-3 border-b border-gray-100">
+                <div className="font-semibold text-gray-900">{currentUser.name}</div>
+                <div className="text-sm text-gray-500">{currentUser.email}</div>
+            </div>
+
+            <button
+                onClick={handleDashboardClick}
+                className="w-full px-4 py-3 text-left hover:bg-gray-50 flex items-center gap-3 text-gray-700"
+            >
+                <User className="w-5 h-5" />
+                <span>My Dashboard</span>
+            </button>
+
+            <button
+                onClick={handleLogoutClick}
+                className="w-full px-4 py-3 text-left hover:bg-gray-50 flex items-center gap-3 text-red-600"
+            >
+                <LogOut className="w-5 h-5" />
+                <span>Sign Out</span>
+            </button>
+        </div>
+    );
+}
+
+// ==================== DETAILER PROFILE PAGE ====================
+function DetailerProfilePage({ detailer, answers, address, setAddress, setAnswers, currentUser, onBack, onBook }) {
+    const [activeTab, setActiveTab] = useState('about');
+
+    return (
+        <div className="min-h-screen bg-gray-50">
+            {/* Glassmorphic Header */}
+            <div className="sticky top-0 z-40 backdrop-blur-xl bg-gradient-to-r from-blue-600/90 via-blue-700/90 to-indigo-600/90 border-b border-blue-400/20 shadow-lg">
+                <div className="max-w-6xl mx-auto px-4 py-4">
+                    <button
+                        onClick={onBack}
+                        className="flex items-center gap-2 text-white font-semibold hover:text-blue-100 transition-colors drop-shadow-sm"
+                    >
+                        ← Back
+                    </button>
+                </div>
+            </div>
+
+            <div className="max-w-5xl mx-auto px-4 py-6 sm:py-8">
+                {/* Profile Header Card */}
+                <div className="bg-white rounded-xl border border-gray-200 shadow-md p-4 sm:p-6 mb-6">
+                    <div className="flex items-start gap-3 sm:gap-4">
+                        <div className="w-16 h-16 sm:w-20 sm:h-20 bg-gradient-to-br from-blue-600 to-indigo-600 rounded-xl flex items-center justify-center flex-shrink-0 shadow-lg">
+                            <span className="text-2xl sm:text-3xl font-bold text-white">
+                                {detailer.name.charAt(0)}
+                            </span>
+                        </div>
+                        <div className="flex-1 min-w-0">
+                            <h1 className="text-2xl sm:text-3xl font-bold text-gray-900 mb-2 break-words">
+                                {detailer.name}
+                            </h1>
+                            <div className="flex flex-col sm:flex-row items-start sm:items-center gap-2 sm:gap-4 text-sm mb-3">
+                                <div className="flex items-center gap-1">
+                                    <Star className={`w-4 h-4 sm:w-5 sm:h-5 ${detailer.reviews > 0 ? 'text-yellow-500 fill-current' : 'text-gray-300 fill-gray-300'}`} />
+                                    {detailer.rating && detailer.reviews > 0 ? (
+                                        <>
+                                            <span className="font-semibold text-base sm:text-lg">{detailer.rating}</span>
+                                            <span className="text-gray-500">({detailer.reviews} reviews)</span>
+                                        </>
+                                    ) : (
+                                        <span className="text-gray-500 text-sm sm:text-base">No reviews yet</span>
+                                    )}
+                                </div>
+                                <span className="hidden sm:inline text-gray-400">•</span>
+                                <div className="flex items-center gap-1 text-gray-600">
+                                    <MapPin className="w-4 h-4 sm:w-5 sm:h-5" />
+                                    <span>{detailer.distance} miles away</span>
+                                </div>
+                            </div>
+                            <div className="flex items-center gap-2">
+                                <CheckCircle2 className="w-5 h-5 text-green-600" />
+                                <span className="font-medium text-green-600">
+                                    Available for your time slot
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div className="grid lg:grid-cols-3 gap-4 sm:gap-6">
+                    {/* Main Content with Tabs */}
+                    <div className="lg:col-span-2">
+                        {/* Tabs */}
+                        <div className="bg-white rounded-t-xl border border-gray-200 border-b-0 shadow-sm">
+                            <div className="flex overflow-x-auto scrollbar-hide">
+                                <button
+                                    onClick={() => setActiveTab('about')}
+                                    className={`px-6 py-4 border-b-2 font-semibold transition-all whitespace-nowrap ${activeTab === 'about'
+                                        ? 'border-blue-600 text-blue-600 bg-blue-50/50'
+                                        : 'border-transparent text-gray-600 hover:text-gray-900 hover:bg-gray-50'
+                                        }`}
+                                >
+                                    About
+                                </button>
+                                <button
+                                    onClick={() => setActiveTab('services')}
+                                    className={`px-6 py-4 border-b-2 font-semibold transition-all whitespace-nowrap ${activeTab === 'services'
+                                        ? 'border-blue-600 text-blue-600 bg-blue-50/50'
+                                        : 'border-transparent text-gray-600 hover:text-gray-900 hover:bg-gray-50'
+                                        }`}
+                                >
+                                    Services
+                                </button>
+                                <button
+                                    onClick={() => setActiveTab('photos')}
+                                    className={`px-6 py-4 border-b-2 font-semibold transition-all whitespace-nowrap ${activeTab === 'photos'
+                                        ? 'border-blue-600 text-blue-600 bg-blue-50/50'
+                                        : 'border-transparent text-gray-600 hover:text-gray-900 hover:bg-gray-50'
+                                        }`}
+                                >
+                                    Photos
+                                </button>
+                            </div>
+                        </div>
+
+                        {/* Tab Content */}
+                        <div className="bg-white rounded-b-xl border border-gray-200 shadow-md p-4 sm:p-6 min-h-[400px]">
+                            {activeTab === 'about' && (
+                                <div>
+                                    <h3 className="font-semibold text-gray-900 mb-4 text-lg">About</h3>
+                                    <p className="text-gray-600 leading-relaxed">{detailer.about}</p>
+                                </div>
+                            )}
+
+                            {activeTab === 'services' && (
+                                <div>
+                                    <h3 className="font-semibold text-gray-900 mb-4 text-lg">Packages</h3>
+                                    {detailer.packages && detailer.packages.length > 0 ? (
+                                        <div className="space-y-4">
+                                            {[...detailer.packages].sort((a, b) => {
+                                                const priceA = a.price || 0;
+                                                const priceB = b.price || 0;
+                                                return priceA - priceB; // Sort low to high
+                                            }).map((pkg) => (
+                                                <div
+                                                    key={pkg.id}
+                                                    className="p-4 border-2 border-gray-200 rounded-lg hover:border-blue-300 hover:shadow-md transition-all"
+                                                >
+                                                    <div className="flex items-start justify-between mb-3">
+                                                        <div className="flex-1 min-w-0 pr-2">
+                                                            <div className="font-semibold text-gray-900 text-base mb-1">{pkg.name}</div>
+                                                            <div className="text-xs text-gray-500 mb-2">{pkg.description}</div>
+                                                        </div>
+                                                        <div className="text-right flex-shrink-0">
+                                                            <div className="text-lg font-bold text-blue-600">${pkg.price}</div>
+                                                        </div>
+                                                    </div>
+                                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3 pt-3 border-t border-gray-200">
+                                                        <div>
+                                                            <div className="text-xs font-semibold text-gray-700 mb-1">Exterior Services:</div>
+                                                            <ul className="text-xs text-gray-600 space-y-1">
+                                                                {pkg.exteriorServices.map((svc, idx) => (
+                                                                    <li key={idx} className="flex items-start">
+                                                                        <CheckCircle2 className="w-3 h-3 text-green-500 mr-1 mt-0.5 flex-shrink-0" />
+                                                                        <span>{svc}</span>
+                                                                    </li>
+                                                                ))}
+                                                            </ul>
+                                                        </div>
+                                                        <div>
+                                                            <div className="text-xs font-semibold text-gray-700 mb-1">Interior Services:</div>
+                                                            <ul className="text-xs text-gray-600 space-y-1">
+                                                                {pkg.interiorServices.map((svc, idx) => (
+                                                                    <li key={idx} className="flex items-start">
+                                                                        <CheckCircle2 className="w-3 h-3 text-green-500 mr-1 mt-0.5 flex-shrink-0" />
+                                                                        <span>{svc}</span>
+                                                                    </li>
+                                                                ))}
+                                                            </ul>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    ) : (
+                                        <p className="text-gray-500">No packages available.</p>
+                                    )}
+                                </div>
+                            )}
+
+                            {activeTab === 'photos' && (
+                                <div>
+                                    <h3 className="font-semibold text-gray-900 mb-4 text-lg">Recent Work</h3>
+                                    {detailer.photos && detailer.photos.length > 0 ? (
+                                        <div className="grid grid-cols-3 gap-3">
+                                            {detailer.photos.map((photo, idx) => (
+                                                <div key={idx} className="aspect-square bg-gray-200 rounded-lg overflow-hidden hover:scale-105 transition-transform shadow-md cursor-pointer">
+                                                    <img src={photo} alt={`Work ${idx + 1}`} className="w-full h-full object-cover" />
+                                                </div>
+                                            ))}
+                                        </div>
+                                    ) : (
+                                        <div className="text-center py-12">
+                                            <Package className="w-16 h-16 text-gray-300 mx-auto mb-4" />
+                                            <p className="text-gray-500">No photos available</p>
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+                        </div>
+                    </div>
+
+                    {/* Booking Sidebar */}
+                    <div className="lg:col-span-1">
+                        <BookingSidebar
+                            detailer={detailer}
+                            answers={answers}
+                            address={address}
+                            setAddress={setAddress}
+                            setAnswers={setAnswers}
+                            currentUser={currentUser}
+                            onBook={onBook}
+                        />
                     </div>
                 </div>
             </div>
         </div>
     );
+}
+
+// ==================== CUSTOMER DASHBOARD ====================
+function CustomerDashboard({ currentUser, onBackToMarketplace, onLogout, showProfileDropdown, setShowProfileDropdown, address, answers, userCoordinates }) {
+    const [activeTab, setActiveTab] = useState('upcoming');
+    const [loading, setLoading] = useState(true);
+    const profileDropdownRef = React.useRef(null);
+
+    // Real data from Firebase
+    const [upcomingAppointments, setUpcomingAppointments] = useState([]);
+    const [savedVehicles, setSavedVehicles] = useState([]);
+    const [paymentMethods, setPaymentMethods] = useState([]);
+    const [savedAddresses, setSavedAddresses] = useState([]);
+    const [userData, setUserData] = useState(null);
+
+    // Close dropdown when clicking outside
+    useEffect(() => {
+        function handleClickOutside(event) {
+            if (profileDropdownRef.current && !profileDropdownRef.current.contains(event.target)) {
+                setShowProfileDropdown(false);
+            }
+        }
+
+        if (showProfileDropdown) {
+            document.addEventListener('mousedown', handleClickOutside);
+        }
+
+        return () => {
+            document.removeEventListener('mousedown', handleClickOutside);
+        };
+    }, [showProfileDropdown, setShowProfileDropdown]);
+
+    // Load user data and related info
+    useEffect(() => {
+        if (currentUser) {
+            loadDashboardData();
+        }
+    }, [currentUser]);
+
+    // Initialize notifications for customers
+    useEffect(() => {
+        if (!currentUser) return;
+
+        let unsubscribeNotifications = null;
+        let unsubscribeUnread = null;
+
+        async function initializeNotifications() {
+            try {
+                // Request notification permission and get token
+                const token = await requestNotificationPermission();
+                if (token) {
+                    await saveFCMToken(currentUser.uid, token);
+                }
+
+                // Set up foreground message handler
+                setupForegroundMessageHandler();
+
+                // Subscribe to notifications with error handling
+                try {
+                    unsubscribeNotifications = subscribeToNotifications(currentUser.uid, (notifs) => {
+                        try {
+                            // Handle customer notifications if needed
+                            // You can add state management here if needed
+                        } catch (error) {
+                            console.error('Error handling customer notifications:', error);
+                        }
+                    });
+
+                    unsubscribeUnread = subscribeToUnreadCount(currentUser.uid, (count) => {
+                        try {
+                            // Handle unread count if needed
+                        } catch (error) {
+                            console.error('Error handling unread count:', error);
+                        }
+                    });
+                } catch (subscriptionError) {
+                    console.error('Error setting up notification subscriptions:', subscriptionError);
+                }
+            } catch (error) {
+                console.error('Error initializing customer notifications:', error);
+            }
+        }
+
+        initializeNotifications();
+
+        // Cleanup function
+        return () => {
+            try {
+                if (typeof unsubscribeNotifications === 'function') unsubscribeNotifications();
+                if (typeof unsubscribeUnread === 'function') unsubscribeUnread();
+            } catch (error) {
+                console.warn('Error unsubscribing from notifications:', error);
+            }
+        };
+    }, [currentUser]);
+
+    async function loadDashboardData() {
+        setLoading(true);
+        try {
+            // Load user profile data - check both customer and detailer collections
+            const customerDoc = await getDoc(doc(db, 'customer', currentUser.uid));
+            const detailerDoc = await getDoc(doc(db, 'detailer', currentUser.uid));
+
+            let userId = null;
+            if (customerDoc.exists()) {
+                userId = customerDoc.id;
+                setUserData({ id: customerDoc.id, ...customerDoc.data() });
+            } else if (detailerDoc.exists()) {
+                userId = detailerDoc.id;
+                setUserData({ id: detailerDoc.id, ...detailerDoc.data() });
+            }
+
+            // Load upcoming bookings
+            await loadUpcomingAppointments();
+
+            // Load saved vehicles (if you add this collection later)
+            if (userId) {
+                await loadSavedVehicles(userId);
+            }
+
+            // Load saved addresses (if you add this collection later)
+            if (userId) {
+                await loadSavedAddresses(userId);
+            }
+
+            // Note: Payment methods would come from Stripe, not Firebase
+            // You'd need to call your Stripe API endpoint
+
+        } catch (error) {
+            console.error('Error loading dashboard data:', error);
+        } finally {
+            setLoading(false);
+        }
+    }
+
+    async function loadUpcomingAppointments() {
+        try {
+            // Query bookings collection for this user's upcoming appointments
+            const bookingsQuery = query(
+                collection(db, 'bookings'),
+                where('customerId', '==', currentUser.uid),
+                where('status', 'in', ['pending', 'confirmed', 'scheduled'])
+            );
+
+            const bookingsSnapshot = await getDocs(bookingsQuery);
+
+            const appointments = await Promise.all(
+                bookingsSnapshot.docs.map(async (bookingDoc) => {
+                    const booking = bookingDoc.data();
+
+                    // Get provider details (unified structure)
+                    let providerName = 'Unknown Provider';
+                    if (booking.providerUserId) {
+                        const providerDoc = await getDoc(doc(db, 'detailer', booking.providerUserId));
+                        if (providerDoc.exists()) {
+                            providerName = providerDoc.data().businessName || providerDoc.data().displayName || 'Unknown Provider';
+                        }
+                    }
+
+                    return {
+                        id: bookingDoc.id,
+                        detailerName: providerName,
+                        service: booking.services && booking.services.length > 0
+                            ? booking.services.map(s => s.name).join(', ')
+                            : booking.serviceName || 'Service',
+                        services: booking.services || (booking.serviceName ? [{ name: booking.serviceName, price: booking.price }] : []),
+                        date: booking.date ? new Date(booking.date).toLocaleDateString() : 'TBD',
+                        time: booking.time || 'TBD',
+                        price: booking.price || 0,
+                        address: booking.address || 'N/A',
+                        status: booking.status
+                    };
+                })
+            );
+
+            setUpcomingAppointments(appointments);
+        } catch (error) {
+            console.error('Error loading appointments:', error);
+            setUpcomingAppointments([]);
+        }
+    }
+
+    async function loadSavedVehicles(userId) {
+        if (!userId) {
+            setSavedVehicles([]);
+            return;
+        }
+        try {
+            // Check if vehicles subcollection exists
+            const vehiclesSnapshot = await getDocs(
+                collection(db, 'customer', userId, 'vehicles')
+            );
+
+            const vehicles = vehiclesSnapshot.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data()
+            }));
+
+            setSavedVehicles(vehicles);
+        } catch (error) {
+            // Collection doesn't exist yet - that's fine
+            setSavedVehicles([]);
+        }
+    }
+
+    async function loadSavedAddresses(userId) {
+        if (!userId) {
+            setSavedAddresses([]);
+            return;
+        }
+        try {
+            // Check if addresses subcollection exists
+            const addressesSnapshot = await getDocs(
+                collection(db, 'customer', userId, 'addresses')
+            );
+
+            const addresses = addressesSnapshot.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data()
+            }));
+
+            setSavedAddresses(addresses);
+        } catch (error) {
+            // Collection doesn't exist yet - that's fine
+            setSavedAddresses([]);
+        }
+    }
+
+    if (loading) {
+        return (
+            <div className="min-h-screen bg-gray-50 flex items-center justify-center">
+                <div className="text-center">
+                    <div className="w-16 h-16 border-4 border-blue-600 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
+                    <p className="text-gray-600">Loading your dashboard...</p>
+                </div>
+            </div>
+        );
+    }
 
     return (
-        <Elements stripe={stripePromise}>
-            <div className="min-h-screen bg-gray-50">
-                <LoginModal
-                    showLoginModal={showLoginModal}
-                    setShowLoginModal={setShowLoginModal}
-                    authMode={authMode}
-                    setAuthMode={setAuthMode}
-                    setShowSignupModal={setShowSignupModal}
-                    setShowProviderModal={setShowProviderModal}
-                />
-                <SignupModal
-                    showSignupModal={showSignupModal}
-                    setShowSignupModal={setShowSignupModal}
-                    authMode={authMode}
-                    setAuthMode={setAuthMode}
-                    setShowLoginModal={setShowLoginModal}
-                    setShowProviderModal={setShowProviderModal}
-                />
-                <ProfilePanel
-                    showProfilePanel={showProfilePanel}
-                    setShowProfilePanel={setShowProfilePanel}
-                    profileTab={profileTab}
-                    setProfileTab={setProfileTab}
-                />
-                <BookingModal
-                    showBookingModal={showBookingModal}
-                    setShowBookingModal={setShowBookingModal}
-                    bookingStep={bookingStep}
-                    setBookingStep={setBookingStep}
-                    bookingData={bookingData}
-                    setBookingData={setBookingData}
-                    userVehicles={userVehicles}
-                    setShowAddVehicle={setShowAddVehicle}
-                    selectedProvider={selectedProvider}
-                />
-                {showProviderModal && (
-                    <ProviderApplicationModal
-                        showModal={showProviderModal}
-                        setShowModal={setShowProviderModal}
-                        providerStep={providerStep}
-                        setProviderStep={setProviderStep}
-                        providerData={providerData}
-                        setProviderData={setProviderData}
-                    />
-                )}
-                {showProviderDetail && (
-                    <ProviderDetailModal
-                        provider={selectedProvider}
-                        showModal={showProviderDetail}
-                        setShowModal={setShowProviderDetail}
-                        onBookNow={() => {
-                            setBookingData(prev => ({ ...prev, provider: selectedProvider }));
-                            setShowBookingModal(true);
-                        }}
-                        setSelectedProvider={setSelectedProvider}
-                        setBookingData={setBookingData}
-                        setShowBookingModal={setShowBookingModal}
-                        setReviewData={setReviewData}
-                        setShowReviewModal={setShowReviewModal}
-                    />
-                )}
-                {showProviderDashboard && (
-                    <ProviderDashboard
-                        showDashboard={showProviderDashboard}
-                        setShowDashboard={setShowProviderDashboard}
-                        triggerProviderRefresh={triggerProviderRefresh}
-                    />
-                )}
-                {showAdminDashboard && (
-                    <AdminDashboard
-                        showDashboard={showAdminDashboard}
-                        setShowDashboard={setShowAdminDashboard}
-                    />
-                )}
+        <div className="min-h-screen bg-gray-50">
+            {/* Glassmorphic Header */}
+            <div className="sticky top-0 z-40 backdrop-blur-xl bg-gradient-to-r from-blue-600/90 via-blue-700/90 to-indigo-600/90 border-b border-blue-400/20 shadow-lg">
+                <div className="max-w-6xl mx-auto px-4 py-4">
+                    <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-4">
+                            <button
+                                onClick={onBackToMarketplace}
+                                className="text-white font-semibold hover:text-blue-100 transition-colors drop-shadow-sm"
+                            >
+                                ← Back
+                            </button>
+                            <h1 className="text-2xl font-bold text-white drop-shadow-md">My Dashboard</h1>
+                        </div>
 
-                {/* Navigation */}
-                <nav className="glass-header sticky top-0 z-40">
-                    <div className="max-w-7xl mx-auto px-4 sm:px-6 py-4">
-                        <div className="flex items-center justify-between">
-                            {/* Logo */}
-                            <div className="flex items-center gap-2">
-                                <Car className="text-cyan-500" size={28} />
-                                <span className="text-xl font-bold text-gray-800">BRNNO Services</span>
+                        <div className="relative" ref={profileDropdownRef}>
+                            <button
+                                onClick={() => setShowProfileDropdown(!showProfileDropdown)}
+                                className="w-11 h-11 bg-gradient-to-br from-purple-500 to-pink-500 rounded-full flex items-center justify-center text-white font-semibold hover:from-purple-600 hover:to-pink-600 transition-all shadow-lg hover:shadow-xl transform hover:scale-105 ring-2 ring-white/30"
+                            >
+                                {currentUser?.initials || (currentUser?.name ? currentUser.name.substring(0, 2).toUpperCase() : 'ME')}
+                            </button>
+                            {showProfileDropdown && (
+                                <ProfileDropdown
+                                    currentUser={currentUser}
+                                    onGoToDashboard={() => { setShowProfileDropdown(false); }}
+                                    onLogout={onLogout}
+                                />
+                            )}
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            {/* User Info Banner */}
+            {userData && (
+                <div className="bg-gradient-to-r from-blue-600 to-blue-700 text-white">
+                    <div className="max-w-6xl mx-auto px-4 py-6">
+                        <h2 className="text-3xl font-bold mb-2">
+                            Welcome back, {userData.firstName || currentUser.name}!
+                        </h2>
+                        <div className="flex items-center gap-4 text-blue-100">
+                            <span>{userData.email}</span>
+                            {userData.phone && (
+                                <>
+                                    <span>•</span>
+                                    <span>{userData.phone}</span>
+                                </>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* Tabs */}
+            <div className="bg-white border-b border-gray-200">
+                <div className="max-w-6xl mx-auto px-4">
+                    <div className="flex gap-8">
+                        <button
+                            onClick={() => setActiveTab('upcoming')}
+                            className={`py-4 border-b-2 font-semibold transition-colors ${activeTab === 'upcoming'
+                                ? 'border-blue-600 text-blue-600'
+                                : 'border-transparent text-gray-600 hover:text-gray-900'
+                                }`}
+                        >
+                            Upcoming
+                        </button>
+                        <button
+                            onClick={() => setActiveTab('vehicles')}
+                            className={`py-4 border-b-2 font-semibold transition-colors ${activeTab === 'vehicles'
+                                ? 'border-blue-600 text-blue-600'
+                                : 'border-transparent text-gray-600 hover:text-gray-900'
+                                }`}
+                        >
+                            Vehicles
+                        </button>
+                        <button
+                            onClick={() => setActiveTab('addresses')}
+                            className={`py-4 border-b-2 font-semibold transition-colors ${activeTab === 'addresses'
+                                ? 'border-blue-600 text-blue-600'
+                                : 'border-transparent text-gray-600 hover:text-gray-900'
+                                }`}
+                        >
+                            Addresses
+                        </button>
+                        <button
+                            onClick={() => setActiveTab('profile')}
+                            className={`py-4 border-b-2 font-semibold transition-colors ${activeTab === 'profile'
+                                ? 'border-blue-600 text-blue-600'
+                                : 'border-transparent text-gray-600 hover:text-gray-900'
+                                }`}
+                        >
+                            Profile
+                        </button>
+                        <button
+                            onClick={() => setActiveTab('payment')}
+                            className={`py-4 border-b-2 font-semibold transition-colors ${activeTab === 'payment'
+                                ? 'border-blue-600 text-blue-600'
+                                : 'border-transparent text-gray-600 hover:text-gray-900'
+                                }`}
+                        >
+                            Payment Methods
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            {/* Content */}
+            <div className="max-w-6xl mx-auto px-4 py-8">
+                {activeTab === 'upcoming' && (
+                    <UpcomingAppointments
+                        appointments={upcomingAppointments}
+                        onRefresh={loadUpcomingAppointments}
+                    />
+                )}
+                {activeTab === 'vehicles' && (
+                    <SavedVehicles
+                        vehicles={savedVehicles}
+                        userData={userData}
+                        onRefresh={() => userData?.id && loadSavedVehicles(userData.id)}
+                    />
+                )}
+                {activeTab === 'addresses' && (
+                    <SavedAddresses
+                        addresses={savedAddresses}
+                        userData={userData}
+                        onRefresh={() => userData?.id && loadSavedAddresses(userData.id)}
+                    />
+                )}
+                {activeTab === 'profile' && (
+                    <UserProfile
+                        userData={userData}
+                        currentUser={currentUser}
+                        address={address}
+                        answers={answers}
+                        userCoordinates={userCoordinates}
+                    />
+                )}
+                {activeTab === 'payment' && (
+                    <PaymentMethods
+                        methods={paymentMethods}
+                        currentUser={currentUser}
+                    />
+                )}
+            </div>
+        </div>
+    );
+}
+
+function UpcomingAppointments({ appointments, onRefresh }) {
+    async function handleCancelBooking(appointmentId) {
+        if (!confirm('Are you sure you want to cancel this appointment?')) return;
+
+        try {
+            await updateDoc(doc(db, 'bookings', appointmentId), {
+                status: 'cancelled',
+                cancelledAt: serverTimestamp()
+            });
+            alert('Appointment cancelled successfully');
+            onRefresh();
+        } catch (error) {
+            console.error('Error cancelling appointment:', error);
+            alert('Failed to cancel appointment');
+        }
+    }
+
+    return (
+        <div>
+            <div className="flex items-center justify-between mb-6">
+                <h2 className="text-2xl font-bold text-gray-900">Upcoming Appointments</h2>
+                <button
+                    onClick={onRefresh}
+                    className="px-4 py-2 text-sm border-2 border-gray-200 rounded-lg font-medium hover:bg-gray-50"
+                >
+                    Refresh
+                </button>
+            </div>
+
+            {appointments.length === 0 ? (
+                <div className="bg-white rounded-xl border border-gray-200 p-12 text-center">
+                    <Calendar className="w-16 h-16 text-gray-300 mx-auto mb-4" />
+                    <h3 className="text-xl font-semibold text-gray-900 mb-2">No upcoming appointments</h3>
+                    <p className="text-gray-600 mb-4">Book a detailing service to get started</p>
+                    <button
+                        onClick={() => window.location.reload()}
+                        className="px-6 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700"
+                    >
+                        Browse Detailers
+                    </button>
+                </div>
+            ) : (
+                <div className="space-y-4">
+                    {appointments.map((apt) => (
+                        <div key={apt.id} className="bg-white rounded-xl border border-gray-200 p-6">
+                            <div className="flex items-start justify-between mb-4">
+                                <div>
+                                    <h3 className="text-xl font-bold text-gray-900">{apt.detailerName}</h3>
+                                    <p className="text-gray-600">{apt.service}</p>
+                                    <span className={`inline-block mt-2 px-3 py-1 rounded-full text-sm font-medium ${apt.status === 'confirmed' ? 'bg-green-100 text-green-700' :
+                                        apt.status === 'pending' ? 'bg-yellow-100 text-yellow-700' :
+                                            'bg-blue-100 text-blue-700'
+                                        }`}>
+                                        {apt.status.charAt(0).toUpperCase() + apt.status.slice(1)}
+                                    </span>
+                                </div>
+                                <div className="text-right">
+                                    <div className="text-2xl font-bold text-gray-900">${apt.price}</div>
+                                </div>
                             </div>
 
-                            {/* Desktop Menu */}
+                            <div className="grid grid-cols-3 gap-4 text-sm mb-4">
+                                <div className="flex items-center gap-2">
+                                    <Calendar className="w-4 h-4 text-gray-400" />
+                                    <span>{apt.date}</span>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                    <Clock className="w-4 h-4 text-gray-400" />
+                                    <span>{apt.time}</span>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                    <MapPin className="w-4 h-4 text-gray-400" />
+                                    <span className="truncate">{apt.address}</span>
+                                </div>
+                            </div>
 
-                            {/* Desktop Auth Buttons */}
-                            <div className="hidden lg:flex items-center gap-3">
-                                {user ? (
-                                    // User is logged in - show user info and logout
-                                    <>
-                                        <div className="flex items-center gap-3">
-                                            <div className="text-right">
-                                                <p className="text-sm font-semibold text-gray-800">
-                                                    {userData?.firstName && userData?.lastName
-                                                        ? `${userData.firstName} ${userData.lastName}`
-                                                        : user.displayName || 'User'
-                                                    }
-                                                </p>
-                                                <p className="text-xs text-gray-500">
-                                                    {userData?.accountType === 'provider' ? 'Provider' : 'Customer'}
-                                                </p>
-                                            </div>
-                                            {userData?.accountType === 'provider' && (
-                                                <button
-                                                    onClick={() => setShowProviderDashboard(true)}
-                                                    className="bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-lg font-semibold transition-colors"
-                                                >
-                                                    Dashboard
-                                                </button>
-                                            )}
-                                            <button
-                                                onClick={() => setShowProfilePanel(true)}
-                                                className="w-8 h-8 bg-cyan-500 text-white rounded-full flex items-center justify-center text-sm font-bold hover:bg-cyan-600 transition-colors"
-                                            >
-                                                {userData?.firstName && userData?.lastName
-                                                    ? `${userData.firstName.charAt(0)}${userData.lastName.charAt(0)}`
-                                                    : user.displayName?.charAt(0) || 'U'
-                                                }
-                                            </button>
+                            <div className="flex gap-3 pt-4 border-t border-gray-100">
+                                <button
+                                    className="flex-1 px-4 py-2 border-2 border-gray-200 rounded-lg font-semibold hover:bg-gray-50"
+                                    onClick={() => alert('Reschedule feature coming soon!')}
+                                >
+                                    Reschedule
+                                </button>
+                                <button
+                                    onClick={() => handleCancelBooking(apt.id)}
+                                    className="flex-1 px-4 py-2 bg-red-50 text-red-600 rounded-lg font-semibold hover:bg-red-100"
+                                >
+                                    Cancel
+                                </button>
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            )}
+        </div>
+    );
+}
+
+function SavedVehicles({ vehicles, userData, onRefresh }) {
+    const [showAddModal, setShowAddModal] = useState(false);
+    const [editingVehicle, setEditingVehicle] = useState(null);
+    const [vehicleData, setVehicleData] = useState({
+        make: '',
+        model: '',
+        year: '',
+        color: ''
+    });
+
+    async function handleSaveVehicle() {
+        if (!userData?.id) {
+            alert('User data not loaded');
+            return;
+        }
+
+        if (!vehicleData.make || !vehicleData.model || !vehicleData.year) {
+            alert('Please fill in all required fields');
+            return;
+        }
+
+        try {
+            if (editingVehicle) {
+                // Update existing vehicle
+                await updateDoc(
+                    doc(db, 'customer', userData.id, 'vehicles', editingVehicle.id),
+                    vehicleData
+                );
+                alert('Vehicle updated successfully!');
+            } else {
+                // Add new vehicle
+                await addDoc(
+                    collection(db, 'customer', userData.id, 'vehicles'),
+                    {
+                        ...vehicleData,
+                        createdAt: serverTimestamp()
+                    }
+                );
+                alert('Vehicle added successfully!');
+            }
+
+            setShowAddModal(false);
+            setEditingVehicle(null);
+            setVehicleData({ make: '', model: '', year: '', color: '' });
+            onRefresh();
+        } catch (error) {
+            console.error('Error saving vehicle:', error);
+            alert('Failed to save vehicle');
+        }
+    }
+
+    async function handleDeleteVehicle(vehicleId) {
+        if (!confirm('Are you sure you want to delete this vehicle?')) return;
+
+        try {
+            await deleteDoc(doc(db, 'customer', userData.id, 'vehicles', vehicleId));
+            alert('Vehicle deleted successfully!');
+            onRefresh();
+        } catch (error) {
+            console.error('Error deleting vehicle:', error);
+            alert('Failed to delete vehicle');
+        }
+    }
+
+    function openEditModal(vehicle) {
+        setEditingVehicle(vehicle);
+        setVehicleData({
+            make: vehicle.make,
+            model: vehicle.model,
+            year: vehicle.year,
+            color: vehicle.color
+        });
+        setShowAddModal(true);
+    }
+
+    return (
+        <div>
+            <div className="flex items-center justify-between mb-6">
+                <h2 className="text-2xl font-bold text-gray-900">Saved Vehicles</h2>
+                <button
+                    onClick={() => {
+                        setEditingVehicle(null);
+                        setVehicleData({ make: '', model: '', year: '', color: '' });
+                        setShowAddModal(true);
+                    }}
+                    className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700"
+                >
+                    <Plus className="w-5 h-5" />
+                    Add Vehicle
+                </button>
+            </div>
+
+            {vehicles.length === 0 ? (
+                <div className="bg-white rounded-xl border border-gray-200 p-12 text-center">
+                    <Car className="w-16 h-16 text-gray-300 mx-auto mb-4" />
+                    <h3 className="text-xl font-semibold text-gray-900 mb-2">No saved vehicles</h3>
+                    <p className="text-gray-600 mb-4">Add your vehicles for faster booking</p>
+                    <button
+                        onClick={() => setShowAddModal(true)}
+                        className="px-6 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700"
+                    >
+                        Add Your First Vehicle
+                    </button>
+                </div>
+            ) : (
+                <div className="grid md:grid-cols-2 gap-4">
+                    {vehicles.map((vehicle) => (
+                        <div key={vehicle.id} className="bg-white rounded-xl border border-gray-200 p-6">
+                            <div className="flex items-start justify-between mb-4">
+                                <div>
+                                    <h3 className="text-xl font-bold text-gray-900">
+                                        {vehicle.year} {vehicle.make} {vehicle.model}
+                                    </h3>
+                                    {vehicle.color && <p className="text-gray-600">{vehicle.color}</p>}
+                                </div>
+                                <Car className="w-8 h-8 text-gray-400" />
+                            </div>
+
+                            <div className="flex gap-2">
+                                <button
+                                    onClick={() => openEditModal(vehicle)}
+                                    className="flex items-center gap-2 px-3 py-2 border-2 border-gray-200 rounded-lg text-sm font-medium hover:bg-gray-50"
+                                >
+                                    <Edit2 className="w-4 h-4" />
+                                    Edit
+                                </button>
+                                <button
+                                    onClick={() => handleDeleteVehicle(vehicle.id)}
+                                    className="flex items-center gap-2 px-3 py-2 border-2 border-red-200 text-red-600 rounded-lg text-sm font-medium hover:bg-red-50"
+                                >
+                                    <Trash2 className="w-4 h-4" />
+                                    Delete
+                                </button>
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            )}
+
+            {/* Add/Edit Vehicle Modal */}
+            {showAddModal && (
+                <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
+                    <div className="bg-white rounded-2xl max-w-md w-full p-8 relative">
+                        <button
+                            onClick={() => {
+                                setShowAddModal(false);
+                                setEditingVehicle(null);
+                            }}
+                            className="absolute top-4 right-4 text-gray-400 hover:text-gray-600"
+                        >
+                            <X className="w-6 h-6" />
+                        </button>
+
+                        <h2 className="text-2xl font-bold text-gray-900 mb-6">
+                            {editingVehicle ? 'Edit Vehicle' : 'Add Vehicle'}
+                        </h2>
+
+                        <div className="space-y-4">
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700 mb-1">
+                                    Make *
+                                </label>
+                                <input
+                                    type="text"
+                                    value={vehicleData.make}
+                                    onChange={(e) => setVehicleData({ ...vehicleData, make: e.target.value })}
+                                    placeholder="Tesla, Honda, Ford..."
+                                    className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                                />
+                            </div>
+
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700 mb-1">
+                                    Model *
+                                </label>
+                                <input
+                                    type="text"
+                                    value={vehicleData.model}
+                                    onChange={(e) => setVehicleData({ ...vehicleData, model: e.target.value })}
+                                    placeholder="Model 3, Civic, F-150..."
+                                    className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                                />
+                            </div>
+
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700 mb-1">
+                                    Year *
+                                </label>
+                                <input
+                                    type="number"
+                                    value={vehicleData.year}
+                                    onChange={(e) => setVehicleData({ ...vehicleData, year: e.target.value })}
+                                    placeholder="2023"
+                                    className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                                />
+                            </div>
+
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700 mb-1">
+                                    Color
+                                </label>
+                                <input
+                                    type="text"
+                                    value={vehicleData.color}
+                                    onChange={(e) => setVehicleData({ ...vehicleData, color: e.target.value })}
+                                    placeholder="White, Black, Red..."
+                                    className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                                />
+                            </div>
+                        </div>
+
+                        <button
+                            onClick={handleSaveVehicle}
+                            className="w-full mt-6 bg-blue-600 text-white py-3 rounded-xl font-semibold hover:bg-blue-700"
+                        >
+                            {editingVehicle ? 'Update Vehicle' : 'Add Vehicle'}
+                        </button>
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+}
+
+function PaymentMethods({ methods, currentUser }) {
+    const paymentMethods = methods || [];
+
+    return (
+        <div>
+            <div className="flex items-center justify-between mb-6">
+                <h2 className="text-2xl font-bold text-gray-900">Payment Methods</h2>
+                <button className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700">
+                    <Plus className="w-5 h-5" />
+                    Add Payment Method
+                </button>
+            </div>
+
+            {paymentMethods.length === 0 ? (
+                <div className="bg-white rounded-xl border border-gray-200 p-12 text-center">
+                    <CreditCard className="w-16 h-16 text-gray-300 mx-auto mb-4" />
+                    <h3 className="text-xl font-semibold text-gray-900 mb-2">No payment methods</h3>
+                    <p className="text-gray-600 mb-4">Add a payment method to make booking easier</p>
+                    <button className="px-6 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700">
+                        Add Payment Method
+                    </button>
+                </div>
+            ) : (
+                <div className="space-y-4">
+                    {paymentMethods.map((method) => (
+                        <div key={method.id} className="bg-white rounded-xl border border-gray-200 p-6">
+                            <div className="flex items-center justify-between">
+                                <div className="flex items-center gap-4">
+                                    <CreditCard className="w-8 h-8 text-gray-400" />
+                                    <div>
+                                        <div className="font-semibold text-gray-900">
+                                            {method.type} •••• {method.last4}
                                         </div>
-                                        <button
-                                            onClick={async () => {
-                                                try {
-                                                    await signOut(auth);
-                                                } catch (error) {
-                                                    console.error('Logout error:', error);
-                                                }
-                                            }}
-                                            className="text-gray-600 hover:text-red-500 px-4 py-2 rounded-lg transition-colors"
-                                        >
-                                            Logout
-                                        </button>
-                                    </>
+                                        <div className="text-sm text-gray-500">Expires {method.expiry}</div>
+                                    </div>
+                                </div>
+
+                                <button className="px-3 py-2 border-2 border-red-200 text-red-600 rounded-lg text-sm font-medium hover:bg-red-50">
+                                    Remove
+                                </button>
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            )}
+        </div>
+    );
+}
+
+function SavedAddresses({ addresses, userData, onRefresh }) {
+    const [showAddModal, setShowAddModal] = useState(false);
+    const [editingAddress, setEditingAddress] = useState(null);
+    const [addressData, setAddressData] = useState({
+        label: '',
+        address: ''
+    });
+
+    async function handleSaveAddress() {
+        if (!userData?.id) {
+            alert('User data not loaded');
+            return;
+        }
+
+        if (!addressData.label || !addressData.address) {
+            alert('Please fill in all fields');
+            return;
+        }
+
+        try {
+            if (editingAddress) {
+                await updateDoc(
+                    doc(db, 'customer', userData.id, 'addresses', editingAddress.id),
+                    addressData
+                );
+                alert('Address updated successfully!');
+            } else {
+                await addDoc(
+                    collection(db, 'customer', userData.id, 'addresses'),
+                    {
+                        ...addressData,
+                        createdAt: serverTimestamp()
+                    }
+                );
+                alert('Address added successfully!');
+            }
+
+            setShowAddModal(false);
+            setEditingAddress(null);
+            setAddressData({ label: '', address: '' });
+            onRefresh();
+        } catch (error) {
+            console.error('Error saving address:', error);
+            alert('Failed to save address');
+        }
+    }
+
+    async function handleDeleteAddress(addressId) {
+        if (!confirm('Are you sure you want to delete this address?')) return;
+
+        try {
+            await deleteDoc(doc(db, 'customer', userData.id, 'addresses', addressId));
+            alert('Address deleted successfully!');
+            onRefresh();
+        } catch (error) {
+            console.error('Error deleting address:', error);
+            alert('Failed to delete address');
+        }
+    }
+
+    function openEditModal(address) {
+        setEditingAddress(address);
+        setAddressData({
+            label: address.label,
+            address: address.address
+        });
+        setShowAddModal(true);
+    }
+
+    return (
+        <div>
+            <div className="flex items-center justify-between mb-6">
+                <h2 className="text-2xl font-bold text-gray-900">Saved Addresses</h2>
+                <button
+                    onClick={() => {
+                        setEditingAddress(null);
+                        setAddressData({ label: '', address: '' });
+                        setShowAddModal(true);
+                    }}
+                    className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700"
+                >
+                    <Plus className="w-5 h-5" />
+                    Add Address
+                </button>
+            </div>
+
+            {addresses.length === 0 ? (
+                <div className="bg-white rounded-xl border border-gray-200 p-12 text-center">
+                    <Home className="w-16 h-16 text-gray-300 mx-auto mb-4" />
+                    <h3 className="text-xl font-semibold text-gray-900 mb-2">No saved addresses</h3>
+                    <p className="text-gray-600 mb-4">Save addresses for faster booking</p>
+                    <button
+                        onClick={() => setShowAddModal(true)}
+                        className="px-6 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700"
+                    >
+                        Add Your First Address
+                    </button>
+                </div>
+            ) : (
+                <div className="space-y-4">
+                    {addresses.map((addr) => (
+                        <div key={addr.id} className="bg-white rounded-xl border border-gray-200 p-6">
+                            <div className="flex items-center justify-between">
+                                <div className="flex items-center gap-4">
+                                    <Home className="w-8 h-8 text-gray-400" />
+                                    <div>
+                                        <div className="font-semibold text-gray-900">{addr.label}</div>
+                                        <div className="text-sm text-gray-500">{addr.address}</div>
+                                    </div>
+                                </div>
+
+                                <div className="flex gap-2">
+                                    <button
+                                        onClick={() => openEditModal(addr)}
+                                        className="px-3 py-2 border-2 border-gray-200 rounded-lg text-sm font-medium hover:bg-gray-50"
+                                    >
+                                        Edit
+                                    </button>
+                                    <button
+                                        onClick={() => handleDeleteAddress(addr.id)}
+                                        className="px-3 py-2 border-2 border-red-200 text-red-600 rounded-lg text-sm font-medium hover:bg-red-50"
+                                    >
+                                        Remove
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            )}
+
+            {/* Add/Edit Address Modal */}
+            {showAddModal && (
+                <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
+                    <div className="bg-white rounded-2xl max-w-md w-full p-8 relative">
+                        <button
+                            onClick={() => {
+                                setShowAddModal(false);
+                                setEditingAddress(null);
+                            }}
+                            className="absolute top-4 right-4 text-gray-400 hover:text-gray-600"
+                        >
+                            <X className="w-6 h-6" />
+                        </button>
+
+                        <h2 className="text-2xl font-bold text-gray-900 mb-6">
+                            {editingAddress ? 'Edit Address' : 'Add Address'}
+                        </h2>
+
+                        <div className="space-y-4">
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700 mb-1">
+                                    Label *
+                                </label>
+                                <input
+                                    type="text"
+                                    value={addressData.label}
+                                    onChange={(e) => setAddressData({ ...addressData, label: e.target.value })}
+                                    placeholder="Home, Work, Parent's House..."
+                                    className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                                />
+                            </div>
+
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700 mb-1">
+                                    Address *
+                                </label>
+                                <textarea
+                                    value={addressData.address}
+                                    onChange={(e) => setAddressData({ ...addressData, address: e.target.value })}
+                                    placeholder="123 Main St, City, ST 12345"
+                                    rows="3"
+                                    className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                                />
+                            </div>
+                        </div>
+
+                        <button
+                            onClick={handleSaveAddress}
+                            className="w-full mt-6 bg-blue-600 text-white py-3 rounded-xl font-semibold hover:bg-blue-700"
+                        >
+                            {editingAddress ? 'Update Address' : 'Add Address'}
+                        </button>
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+}
+
+function UserProfile({ userData, currentUser, address, answers, userCoordinates }) {
+    const [isEditingPreferences, setIsEditingPreferences] = useState(false);
+    const [isEditingProfile, setIsEditingProfile] = useState(false);
+    const [editedAddress, setEditedAddress] = useState('');
+    const [editedProfile, setEditedProfile] = useState({
+        firstName: '',
+        lastName: '',
+        phone: ''
+    });
+    const [editedPreferences, setEditedPreferences] = useState({
+        vehicleType: '',
+        serviceType: '',
+        timeSlot: ''
+    });
+
+    useEffect(() => {
+        if (userData) {
+            setEditedAddress(userData.address || '');
+            setEditedProfile({
+                firstName: userData.firstName || '',
+                lastName: userData.lastName || '',
+                phone: userData.phone || ''
+            });
+            setEditedPreferences(userData.preferences || {
+                vehicleType: '',
+                serviceType: '',
+                timeSlot: ''
+            });
+        }
+    }, [userData]);
+
+    async function handleSaveProfile() {
+        if (!userData?.id) return;
+
+        try {
+            const userDocRef = doc(db, 'customer', userData.id);
+            await updateDoc(userDocRef, {
+                firstName: editedProfile.firstName,
+                lastName: editedProfile.lastName,
+                displayName: `${editedProfile.firstName} ${editedProfile.lastName}`.trim(),
+                phone: editedProfile.phone,
+                updatedAt: serverTimestamp()
+            });
+
+            alert('Profile updated successfully!');
+            setIsEditingProfile(false);
+            window.location.reload(); // Reload to show updated data
+        } catch (error) {
+            console.error('Error updating profile:', error);
+            alert('Failed to update profile');
+        }
+    }
+
+    async function handleResetPassword() {
+        if (!currentUser?.email) {
+            alert('Email address not found. Please contact support.');
+            return;
+        }
+
+        try {
+            await sendPasswordResetEmail(auth, currentUser.email);
+            alert('Password reset email sent! Please check your inbox and follow the instructions to reset your password.');
+        } catch (error) {
+            console.error('Error sending password reset email:', error);
+            alert(`Failed to send password reset email: ${error.message}`);
+        }
+    }
+
+    async function handleSavePreferences() {
+        if (!userData?.id) return;
+
+        try {
+            const userDocRef = doc(db, 'customer', userData.id);
+            await updateDoc(userDocRef, {
+                address: editedAddress,
+                preferences: editedPreferences,
+                updatedAt: serverTimestamp()
+            });
+
+            alert('Preferences updated successfully!');
+            setIsEditingPreferences(false);
+            window.location.reload(); // Reload to show updated data
+        } catch (error) {
+            console.error('Error updating preferences:', error);
+            alert('Failed to update preferences');
+        }
+    }
+
+    if (!userData) {
+        return (
+            <div className="bg-white rounded-xl border border-gray-200 p-12 text-center">
+                <p className="text-gray-600">Loading profile...</p>
+            </div>
+        );
+    }
+
+    return (
+        <div>
+            <h2 className="text-2xl font-bold text-gray-900 mb-6">Profile Information</h2>
+
+
+            {/* Personal Info */}
+            <div className="bg-white rounded-xl border border-gray-200 p-8 mb-6">
+                <div className="flex items-center justify-between mb-4">
+                    <h3 className="text-lg font-bold text-gray-900">Personal Information</h3>
+                    {!isEditingProfile && (
+                        <button
+                            onClick={() => setIsEditingProfile(true)}
+                            className="flex items-center gap-2 px-4 py-2 border-2 border-gray-200 rounded-lg font-semibold hover:bg-gray-50"
+                        >
+                            <Edit2 className="w-4 h-4" />
+                            Edit
+                        </button>
+                    )}
+                </div>
+                <div className="max-w-2xl">
+                    {!isEditingProfile ? (
+                        <>
+                            <div className="grid grid-cols-2 gap-6">
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-500 mb-1">
+                                        First Name
+                                    </label>
+                                    <div className="text-lg font-semibold text-gray-900">
+                                        {userData.firstName || 'Not set'}
+                                    </div>
+                                </div>
+
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-500 mb-1">
+                                        Last Name
+                                    </label>
+                                    <div className="text-lg font-semibold text-gray-900">
+                                        {userData.lastName || 'Not set'}
+                                    </div>
+                                </div>
+
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-500 mb-1">
+                                        Email
+                                    </label>
+                                    <div className="text-lg font-semibold text-gray-900">
+                                        {userData.email}
+                                    </div>
+                                    <p className="text-xs text-gray-500 mt-1">Email cannot be changed</p>
+                                </div>
+
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-500 mb-1">
+                                        Phone
+                                    </label>
+                                    <div className="text-lg font-semibold text-gray-900">
+                                        {userData.phone || 'Not set'}
+                                    </div>
+                                </div>
+
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-500 mb-1">
+                                        Account Type
+                                    </label>
+                                    <div className="text-lg font-semibold text-gray-900 capitalize">
+                                        {userData.accountType || 'customer'}
+                                    </div>
+                                </div>
+
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-500 mb-1">
+                                        Member Since
+                                    </label>
+                                    <div className="text-lg font-semibold text-gray-900">
+                                        {userData.createdAt ? new Date(userData.createdAt.seconds * 1000).toLocaleDateString() : 'N/A'}
+                                    </div>
+                                </div>
+                            </div>
+                            <div className="mt-6 pt-6 border-t border-gray-200">
+                                <button
+                                    onClick={handleResetPassword}
+                                    className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700 transition-colors"
+                                >
+                                    <Shield className="w-4 h-4" />
+                                    Reset Password
+                                </button>
+                                <p className="text-xs text-gray-500 mt-2">
+                                    We'll send a password reset link to your email address.
+                                </p>
+                            </div>
+                        </>
+                    ) : (
+                        <div className="space-y-4">
+                            <div className="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                                        First Name
+                                    </label>
+                                    <input
+                                        type="text"
+                                        value={editedProfile.firstName}
+                                        onChange={(e) => setEditedProfile({ ...editedProfile, firstName: e.target.value })}
+                                        className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                                        placeholder="First Name"
+                                    />
+                                </div>
+
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                                        Last Name
+                                    </label>
+                                    <input
+                                        type="text"
+                                        value={editedProfile.lastName}
+                                        onChange={(e) => setEditedProfile({ ...editedProfile, lastName: e.target.value })}
+                                        className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                                        placeholder="Last Name"
+                                    />
+                                </div>
+                            </div>
+
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700 mb-2">
+                                    Phone
+                                </label>
+                                <input
+                                    type="tel"
+                                    value={editedProfile.phone}
+                                    onChange={(e) => setEditedProfile({ ...editedProfile, phone: e.target.value })}
+                                    className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                                    placeholder="(555) 123-4567"
+                                />
+                            </div>
+
+                            <div className="flex gap-3 pt-4">
+                                <button
+                                    onClick={handleSaveProfile}
+                                    className="px-6 py-3 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700"
+                                >
+                                    Save Changes
+                                </button>
+                                <button
+                                    onClick={() => {
+                                        setIsEditingProfile(false);
+                                        // Reset to original values
+                                        setEditedProfile({
+                                            firstName: userData.firstName || '',
+                                            lastName: userData.lastName || '',
+                                            phone: userData.phone || ''
+                                        });
+                                    }}
+                                    className="px-6 py-3 border-2 border-gray-200 rounded-lg font-semibold hover:bg-gray-50"
+                                >
+                                    Cancel
+                                </button>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            </div>
+
+            {/* Booking Preferences */}
+            <div className="bg-white rounded-xl border border-gray-200 p-8">
+                <div className="flex items-center justify-between mb-4">
+                    <h3 className="text-lg font-bold text-gray-900">Booking Preferences</h3>
+                    {!isEditingPreferences && (
+                        <button
+                            onClick={() => setIsEditingPreferences(true)}
+                            className="flex items-center gap-2 px-4 py-2 border-2 border-gray-200 rounded-lg font-semibold hover:bg-gray-50"
+                        >
+                            <Edit2 className="w-4 h-4" />
+                            Edit
+                        </button>
+                    )}
+                </div>
+
+                {!isEditingPreferences ? (
+                    <div className="max-w-2xl space-y-4">
+                        <div>
+                            <label className="block text-sm font-medium text-gray-500 mb-1">
+                                Default Address
+                            </label>
+                            <div className="text-lg text-gray-900">
+                                {userData.address || 'Not set'}
+                            </div>
+                        </div>
+
+                        {userData.preferences && (
+                            <>
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-500 mb-1">
+                                        Preferred Vehicle Type
+                                    </label>
+                                    <div className="text-lg text-gray-900">
+                                        {userData.preferences.vehicleType || 'Not set'}
+                                    </div>
+                                </div>
+
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-500 mb-1">
+                                        Preferred Service Type
+                                    </label>
+                                    <div className="text-lg text-gray-900">
+                                        {userData.preferences.serviceType || 'Not set'}
+                                    </div>
+                                </div>
+
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-500 mb-1">
+                                        Preferred Time Slot
+                                    </label>
+                                    <div className="text-lg text-gray-900">
+                                        {userData.preferences.timeSlot || 'Not set'}
+                                    </div>
+                                </div>
+                            </>
+                        )}
+                    </div>
+                ) : (
+                    <div className="max-w-2xl space-y-4">
+                        <div>
+                            <label className="block text-sm font-medium text-gray-700 mb-2">
+                                Default Address
+                            </label>
+                            <input
+                                type="text"
+                                value={editedAddress}
+                                onChange={(e) => setEditedAddress(e.target.value)}
+                                placeholder="123 Main St, City, State ZIP"
+                                className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                            />
+                        </div>
+
+                        <div>
+                            <label className="block text-sm font-medium text-gray-700 mb-2">
+                                Preferred Vehicle Type
+                            </label>
+                            <select
+                                value={editedPreferences.vehicleType}
+                                onChange={(e) => setEditedPreferences({ ...editedPreferences, vehicleType: e.target.value })}
+                                className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                            >
+                                <option value="">Select vehicle type</option>
+                                <option value="Sedan">Sedan</option>
+                                <option value="SUV">SUV</option>
+                                <option value="Truck">Truck</option>
+                                <option value="Sports Car">Sports Car</option>
+                                <option value="Van">Van</option>
+                                <option value="Motorcycle">Motorcycle</option>
+                            </select>
+                        </div>
+
+                        <div>
+                            <label className="block text-sm font-medium text-gray-700 mb-2">
+                                Preferred Service Type
+                            </label>
+                            <select
+                                value={editedPreferences.serviceType}
+                                onChange={(e) => setEditedPreferences({ ...editedPreferences, serviceType: e.target.value })}
+                                className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                            >
+                                <option value="">Select service type</option>
+                                <option value="Full Detail">Full Detail</option>
+                                <option value="Exterior Only">Exterior Only</option>
+                                <option value="Interior Only">Interior Only</option>
+                                <option value="Paint Correction">Paint Correction</option>
+                                <option value="Ceramic Coating">Ceramic Coating</option>
+                                <option value="Basic Wash">Basic Wash</option>
+                            </select>
+                        </div>
+
+                        <div>
+                            <label className="block text-sm font-medium text-gray-700 mb-2">
+                                Preferred Time Slot
+                            </label>
+                            <select
+                                value={editedPreferences.timeSlot}
+                                onChange={(e) => setEditedPreferences({ ...editedPreferences, timeSlot: e.target.value })}
+                                className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                            >
+                                <option value="">Select time slot</option>
+                                <option value="Morning (8am-12pm)">Morning (8am-12pm)</option>
+                                <option value="Afternoon (12pm-4pm)">Afternoon (12pm-4pm)</option>
+                                <option value="Evening (4pm-8pm)">Evening (4pm-8pm)</option>
+                                <option value="Flexible">Flexible</option>
+                            </select>
+                        </div>
+
+                        <div className="flex gap-3 pt-4">
+                            <button
+                                onClick={handleSavePreferences}
+                                className="px-6 py-3 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700"
+                            >
+                                Save Changes
+                            </button>
+                            <button
+                                onClick={() => setIsEditingPreferences(false)}
+                                className="px-6 py-3 border-2 border-gray-200 rounded-lg font-semibold hover:bg-gray-50"
+                            >
+                                Cancel
+                            </button>
+                        </div>
+                    </div>
+                )}
+
+                <div className="mt-6 p-4 bg-blue-50 rounded-lg">
+                    <p className="text-sm text-blue-900">
+                        💡 <strong>Tip:</strong> These preferences are used to pre-fill your booking information. You can always change them when making a booking.
+                    </p>
+                </div>
+            </div>
+        </div>
+    );
+}
+
+function BookingHistory({ history }) {
+    return (
+        <div>
+            <h2 className="text-2xl font-bold text-gray-900 mb-6">Booking History</h2>
+
+            <div className="space-y-4">
+                {history.slice(0, 5).map((booking) => (
+                    <div key={booking.id} className="bg-white rounded-xl border border-gray-200 p-6">
+                        <div className="flex items-start justify-between mb-3">
+                            <div>
+                                <h3 className="font-bold text-gray-900">{booking.detailerName}</h3>
+                                {booking.services && booking.services.length > 0 ? (
+                                    <div className="space-y-1">
+                                        {booking.services.map((service, idx) => (
+                                            <p key={idx} className="text-gray-600">
+                                                {service.name} {service.price ? `- $${service.price}` : ''}
+                                            </p>
+                                        ))}
+                                    </div>
                                 ) : (
-                                    // User is not logged in - show login/signup buttons
-                                    <>
-                                        <button
-                                            onClick={() => setShowLoginModal(true)}
-                                            className="text-gray-600 hover:text-cyan-500 px-4 py-2 rounded-lg transition-colors"
-                                        >
-                                            Log In
-                                        </button>
-                                        <button
-                                            onClick={() => setShowSignupModal(true)}
-                                            className="bg-cyan-500 hover:bg-cyan-600 text-white px-6 py-2 rounded-lg font-semibold transition-colors"
-                                        >
-                                            Sign Up
-                                        </button>
-                                    </>
+                                    <p className="text-gray-600">{booking.service}</p>
                                 )}
                             </div>
+                            <div className="text-right">
+                                <div className="font-bold text-gray-900">${booking.price}</div>
+                                <div className="text-sm text-green-600">{booking.status}</div>
+                            </div>
+                        </div>
 
-                            {/* Mobile Menu Button */}
-                            <button
-                                onClick={() => setShowMobileMenu(!showMobileMenu)}
-                                className="lg:hidden text-gray-600 hover:text-cyan-500 p-2"
+                        <div className="flex items-center gap-2 text-sm text-gray-500">
+                            <Calendar className="w-4 h-4" />
+                            <span>{booking.date}</span>
+                        </div>
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
+}
+
+// ==================== NOTIFICATION CENTER ====================
+function NotificationCenter({ notifications = [], unreadCount = 0, onMarkAsRead, onMarkAllAsRead }) {
+    const getNotificationIcon = (type) => {
+        switch (type) {
+            case 'new_booking':
+                return <Calendar className="w-5 h-5 text-blue-600" />;
+            case 'booking_confirmed':
+                return <CheckCircle className="w-5 h-5 text-green-600" />;
+            case 'booking_cancelled':
+                return <X className="w-5 h-5 text-red-600" />;
+            case 'payment_received':
+                return <DollarSign className="w-5 h-5 text-green-600" />;
+            case 'booking_reminder':
+                return <Clock className="w-5 h-5 text-yellow-600" />;
+            default:
+                return <Bell className="w-5 h-5 text-gray-600" />;
+        }
+    };
+
+    const getNotificationColor = (type) => {
+        switch (type) {
+            case 'new_booking':
+                return 'bg-blue-50 border-blue-200';
+            case 'booking_confirmed':
+                return 'bg-green-50 border-green-200';
+            case 'booking_cancelled':
+                return 'bg-red-50 border-red-200';
+            case 'payment_received':
+                return 'bg-green-50 border-green-200';
+            case 'booking_reminder':
+                return 'bg-yellow-50 border-yellow-200';
+            default:
+                return 'bg-gray-50 border-gray-200';
+        }
+    };
+
+    const formatDate = (timestamp) => {
+        try {
+            if (!timestamp) return 'Just now';
+
+            let date;
+            if (timestamp && typeof timestamp.toDate === 'function') {
+                // Firestore Timestamp
+                date = timestamp.toDate();
+            } else if (timestamp && timestamp.seconds) {
+                // Firestore Timestamp object with seconds
+                date = new Date(timestamp.seconds * 1000);
+            } else if (typeof timestamp === 'string' || typeof timestamp === 'number') {
+                // String or number timestamp
+                date = new Date(timestamp);
+            } else {
+                return 'Just now';
+            }
+
+            // Check if date is valid
+            if (isNaN(date.getTime())) {
+                return 'Just now';
+            }
+
+            const now = new Date();
+            const diffMs = now - date;
+            const diffMins = Math.floor(diffMs / 60000);
+            const diffHours = Math.floor(diffMs / 3600000);
+            const diffDays = Math.floor(diffMs / 86400000);
+
+            if (diffMins < 1) return 'Just now';
+            if (diffMins < 60) return `${diffMins} minute${diffMins > 1 ? 's' : ''} ago`;
+            if (diffHours < 24) return `${diffHours} hour${diffHours > 1 ? 's' : ''} ago`;
+            if (diffDays < 7) return `${diffDays} day${diffDays > 1 ? 's' : ''} ago`;
+            return date.toLocaleDateString();
+        } catch (error) {
+            console.warn('Error formatting date:', error);
+            return 'Just now';
+        }
+    };
+
+    return (
+        <div>
+            <div className="flex items-center justify-between mb-6">
+                <div>
+                    <h2 className="text-2xl font-bold text-gray-900">Notifications</h2>
+                    {unreadCount > 0 && (
+                        <p className="text-sm text-gray-600 mt-1">
+                            {unreadCount} unread notification{unreadCount > 1 ? 's' : ''}
+                        </p>
+                    )}
+                </div>
+                {unreadCount > 0 && (
+                    <button
+                        onClick={onMarkAllAsRead}
+                        className="px-4 py-2 text-sm bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700"
+                    >
+                        Mark all as read
+                    </button>
+                )}
+            </div>
+
+            {!notifications || notifications.length === 0 ? (
+                <div className="bg-white rounded-xl border border-gray-200 p-12 text-center">
+                    <Bell className="w-16 h-16 text-gray-300 mx-auto mb-4" />
+                    <h3 className="text-xl font-semibold text-gray-900 mb-2">No notifications</h3>
+                    <p className="text-gray-600">You'll see notifications about bookings, payments, and updates here</p>
+                </div>
+            ) : (
+                <div className="space-y-3">
+                    {notifications.map((notification) => {
+                        if (!notification) return null;
+                        return (
+                            <div
+                                key={notification.id || Math.random()}
+                                className={`bg-white rounded-xl border-2 p-5 transition-all cursor-pointer hover:shadow-md ${notification.read ? 'opacity-75' : getNotificationColor(notification.type || 'default')
+                                    }`}
+                                onClick={() => !notification.read && onMarkAsRead && onMarkAsRead(notification.id)}
                             >
-                                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    {showMobileMenu ? (
-                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                                    ) : (
-                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
-                                    )}
-                                </svg>
+                                <div className="flex items-start gap-4">
+                                    <div className="flex-shrink-0 mt-0.5">
+                                        {getNotificationIcon(notification.type || 'default')}
+                                    </div>
+                                    <div className="flex-1 min-w-0">
+                                        <div className="flex items-start justify-between gap-2">
+                                            <div className="flex-1">
+                                                <h3 className="font-semibold text-gray-900 mb-1">
+                                                    {notification.title || 'Notification'}
+                                                </h3>
+                                                <p className="text-gray-600 text-sm mb-2">
+                                                    {notification.message || ''}
+                                                </p>
+                                                <p className="text-xs text-gray-500">
+                                                    {formatDate(notification.createdAt)}
+                                                </p>
+                                            </div>
+                                            {!notification.read && (
+                                                <div className="flex-shrink-0">
+                                                    <div className="w-2 h-2 bg-blue-600 rounded-full"></div>
+                                                </div>
+                                            )}
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        );
+                    })}
+                </div>
+            )}
+        </div>
+    );
+}
+
+// ==================== PROVIDER DASHBOARD ====================
+function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showProfileDropdown, setShowProfileDropdown }) {
+    const [activeTab, setActiveTab] = useState('bookings');
+    const [loading, setLoading] = useState(true);
+    const [bookings, setBookings] = useState([]);
+    // providerData removed - using userData instead (unified structure)
+    const [providerDocId, setProviderDocId] = useState(null); // Store provider document ID
+    const [userData, setUserData] = useState(null);
+    const [availablePackages, setAvailablePackages] = useState([]);
+    const [selectedPackages, setSelectedPackages] = useState([]);
+    const [selectedAddOns, setSelectedAddOns] = useState([]);
+    const [packagePrices, setPackagePrices] = useState({}); // { "package-id": { price: X } }
+    const [savingPackages, setSavingPackages] = useState(false);
+    const [weeklySchedule, setWeeklySchedule] = useState({});
+    const [blackoutDates, setBlackoutDates] = useState([]);
+    const [selectedBlackoutDate, setSelectedBlackoutDate] = useState('');
+    const [showBlackoutModal, setShowBlackoutModal] = useState(false);
+    const [pendingProviders, setPendingProviders] = useState([]);
+    const [rejectedProviders, setRejectedProviders] = useState([]);
+    const [loadingPending, setLoadingPending] = useState(false);
+    const [notifications, setNotifications] = useState([]);
+    const [unreadCount, setUnreadCount] = useState(0);
+    const [isEditingProfile, setIsEditingProfile] = useState(false);
+    const [editedProviderProfile, setEditedProviderProfile] = useState({
+        businessName: '',
+        serviceArea: '',
+        businessAddress: '',
+        phone: '',
+        email: ''
+    });
+    const [logoFile, setLogoFile] = useState(null);
+    const [logoPreview, setLogoPreview] = useState(null);
+    const [uploadingLogo, setUploadingLogo] = useState(false);
+    const profileDropdownRef = React.useRef(null);
+
+    // Close dropdown when clicking outside
+    useEffect(() => {
+        function handleClickOutside(event) {
+            if (profileDropdownRef.current && !profileDropdownRef.current.contains(event.target)) {
+                setShowProfileDropdown(false);
+            }
+        }
+
+        if (showProfileDropdown) {
+            document.addEventListener('mousedown', handleClickOutside);
+        }
+
+        return () => {
+            document.removeEventListener('mousedown', handleClickOutside);
+        };
+    }, [showProfileDropdown, setShowProfileDropdown]);
+
+    async function loadPendingProviders() {
+        if (userData?.role !== 'admin') return;
+
+        setLoadingPending(true);
+        try {
+            // Query users collection for providers with pending status
+            const pendingQuery = query(
+                collection(db, 'detailer'),
+                where('status', '==', 'pending')
+            );
+            const snapshot = await getDocs(pendingQuery);
+
+            const pending = snapshot.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data()
+            }));
+
+            setPendingProviders(pending);
+        } catch (error) {
+            console.error('Error loading pending providers:', error);
+        } finally {
+            setLoadingPending(false);
+        }
+    }
+
+    async function loadRejectedProviders() {
+        if (userData?.role !== 'admin') return;
+
+        try {
+            // Query detailer collection for providers with rejected status
+            const rejectedQuery = query(
+                collection(db, 'detailer'),
+                where('status', '==', 'rejected')
+            );
+            const snapshot = await getDocs(rejectedQuery);
+
+            const rejected = snapshot.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data()
+            }));
+
+            setRejectedProviders(rejected);
+        } catch (error) {
+            console.error('Error loading rejected providers:', error);
+        }
+    }
+
+    useEffect(() => {
+        if (currentUser) {
+            loadProviderData();
+            // Initialize FCM and request notification permission
+            initializeNotifications();
+        }
+    }, [currentUser]);
+
+    // Initialize notifications
+    async function initializeNotifications() {
+        if (!currentUser) return;
+
+        try {
+            // Request notification permission and get token
+            const token = await requestNotificationPermission();
+            if (token) {
+                await saveFCMToken(currentUser.uid, token);
+            }
+
+            // Set up foreground message handler
+            setupForegroundMessageHandler();
+
+            // Subscribe to notifications with error handling
+            try {
+                const unsubscribeNotifications = subscribeToNotifications(currentUser.uid, (notifs) => {
+                    try {
+                        setNotifications(Array.isArray(notifs) ? notifs : []);
+                    } catch (error) {
+                        console.error('Error setting notifications state:', error);
+                        setNotifications([]);
+                    }
+                });
+
+                // Subscribe to unread count with error handling
+                const unsubscribeUnread = subscribeToUnreadCount(currentUser.uid, (count) => {
+                    try {
+                        setUnreadCount(typeof count === 'number' ? count : 0);
+                    } catch (error) {
+                        console.error('Error setting unread count state:', error);
+                        setUnreadCount(0);
+                    }
+                });
+
+                return () => {
+                    try {
+                        if (typeof unsubscribeNotifications === 'function') unsubscribeNotifications();
+                        if (typeof unsubscribeUnread === 'function') unsubscribeUnread();
+                    } catch (error) {
+                        console.warn('Error unsubscribing from notifications:', error);
+                    }
+                };
+            } catch (subscriptionError) {
+                console.error('Error setting up notification subscriptions:', subscriptionError);
+                // Set defaults to prevent white screen
+                setNotifications([]);
+                setUnreadCount(0);
+            }
+        } catch (error) {
+            console.error('Error initializing notifications:', error);
+            // Set defaults to prevent white screen
+            setNotifications([]);
+            setUnreadCount(0);
+        }
+    }
+
+    // Add separate useEffect for admin check after userData loads:
+    useEffect(() => {
+        if (userData?.role === 'admin') {
+            loadPendingProviders();
+        }
+    }, [userData]);
+
+    // Reload pending and rejected providers when admin tab is activated
+    useEffect(() => {
+        if (activeTab === 'admin' && userData?.role === 'admin') {  // Change to userData
+            loadPendingProviders();
+            loadRejectedProviders();
+        }
+    }, [activeTab, userData]);  // Add userData to dependencies
+
+    async function loadProviderData() {
+        setLoading(true);
+        try {
+            // Read from detailer collection
+            const detailerDoc = await getDoc(doc(db, 'detailer', currentUser.uid));
+
+            if (!detailerDoc.exists()) {
+                console.error('Detailer document not found');
+                return;
+            }
+
+            const data = detailerDoc.data();
+            setUserData({ id: detailerDoc.id, ...data });
+
+            // Store document ID (same as UID now)
+            setProviderDocId(detailerDoc.id);
+
+            // Load provider-specific state from unified document
+            setSelectedPackages(data.offeredPackages || []);
+            setSelectedAddOns(data.addOns || []);
+            setPackagePrices(data.packagePrices || {});
+
+            // Initialize edited profile data
+            setEditedProviderProfile({
+                businessName: data.businessName || '',
+                serviceArea: data.serviceArea || '',
+                businessAddress: data.businessAddress || data.address || '',
+                phone: data.phone || '',
+                email: data.email || ''
+            });
+
+            // Load availability and ensure enabled days have start/end times
+            const defaultAvail = data.defaultAvailability || {};
+            // Normalize the schedule - ensure enabled days have start/end times
+            const normalizedSchedule = {};
+            Object.keys(defaultAvail).forEach(day => {
+                const daySchedule = defaultAvail[day];
+                if (daySchedule && daySchedule.enabled) {
+                    normalizedSchedule[day] = {
+                        enabled: true,
+                        start: daySchedule.start || '09:00',
+                        end: daySchedule.end || '17:00'
+                    };
+                } else {
+                    normalizedSchedule[day] = daySchedule;
+                }
+            });
+            setWeeklySchedule(normalizedSchedule);
+
+            // Convert dateOverrides object to array for easier management
+            const overrides = data.dateOverrides || {};
+            const blackouts = Object.keys(overrides)
+                .filter(date => overrides[date]?.type === 'unavailable')
+                .map(date => ({ date, type: 'unavailable' }));
+            setBlackoutDates(blackouts);
+
+            // Load packages from Firestore
+            const packagesQuery = collection(db, 'packages');
+            const packagesSnapshot = await getDocs(packagesQuery);
+            if (!packagesSnapshot.empty) {
+                const packages = packagesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                setAvailablePackages(packages);
+            } else {
+                // Fallback to local packages
+                setAvailablePackages(PACKAGES_DATA);
+            }
+
+            // Load bookings for this provider
+            await loadBookings();
+        } catch (error) {
+            console.error('Error loading provider data:', error);
+        } finally {
+            setLoading(false);
+        }
+    }
+
+    async function loadBookings() {
+        try {
+            // Unified structure: providerUserId is the same as currentUser.uid
+            const providerUserId = currentUser.uid;
+            const providerDocId = currentUser.uid; // Document ID is now the UID
+
+            // Query by providerUserId first (this is what new bookings use)
+            let bookingsByUserId = { docs: [] };
+            try {
+                const bookingsQueryByUserId = query(
+                    collection(db, 'bookings'),
+                    where('providerUserId', '==', providerUserId)
+                );
+                bookingsByUserId = await getDocs(bookingsQueryByUserId);
+            } catch (err) {
+                console.warn('Could not query by providerUserId:', err);
+            }
+
+            // Also query by providerId if we have a provider document
+            // Note: This query may fail due to security rules if providerUserId isn't set correctly
+            // It's a fallback, so we'll fail silently
+            let bookingsById = { docs: [] };
+            if (providerDocId) {
+                try {
+                    const bookingsQueryById = query(
+                        collection(db, 'bookings'),
+                        where('providerId', '==', providerDocId)
+                    );
+                    bookingsById = await getDocs(bookingsQueryById);
+                } catch (err) {
+                    // Silently fail - this is expected if security rules don't allow querying by providerId alone
+                    // The primary query by providerUserId should work
+                    if (err.code !== 'permission-denied') {
+                        console.warn('Could not query by providerId:', err);
+                    }
+                }
+            }
+
+            // Combine results and remove duplicates
+            let allBookingDocs = [...bookingsByUserId.docs];
+            const existingIds = new Set(bookingsByUserId.docs.map(d => d.id));
+
+            bookingsById.docs.forEach(doc => {
+                if (!existingIds.has(doc.id)) {
+                    allBookingDocs.push(doc);
+                }
+            });
+
+            // Note: Removed fallback search that queries all bookings due to permission restrictions
+            // If bookings aren't showing up, check that:
+            // 1. providerUserId in booking matches the provider's userId field
+            // 2. providerId in booking matches the provider document ID
+
+            const bookingsSnapshot = {
+                docs: allBookingDocs
+            };
+
+            const bookingsList = await Promise.all(
+                bookingsSnapshot.docs.map(async (bookingDoc) => {
+                    const booking = bookingDoc.data();
+
+                    // Get customer details
+                    let customerName = 'Unknown Customer';
+                    let customerEmail = '';
+                    let customerPhone = '';
+                    if (booking.customerId) {
+                        // Get customer directly by UID (no query needed)
+                        const customerDoc = await getDoc(doc(db, 'customer', booking.customerId));
+                        if (customerDoc.exists()) {
+                            const customerData = customerDoc.data();
+                            customerName = customerData.firstName && customerData.lastName
+                                ? `${customerData.firstName} ${customerData.lastName}`
+                                : customerData.displayName || customerData.email || 'Unknown';
+                            customerEmail = customerData.email || '';
+                            customerPhone = customerData.phone || '';
+                        }
+                    }
+
+                    return {
+                        id: bookingDoc.id,
+                        customerName,
+                        customerEmail,
+                        customerPhone,
+                        service: booking.services && booking.services.length > 0
+                            ? booking.services.map(s => s.name).join(', ')
+                            : booking.serviceName || 'Service',
+                        services: booking.services || (booking.serviceName ? [{ name: booking.serviceName, price: booking.price }] : []),
+                        date: booking.date ? new Date(booking.date.seconds ? booking.date.seconds * 1000 : booking.date).toLocaleDateString() : 'TBD',
+                        time: booking.time || 'TBD',
+                        price: booking.price || 0,
+                        address: booking.address || 'N/A',
+                        vehicleType: booking.vehicleType || 'Not specified',
+                        status: booking.status || 'pending',
+                        createdAt: booking.createdAt
+                    };
+                })
+            );
+
+            // Sort by date (upcoming first)
+            bookingsList.sort((a, b) => {
+                if (a.date === 'TBD') return 1;
+                if (b.date === 'TBD') return -1;
+                return new Date(a.date) - new Date(b.date);
+            });
+
+            setBookings(bookingsList);
+        } catch (error) {
+            console.error('Error loading bookings:', error);
+            setBookings([]);
+        }
+    }
+
+    async function handleUpdateBookingStatus(bookingId, newStatus) {
+        try {
+            await updateDoc(doc(db, 'bookings', bookingId), {
+                status: newStatus,
+                updatedAt: serverTimestamp()
+            });
+
+            // Create notification if booking is cancelled
+            if (newStatus === 'cancelled') {
+                try {
+                    const bookingDoc = await getDoc(doc(db, 'bookings', bookingId));
+                    if (bookingDoc.exists()) {
+                        const bookingData = { id: bookingId, ...bookingDoc.data() };
+                        if (bookingData.providerUserId) {
+                            await notifyBookingCancelled(bookingData.providerUserId, bookingData);
+                        }
+                    }
+                } catch (notifError) {
+                    console.warn('Failed to create cancellation notification:', notifError);
+                }
+            }
+
+            alert(`Booking ${newStatus} successfully`);
+            loadBookings();
+        } catch (error) {
+            console.error('Error updating booking:', error);
+            alert('Failed to update booking');
+        }
+    }
+
+    async function handleToggleService(serviceId) {
+        try {
+            const updatedServices = services.map(service =>
+                service.id === serviceId
+                    ? { ...service, active: !service.active }
+                    : service
+            );
+
+            setServices(updatedServices);
+
+            // Update in Firestore
+            const providerQuery = query(
+                collection(db, 'providers'),
+                where('userId', '==', currentUser.uid)
+            );
+            const providerSnapshot = await getDocs(providerQuery);
+
+            if (!providerSnapshot.empty) {
+                await updateDoc(doc(db, 'providers', providerSnapshot.docs[0].id), {
+                    services: updatedServices,
+                    updatedAt: serverTimestamp()
+                });
+                alert('Service status updated!');
+            }
+        } catch (error) {
+            console.error('Error updating service:', error);
+            alert('Failed to update service');
+            // Revert on error
+            loadProviderData();
+        }
+    }
+
+    async function handleSaveService(updatedService) {
+        try {
+            // More robust matching - check id, slug, or name as fallback
+            const updatedServices = services.map(service => {
+                // Match by id first, then slug, then name as fallback
+                const matches =
+                    (service.id && updatedService.id && service.id === updatedService.id) ||
+                    (service.slug && updatedService.slug && service.slug === updatedService.slug) ||
+                    (service.name && updatedService.name && service.name === updatedService.name);
+
+                return matches ? updatedService : service;
+            });
+
+            // Check if we actually found and updated a service
+            const serviceFound = updatedServices.some((s, idx) => {
+                const original = services[idx];
+                return JSON.stringify(s) !== JSON.stringify(original);
+            });
+
+            if (!serviceFound) {
+                console.warn('Service not found for update:', updatedService);
+                alert('Service not found. Please try again.');
+                return;
+            }
+
+            setServices(updatedServices);
+            setShowEditModal(false);
+            setEditingService(null);
+
+            // Update in Firestore (detailer collection)
+            await updateDoc(doc(db, 'detailer', currentUser.uid), {
+                services: updatedServices,
+                updatedAt: serverTimestamp()
+            });
+
+            // Reload provider data to ensure consistency
+            await loadProviderData();
+            alert('Service updated successfully!');
+        } catch (error) {
+            console.error('Error saving service:', error);
+            alert('Failed to save service: ' + (error.message || 'Unknown error'));
+            // Reload to revert any local changes
+            loadProviderData();
+        }
+    }
+
+    function handleEditService(service) {
+        setEditingService({ ...service });
+        setShowEditModal(true);
+    }
+
+    async function handleSaveWeeklySchedule() {
+        try {
+            // Update detailer collection
+            await updateDoc(doc(db, 'detailer', currentUser.uid), {
+                defaultAvailability: weeklySchedule,
+                updatedAt: serverTimestamp()
+            });
+            alert('Weekly schedule saved successfully!');
+        } catch (error) {
+            console.error('Error saving schedule:', error);
+            alert('Failed to save schedule');
+            loadProviderData();
+        }
+    }
+
+    function handleDayScheduleChange(day, field, value) {
+        setWeeklySchedule(prev => ({
+            ...prev,
+            [day]: {
+                ...prev[day],
+                [field]: value
+            }
+        }));
+    }
+
+    function handleToggleDay(day) {
+        setWeeklySchedule(prev => {
+            const currentDay = prev[day] || {};
+            const isCurrentlyEnabled = currentDay.enabled || false;
+
+            return {
+                ...prev,
+                [day]: {
+                    ...currentDay,
+                    enabled: !isCurrentlyEnabled,
+                    // If enabling and no start/end times exist, set defaults
+                    start: currentDay.start || '09:00',
+                    end: currentDay.end || '17:00'
+                }
+            };
+        });
+    }
+
+    async function handleAddBlackoutDate() {
+        if (!selectedBlackoutDate) {
+            alert('Please select a date');
+            return;
+        }
+
+        if (blackoutDates.find(b => b.date === selectedBlackoutDate)) {
+            alert('This date is already blocked out');
+            return;
+        }
+
+        try {
+            const newBlackout = { date: selectedBlackoutDate, type: 'unavailable' };
+            const updatedBlackouts = [...blackoutDates, newBlackout];
+            setBlackoutDates(updatedBlackouts);
+
+            // Update in Firestore
+            // Update detailer collection
+            const detailerDoc = await getDoc(doc(db, 'detailer', currentUser.uid));
+
+            if (detailerDoc.exists()) {
+                const detailerData = detailerDoc.data();
+                const dateOverrides = detailerData.dateOverrides || {};
+
+                dateOverrides[selectedBlackoutDate] = { type: 'unavailable' };
+
+                await updateDoc(doc(db, 'detailer', currentUser.uid), {
+                    dateOverrides: dateOverrides,
+                    updatedAt: serverTimestamp()
+                });
+
+                setSelectedBlackoutDate('');
+                setShowBlackoutModal(false);
+                alert('Blackout date added successfully!');
+            }
+        } catch (error) {
+            console.error('Error adding blackout date:', error);
+            alert('Failed to add blackout date');
+            loadProviderData();
+        }
+    }
+
+    async function handleRemoveBlackoutDate(dateToRemove) {
+        if (!confirm('Are you sure you want to remove this blackout date?')) return;
+
+        try {
+            const updatedBlackouts = blackoutDates.filter(b => b.date !== dateToRemove);
+            setBlackoutDates(updatedBlackouts);
+
+            // Update in Firestore (detailer collection)
+            const detailerDoc = await getDoc(doc(db, 'detailer', currentUser.uid));
+
+            if (detailerDoc.exists()) {
+                const detailerData = detailerDoc.data();
+                const dateOverrides = detailerData.dateOverrides || {};
+
+                delete dateOverrides[dateToRemove];
+
+                await updateDoc(doc(db, 'detailer', currentUser.uid), {
+                    dateOverrides: dateOverrides,
+                    updatedAt: serverTimestamp()
+                });
+
+                alert('Blackout date removed successfully!');
+            }
+        } catch (error) {
+            console.error('Error removing blackout date:', error);
+            alert('Failed to remove blackout date');
+            loadProviderData();
+        }
+    }
+
+    async function handleApproveProvider(providerId) {
+        if (!confirm('Approve this provider? They will be able to accept bookings.')) return;
+
+        try {
+            // Get the detailer document
+            const detailerDoc = await getDoc(doc(db, 'detailer', providerId));
+
+            if (!detailerDoc.exists()) {
+                alert('Error: Provider document not found!');
+                return;
+            }
+
+            const detailerData = detailerDoc.data();
+
+            // Prepare update data
+            const updateData = {
+                status: 'approved',
+                approvedAt: serverTimestamp(),
+                updatedAt: serverTimestamp()
+            };
+
+            // If provider doesn't have packages, initialize with all packages
+            if (!detailerData.offeredPackages || detailerData.offeredPackages.length === 0) {
+                updateData.offeredPackages = PACKAGES_DATA.map(pkg => pkg.id);
+            }
+
+            // Perform the update (detailer collection)
+            await updateDoc(doc(db, 'detailer', providerId), updateData);
+
+            // Verify the update succeeded by reading the document again
+            const verifyDoc = await getDoc(doc(db, 'detailer', providerId));
+            const verifyData = verifyDoc.data();
+
+            if (verifyData.status !== 'approved') {
+                throw new Error('Update verification failed: status is still not approved');
+            }
+
+            alert('Provider approved successfully!');
+            // Reload pending providers list
+            await loadPendingProviders();
+        } catch (error) {
+            console.error('Error approving provider:', error);
+            alert(`Failed to approve provider: ${error.message || 'Unknown error'}`);
+        }
+    }
+
+    async function handleRejectProvider(providerId) {
+        const reason = prompt('Reason for rejection (optional):');
+        if (reason === null) return; // User cancelled
+
+        try {
+            // Update detailer collection
+            await updateDoc(doc(db, 'detailer', providerId), {
+                status: 'rejected',
+                rejectionReason: reason || '',
+                rejectedAt: serverTimestamp(),
+                updatedAt: serverTimestamp()
+            });
+            alert('Provider rejected.');
+            loadPendingProviders();
+            loadRejectedProviders(); // Also reload rejected providers list
+        } catch (error) {
+            console.error('Error rejecting provider:', error);
+            alert('Failed to reject provider');
+        }
+    }
+
+    async function handleDeleteProvider(providerId) {
+        if (!confirm('Are you sure you want to permanently delete this provider account? This action cannot be undone.')) {
+            return;
+        }
+
+        try {
+            // Delete the detailer document
+            await deleteDoc(doc(db, 'detailer', providerId));
+            alert('Provider account deleted successfully.');
+            loadPendingProviders();
+            loadRejectedProviders(); // Reload rejected providers list
+        } catch (error) {
+            console.error('Error deleting provider:', error);
+            alert(`Failed to delete provider: ${error.message || 'Unknown error'}`);
+        }
+    }
+
+    async function listAllProviders() {
+        try {
+            // Query users collection for providers (unified structure)
+            const providersQuery = query(
+                collection(db, 'detailer')
+            );
+            const providersSnapshot = await getDocs(providersQuery);
+
+            const providersList = providersSnapshot.docs.map(doc => {
+                const data = doc.data();
+                return {
+                    id: doc.id,
+                    userId: data.uid, // Now same as document ID
+                    email: data.email,
+                    businessName: data.businessName || data.name || 'N/A',
+                    status: data.status,
+                    hasPackages: (data.offeredPackages || []).length > 0,
+                    packageCount: (data.offeredPackages || []).length,
+                    createdAt: data.createdAt?.toDate?.() || 'N/A'
+                };
+            });
+
+            // Log to console
+            console.table(providersList);
+
+            // Also show in alert with details
+            const details = providersList.map((p, idx) =>
+                `${idx + 1}. ${p.businessName}\n   Email: ${p.email || 'N/A'}\n   Status: ${p.status}\n   Packages: ${p.packageCount}\n   UserId: ${p.userId}\n   DocId: ${p.id}`
+            ).join('\n\n');
+
+            alert(`Found ${providersList.length} provider(s):\n\n${details}\n\nCheck console for table view.`);
+        } catch (error) {
+            console.error('Error listing providers:', error);
+            alert(`Error: ${error.message}`);
+        }
+    }
+
+    // Handle file selection for logo upload
+    function handleFileSelect(e) {
+        const file = e.target.files[0];
+        if (file) {
+            // Validate file type
+            if (!file.type.startsWith('image/')) {
+                alert('Please select an image file');
+                return;
+            }
+
+            // Validate file size (max 5MB)
+            if (file.size > 5 * 1024 * 1024) {
+                alert('Image size must be less than 5MB');
+                return;
+            }
+
+            setLogoFile(file);
+
+            // Create preview
+            const reader = new FileReader();
+            reader.onloadend = () => {
+                setLogoPreview(reader.result);
+            };
+            reader.readAsDataURL(file);
+        }
+    }
+
+    // Handle logo upload
+    async function handleLogoUpload() {
+        if (!logoFile) return;
+
+        try {
+            setUploadingLogo(true);
+
+            // Create storage reference
+            const storageRef = ref(storage, `provider-logos/${currentUser.uid}/${Date.now()}_${logoFile.name}`);
+
+            // Upload file
+            await uploadBytes(storageRef, logoFile);
+
+            // Get download URL
+            const downloadURL = await getDownloadURL(storageRef);
+
+            // Update detailer collection
+            await updateDoc(doc(db, 'detailer', currentUser.uid), {
+                image: downloadURL,
+                updatedAt: serverTimestamp()
+            });
+
+            alert('Logo uploaded successfully!');
+            setLogoFile(null);
+            setLogoPreview(null);
+            await loadProviderData();
+        } catch (error) {
+            console.error('Error uploading logo:', error);
+            alert(`Failed to upload logo: ${error.message}`);
+        } finally {
+            setUploadingLogo(false);
+        }
+    }
+
+    // --- EARLY RETURN FIX ---
+    // If loading or userData doesn't exist yet, show loading message
+    // and STOP the function here to prevent accessing undefined properties
+    if (loading || !userData) {
+        return (
+            <div className="min-h-screen bg-gray-50 flex items-center justify-center">
+                <div className="text-center">
+                    <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto"></div>
+                    <p className="text-gray-600">Loading dashboard...</p>
+                </div>
+            </div>
+        );
+    }
+    // --- END OF FIX ---
+    // If the code reaches this point, userData is guaranteed to exist
+
+    const upcomingBookings = bookings.filter(b => ['pending', 'confirmed', 'scheduled'].includes(b.status));
+    const completedBookings = bookings.filter(b => ['completed', 'cancelled'].includes(b.status));
+
+    return (
+        <div className="min-h-screen bg-gray-50">
+            {/* Glassmorphic Header */}
+            <div className="sticky top-0 z-40 backdrop-blur-xl bg-gradient-to-r from-blue-600/90 via-blue-700/90 to-indigo-600/90 border-b border-blue-400/20 shadow-lg">
+                <div className="max-w-6xl mx-auto px-4 py-6">
+                    <div className="flex items-center justify-between">
+                        <div>
+                            <h1 className="text-3xl font-bold text-white drop-shadow-md">
+                                Provider Dashboard
+                            </h1>
+                            {userData && (
+                                <p className="text-blue-100 mt-1 drop-shadow-sm">
+                                    {userData.businessName || userData.name || 'Your Business'}
+                                </p>
+                            )}
+                        </div>
+                        <div className="flex items-center gap-4">
+                            <button
+                                onClick={onBackToMarketplace}
+                                className="px-4 py-2 text-white hover:text-blue-100 font-medium transition-colors drop-shadow-sm"
+                            >
+                                Marketplace
+                            </button>
+                            <button
+                                onClick={onLogout}
+                                className="px-4 py-2 bg-red-500/90 backdrop-blur-sm text-white rounded-lg hover:bg-red-600/90 font-medium shadow-md transition-all"
+                            >
+                                Logout
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            {/* Tabs */}
+            <div className="bg-white border-b border-gray-200">
+                <div className="max-w-6xl mx-auto px-4">
+                    <div className="flex gap-8">
+                        <button
+                            onClick={() => setActiveTab('bookings')}
+                            className={`py-4 border-b-2 font-semibold transition-colors ${activeTab === 'bookings'
+                                ? 'border-blue-600 text-blue-600'
+                                : 'border-transparent text-gray-600 hover:text-gray-900'
+                                }`}
+                        >
+                            Bookings ({upcomingBookings.length})
+                        </button>
+                        <button
+                            onClick={() => setActiveTab('history')}
+                            className={`py-4 border-b-2 font-semibold transition-colors ${activeTab === 'history'
+                                ? 'border-blue-600 text-blue-600'
+                                : 'border-transparent text-gray-600 hover:text-gray-900'
+                                }`}
+                        >
+                            History ({completedBookings.length})
+                        </button>
+                        <button
+                            onClick={() => setActiveTab('packages')}
+                            className={`py-4 border-b-2 font-semibold transition-colors ${activeTab === 'packages'
+                                ? 'border-blue-600 text-blue-600'
+                                : 'border-transparent text-gray-600 hover:text-gray-900'
+                                }`}
+                        >
+                            Packages
+                        </button>
+                        <button
+                            onClick={() => setActiveTab('availability')}
+                            className={`py-4 border-b-2 font-semibold transition-colors ${activeTab === 'availability'
+                                ? 'border-blue-600 text-blue-600'
+                                : 'border-transparent text-gray-600 hover:text-gray-900'
+                                }`}
+                        >
+                            Availability
+                        </button>
+                        <button
+                            onClick={() => setActiveTab('profile')}
+                            className={`py-4 border-b-2 font-semibold transition-colors ${activeTab === 'profile'
+                                ? 'border-blue-600 text-blue-600'
+                                : 'border-transparent text-gray-600 hover:text-gray-900'
+                                }`}
+                        >
+                            Profile
+                        </button>
+                        <button
+                            onClick={() => setActiveTab('notifications')}
+                            className={`py-4 border-b-2 font-semibold transition-colors relative ${activeTab === 'notifications'
+                                ? 'border-blue-600 text-blue-600'
+                                : 'border-transparent text-gray-600 hover:text-gray-900'
+                                }`}
+                        >
+                            Notifications
+                            {unreadCount > 0 && (
+                                <span className="absolute top-2 right-0 bg-red-500 text-white text-xs font-bold rounded-full w-5 h-5 flex items-center justify-center">
+                                    {unreadCount > 9 ? '9+' : unreadCount}
+                                </span>
+                            )}
+                        </button>
+                        {userData?.role === 'admin' && (  // Change to userData
+                            <button
+                                onClick={() => setActiveTab('admin')}
+                                className={`py-4 border-b-2 font-semibold transition-colors ${activeTab === 'admin'
+                                    ? 'border-blue-600 text-blue-600'
+                                    : 'border-transparent text-gray-600 hover:text-gray-900'
+                                    }`}
+                            >
+                                Admin {pendingProviders.length > 0 && `(${pendingProviders.length})`}
+                            </button>
+                        )}
+                    </div>
+                </div>
+            </div>
+
+            {/* Content */}
+            <div className="max-w-6xl mx-auto px-4 py-8">
+                {activeTab === 'bookings' && (
+                    <div>
+                        <div className="flex items-center justify-between mb-6">
+                            <h2 className="text-2xl font-bold text-gray-900">Upcoming Bookings</h2>
+                            <button
+                                onClick={loadBookings}
+                                className="px-4 py-2 text-sm border-2 border-gray-200 rounded-lg font-medium hover:bg-gray-50"
+                            >
+                                Refresh
+                            </button>
+                        </div>
+                        {upcomingBookings.length === 0 ? (
+                            <div className="bg-white rounded-xl border border-gray-200 p-12 text-center">
+                                <Calendar className="w-16 h-16 text-gray-300 mx-auto mb-4" />
+                                <h3 className="text-xl font-semibold text-gray-900 mb-2">No upcoming bookings</h3>
+                                <p className="text-gray-600">New bookings will appear here</p>
+                            </div>
+                        ) : (
+                            <div className="space-y-4">
+                                {upcomingBookings.map((booking) => (
+                                    <div key={booking.id} className="bg-white rounded-xl border border-gray-200 p-6">
+                                        <div className="flex justify-between items-start mb-4">
+                                            <div className="flex-1">
+                                                <h3 className="text-xl font-bold text-gray-900 mb-2">
+                                                    {booking.customerName}
+                                                </h3>
+
+                                                {/* Contact Information */}
+                                                <div className="flex flex-wrap gap-4 mb-4 text-sm">
+                                                    {booking.customerEmail && (
+                                                        <div className="flex items-center gap-2 text-gray-600">
+                                                            <Mail className="w-4 h-4" />
+                                                            <a href={`mailto:${booking.customerEmail}`} className="hover:text-blue-600">
+                                                                {booking.customerEmail}
+                                                            </a>
+                                                        </div>
+                                                    )}
+                                                    {booking.customerPhone && (
+                                                        <div className="flex items-center gap-2 text-gray-600">
+                                                            <Phone className="w-4 h-4" />
+                                                            <a href={`tel:${booking.customerPhone}`} className="hover:text-blue-600">
+                                                                {booking.customerPhone}
+                                                            </a>
+                                                        </div>
+                                                    )}
+                                                </div>
+
+                                                {/* Package/Service & Vehicle */}
+                                                <div className="mb-4">
+                                                    {booking.packageName ? (
+                                                        <div className="space-y-2 mb-2">
+                                                            <div className="flex items-center justify-between">
+                                                                <p className="text-lg font-semibold text-gray-900">{booking.packageName}</p>
+                                                                {booking.packagePrice && (
+                                                                    <span className="text-sm font-medium text-gray-600">
+                                                                        ${booking.packagePrice}
+                                                                    </span>
+                                                                )}
+                                                            </div>
+                                                            {booking.addOns && booking.addOns.length > 0 && (
+                                                                <div className="ml-4 space-y-1">
+                                                                    {booking.addOns.map((addOn, idx) => (
+                                                                        <div key={idx} className="flex items-center justify-between text-sm">
+                                                                            <span className="text-gray-600">+ {addOn.name}</span>
+                                                                            {addOn.price && (
+                                                                                <span className="text-gray-600">${addOn.price}</span>
+                                                                            )}
+                                                                        </div>
+                                                                    ))}
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    ) : booking.services && booking.services.length > 0 ? (
+                                                        <div className="space-y-2 mb-2">
+                                                            {booking.services.map((service, idx) => (
+                                                                <div key={idx} className="flex items-center justify-between">
+                                                                    <p className="text-lg font-semibold text-gray-900">{service.name}</p>
+                                                                    {service.price && (
+                                                                        <span className="text-sm font-medium text-gray-600">${service.price}</span>
+                                                                    )}
+                                                                </div>
+                                                            ))}
+                                                        </div>
+                                                    ) : (
+                                                        <p className="text-lg font-semibold text-gray-900 mb-2">{booking.service || booking.serviceName || 'Service'}</p>
+                                                    )}
+                                                    <div className="flex items-center gap-2 text-sm text-gray-600">
+                                                        <Car className="w-4 h-4" />
+                                                        <span className="font-medium">Vehicle:</span>
+                                                        <span>{booking.vehicleType || 'Not specified'}</span>
+                                                    </div>
+                                                </div>
+
+                                                {/* Date, Time, and Address */}
+                                                <div className="space-y-2 text-sm">
+                                                    <div className="flex items-center gap-2 text-gray-600">
+                                                        <Calendar className="w-4 h-4" />
+                                                        <span className="font-medium">{booking.date}</span>
+                                                    </div>
+                                                    <div className="flex items-center gap-2 text-gray-600">
+                                                        <Clock className="w-4 h-4" />
+                                                        <span className="font-medium">{booking.time}</span>
+                                                    </div>
+                                                    <div className="flex items-start gap-2 text-gray-600">
+                                                        <MapPin className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                                                        <span className="font-medium">{booking.address}</span>
+                                                    </div>
+                                                </div>
+                                            </div>
+
+                                            <div className="text-right ml-6">
+                                                <p className="text-2xl font-bold text-gray-900 mb-2">
+                                                    ${booking.price.toFixed(2)}
+                                                </p>
+                                                <span className={`inline-block px-3 py-1 rounded-full text-sm font-medium ${booking.status === 'confirmed'
+                                                    ? 'bg-green-100 text-green-800'
+                                                    : booking.status === 'pending'
+                                                        ? 'bg-yellow-100 text-yellow-800'
+                                                        : 'bg-blue-100 text-blue-800'
+                                                    }`}>
+                                                    {booking.status.charAt(0).toUpperCase() + booking.status.slice(1)}
+                                                </span>
+                                            </div>
+                                        </div>
+
+                                        {booking.status === 'pending' && (
+                                            <div className="flex gap-3 pt-4 border-t border-gray-100">
+                                                <button
+                                                    onClick={() => handleUpdateBookingStatus(booking.id, 'confirmed')}
+                                                    className="flex-1 px-4 py-2 bg-green-600 text-white rounded-lg font-semibold hover:bg-green-700"
+                                                >
+                                                    Accept
+                                                </button>
+                                                <button
+                                                    onClick={() => {
+                                                        if (confirm('Are you sure you want to reject this booking?')) {
+                                                            handleUpdateBookingStatus(booking.id, 'cancelled');
+                                                        }
+                                                    }}
+                                                    className="flex-1 px-4 py-2 bg-red-50 text-red-600 rounded-lg font-semibold hover:bg-red-100"
+                                                >
+                                                    Reject
+                                                </button>
+                                            </div>
+                                        )}
+
+                                        {booking.status === 'confirmed' && (
+                                            <div className="flex gap-3 pt-4 border-t border-gray-100">
+                                                <button
+                                                    onClick={() => handleUpdateBookingStatus(booking.id, 'completed')}
+                                                    className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700"
+                                                >
+                                                    Mark Complete
+                                                </button>
+                                                <button
+                                                    onClick={() => {
+                                                        if (confirm('Are you sure you want to cancel this booking?')) {
+                                                            handleUpdateBookingStatus(booking.id, 'cancelled');
+                                                        }
+                                                    }}
+                                                    className="flex-1 px-4 py-2 bg-red-50 text-red-600 rounded-lg font-semibold hover:bg-red-100"
+                                                >
+                                                    Cancel
+                                                </button>
+                                            </div>
+                                        )}
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+                )}
+
+                {activeTab === 'history' && (
+                    <div>
+                        <h2 className="text-2xl font-bold text-gray-900 mb-6">Booking History</h2>
+                        {completedBookings.length === 0 ? (
+                            <div className="bg-white rounded-xl border border-gray-200 p-12 text-center">
+                                <p className="text-gray-600">No completed bookings yet</p>
+                            </div>
+                        ) : (
+                            <div className="space-y-4">
+                                {completedBookings.map((booking) => (
+                                    <div key={booking.id} className="bg-white rounded-xl border border-gray-200 p-6">
+                                        <div className="flex justify-between items-start">
+                                            <div className="flex-1">
+                                                <h3 className="text-lg font-semibold text-gray-900 mb-2">
+                                                    {booking.customerName}
+                                                </h3>
+
+                                                {/* Contact Information */}
+                                                {(booking.customerEmail || booking.customerPhone) && (
+                                                    <div className="flex flex-wrap gap-4 mb-3 text-sm">
+                                                        {booking.customerEmail && (
+                                                            <div className="flex items-center gap-2 text-gray-600">
+                                                                <Mail className="w-4 h-4" />
+                                                                <span>{booking.customerEmail}</span>
+                                                            </div>
+                                                        )}
+                                                        {booking.customerPhone && (
+                                                            <div className="flex items-center gap-2 text-gray-600">
+                                                                <Phone className="w-4 h-4" />
+                                                                <span>{booking.customerPhone}</span>
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                )}
+
+                                                {booking.packageName ? (
+                                                    <div className="mb-2">
+                                                        <p className="text-gray-600 mb-1 font-semibold">{booking.packageName}</p>
+                                                        {booking.packagePrice && (
+                                                            <p className="text-gray-500 text-sm mb-1">
+                                                                ${booking.packagePrice}
+                                                            </p>
+                                                        )}
+                                                        {booking.addOns && booking.addOns.length > 0 && (
+                                                            <div className="ml-2 mt-1">
+                                                                {booking.addOns.map((addOn, idx) => (
+                                                                    <p key={idx} className="text-gray-500 text-sm">
+                                                                        + {addOn.name} {addOn.price ? `($${addOn.price})` : ''}
+                                                                    </p>
+                                                                ))}
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                ) : booking.services && booking.services.length > 0 ? (
+                                                    <div className="mb-2">
+                                                        {booking.services.map((service, idx) => (
+                                                            <p key={idx} className="text-gray-600 mb-1">
+                                                                {service.name} {service.price ? `- $${service.price}` : ''}
+                                                            </p>
+                                                        ))}
+                                                    </div>
+                                                ) : (
+                                                    <p className="text-gray-600 mb-1">{booking.service || booking.serviceName || 'Service'}</p>
+                                                )}
+                                                <p className="text-sm text-gray-500 mb-2">
+                                                    <span className="font-medium">Vehicle:</span> {booking.vehicleType || 'Not specified'}
+                                                </p>
+                                                <div className="flex flex-wrap gap-4 text-sm text-gray-500 mt-2">
+                                                    <span>{booking.date} at {booking.time}</span>
+                                                    {booking.address && booking.address !== 'N/A' && (
+                                                        <span className="flex items-center gap-1">
+                                                            <MapPin className="w-3 h-3" />
+                                                            {booking.address}
+                                                        </span>
+                                                    )}
+                                                </div>
+                                            </div>
+                                            <div className="text-right ml-6">
+                                                <p className="text-xl font-bold text-gray-900">
+                                                    ${booking.price.toFixed(2)}
+                                                </p>
+                                                <span className={`inline-block mt-2 px-3 py-1 rounded-full text-sm ${booking.status === 'completed'
+                                                    ? 'bg-green-100 text-green-800'
+                                                    : 'bg-gray-100 text-gray-800'
+                                                    }`}>
+                                                    {booking.status.charAt(0).toUpperCase() + booking.status.slice(1)}
+                                                </span>
+                                            </div>
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+                )}
+
+                {activeTab === 'packages' && (
+                    <div>
+                        <div className="flex items-center justify-between mb-6">
+                            <div>
+                                <h2 className="text-2xl font-bold text-gray-900">Manage Packages</h2>
+                                <p className="text-sm text-gray-500 mt-1">
+                                    Select which packages you want to offer to customers
+                                </p>
+                            </div>
+                            <button
+                                type="button"
+                                onClick={async (e) => {
+                                    e.preventDefault();
+                                    e.stopPropagation();
+
+                                    console.log('🔵 Save button clicked!', {
+                                        savingPackages,
+                                        currentUser: currentUser?.uid,
+                                        selectedPackages,
+                                        selectedAddOns,
+                                        packagePrices
+                                    });
+
+                                    if (savingPackages) {
+                                        return;
+                                    }
+
+                                    try {
+                                        setSavingPackages(true);
+
+                                        if (!currentUser || !currentUser.uid) {
+                                            const errorMsg = 'Error: You must be logged in to save changes.';
+                                            console.error('❌', errorMsg);
+                                            alert(errorMsg);
+                                            setSavingPackages(false);
+                                            return;
+                                        }
+
+                                        // Unified structure: document ID is the UID
+                                        const docIdToUpdate = currentUser.uid;
+
+                                        // Verify document exists
+                                        const detailerDocRef = doc(db, 'detailer', currentUser.uid);
+                                        const detailerDocSnap = await getDoc(detailerDocRef);
+
+                                        if (!detailerDocSnap.exists()) {
+                                            console.error('⚠️ Detailer document not found!');
+                                            alert('Error: Your detailer account was not found. Please contact support.');
+                                            return;
+                                        }
+
+                                        // Ensure packagePrices is always an object
+                                        const safePackagePrices = packagePrices || {};
+
+                                        // Update detailer collection
+                                        await updateDoc(detailerDocRef, {
+                                            offeredPackages: selectedPackages,
+                                            addOns: selectedAddOns,
+                                            packagePrices: safePackagePrices,
+                                            updatedAt: serverTimestamp()
+                                        });
+
+                                        alert('Packages saved successfully!');
+
+                                        // Reload provider data to reflect changes
+                                        await loadProviderData();
+                                    } catch (error) {
+                                        console.error('❌ Error saving packages:', error);
+                                        console.error('Error details:', {
+                                            message: error.message,
+                                            code: error.code,
+                                            stack: error.stack
+                                        });
+                                        alert(`Failed to save packages: ${error.message || 'Unknown error'}`);
+                                    } finally {
+                                        setSavingPackages(false);
+                                        console.log('🏁 Save process complete');
+                                    }
+                                }}
+                                disabled={savingPackages}
+                                className="px-4 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700 transition-colors disabled:bg-gray-400 disabled:cursor-not-allowed flex items-center gap-2 cursor-pointer"
+                                style={{ pointerEvents: savingPackages ? 'none' : 'auto' }}
+                            >
+                                {savingPackages ? (
+                                    <>
+                                        <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                                        Saving...
+                                    </>
+                                ) : (
+                                    'Save Changes'
+                                )}
                             </button>
                         </div>
 
-                        {/* Mobile Menu Dropdown */}
-                        {showMobileMenu && (
-                            <div className="lg:hidden mt-4 pb-4 border-t border-gray-200 pt-4">
-                                <div className="flex flex-col gap-3">
-                                    <button
-                                        onClick={() => {
-                                            // Check if user is authenticated and has provider role
-                                            if (auth.currentUser) {
-                                                // User is logged in, check their role
-                                                getDoc(doc(db, 'users', auth.currentUser.uid)).then(userDoc => {
-                                                    if (userDoc.exists() && userDoc.data().accountType === 'provider') {
-                                                        setShowProviderDashboard(true);
-                                                        setShowMobileMenu(false);
-                                                    } else {
-                                                        alert('Provider access required. Please sign up as a provider first.');
-                                                        setShowProviderModal(true);
-                                                        setShowMobileMenu(false);
-                                                    }
-                                                }).catch(() => {
-                                                    alert('Please sign in first to access provider dashboard.');
-                                                    setShowLoginModal(true);
-                                                    setShowMobileMenu(false);
-                                                });
-                                            } else {
-                                                alert('Please sign in first to access provider dashboard.');
-                                                setShowLoginModal(true);
-                                                setShowMobileMenu(false);
-                                            }
-                                        }}
-                                        className="text-gray-600 hover:text-cyan-500 px-4 py-2 rounded-lg hover:bg-gray-50 transition-colors"
-                                    >
-                                        Provider Dashboard
-                                    </button>
-                                    <button
-                                        onClick={() => {
-                                            // Check if user is authenticated
-                                            if (auth.currentUser) {
-                                                setShowProfilePanel(true);
-                                                setShowMobileMenu(false);
-                                            } else {
-                                                alert('Please sign in first to access your profile.');
-                                                setShowLoginModal(true);
-                                                setShowMobileMenu(false);
-                                            }
-                                        }}
-                                        className="text-left text-gray-600 hover:text-cyan-500 px-4 py-2 rounded-lg hover:bg-gray-50 transition-colors"
-                                    >
-                                        My Profile
-                                    </button>
-                                    <div className="border-t border-gray-200 pt-3 mt-2">
-                                        {user ? (
-                                            // User is logged in - show user info and logout
-                                            <>
-                                                <div className="flex items-center gap-3 px-4 py-3 mb-3 bg-gray-50 rounded-lg">
-                                                    <div className="w-10 h-10 bg-cyan-500 text-white rounded-full flex items-center justify-center text-sm font-bold">
-                                                        {userData?.firstName && userData?.lastName
-                                                            ? `${userData.firstName.charAt(0)}${userData.lastName.charAt(0)}`
-                                                            : user.displayName?.charAt(0) || 'U'
-                                                        }
-                                                    </div>
+                        {/* Packages Section */}
+                        <div className="mb-8">
+                            <h3 className="text-lg font-semibold text-gray-900 mb-4">Available Packages</h3>
+                            {availablePackages.length === 0 ? (
+                                <div className="bg-white rounded-xl border border-gray-200 p-12 text-center">
+                                    <Package className="w-16 h-16 text-gray-300 mx-auto mb-4" />
+                                    <h3 className="text-xl font-semibold text-gray-900 mb-2">No packages available</h3>
+                                    <p className="text-gray-600">Packages will appear here once they're added to the system.</p>
+                                </div>
+                            ) : (
+                                <div className="space-y-4">
+                                    {availablePackages.map((pkg) => {
+                                        const isSelected = selectedPackages.includes(pkg.id);
+                                        return (
+                                            <div
+                                                key={pkg.id}
+                                                className={`bg-white rounded-xl border-2 p-6 transition-all ${isSelected ? 'border-blue-600 bg-blue-50' : 'border-gray-200'
+                                                    }`}
+                                            >
+                                                <div className="flex items-start justify-between">
                                                     <div className="flex-1">
-                                                        <p className="text-sm font-semibold text-gray-800">
-                                                            {userData?.firstName && userData?.lastName
-                                                                ? `${userData.firstName} ${userData.lastName}`
-                                                                : user.displayName || 'User'
-                                                            }
-                                                        </p>
-                                                        <p className="text-xs text-gray-500">
-                                                            {userData?.accountType === 'provider' ? 'Provider' : 'Customer'}
-                                                        </p>
+                                                        <div className="flex items-center gap-3 mb-2">
+                                                            <h3 className="text-lg font-semibold text-gray-900">{pkg.name}</h3>
+                                                            {isSelected && (
+                                                                <span className="px-2 py-1 rounded-full text-xs font-medium bg-green-100 text-green-800">
+                                                                    Offered
+                                                                </span>
+                                                            )}
+                                                        </div>
+                                                        <p className="text-sm text-gray-600 mb-3">{pkg.description}</p>
+                                                        <div className="flex flex-wrap items-center justify-between gap-4 text-sm mb-3 p-3 bg-gray-50 rounded-lg">
+                                                            <div className="flex items-center gap-4">
+                                                                <div className="flex items-center gap-2">
+                                                                    <DollarSign className="w-4 h-4 text-gray-600" />
+                                                                    <span className={`font-bold text-lg ${isSelected && packagePrices[pkg.id] ? 'text-blue-600' : 'text-gray-900'}`}>
+                                                                        ${packagePrices[pkg.id]?.price ?? pkg.price}
+                                                                    </span>
+                                                                    {isSelected && packagePrices[pkg.id] && (
+                                                                        <span className="px-2 py-1 rounded-full text-xs bg-blue-100 text-blue-700 font-medium">Custom</span>
+                                                                    )}
+                                                                </div>
+                                                            </div>
+                                                            {isSelected && (
+                                                                <button
+                                                                    onClick={() => {
+                                                                        // Initialize prices if not set
+                                                                        if (!packagePrices[pkg.id]) {
+                                                                            setPackagePrices(prev => ({
+                                                                                ...prev,
+                                                                                [pkg.id]: {
+                                                                                    price: pkg.price
+                                                                                }
+                                                                            }));
+                                                                        }
+                                                                    }}
+                                                                    className="px-4 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700 flex items-center gap-2 text-sm"
+                                                                >
+                                                                    <Edit2 className="w-4 h-4" />
+                                                                    {packagePrices[pkg.id] ? 'Edit Prices' : 'Set Custom Prices'}
+                                                                </button>
+                                                            )}
+                                                        </div>
+
+                                                        {/* Price editing section - only show if package is selected */}
+                                                        {isSelected && packagePrices[pkg.id] && (
+                                                            <div className="mb-3 p-4 bg-blue-50 rounded-lg border-2 border-blue-300">
+                                                                <div className="flex items-center justify-between mb-3">
+                                                                    <label className="block text-sm font-semibold text-gray-900">
+                                                                        <Edit2 className="w-4 h-4 inline mr-1" />
+                                                                        Custom Pricing
+                                                                    </label>
+                                                                    <button
+                                                                        onClick={() => {
+                                                                            setPackagePrices(prev => {
+                                                                                const updated = { ...prev };
+                                                                                delete updated[pkg.id];
+                                                                                return updated;
+                                                                            });
+                                                                        }}
+                                                                        className="text-xs text-red-600 hover:text-red-700 font-medium flex items-center gap-1 px-2 py-1 hover:bg-red-50 rounded"
+                                                                    >
+                                                                        <X className="w-3 h-3" />
+                                                                        Reset to Default
+                                                                    </button>
+                                                                </div>
+                                                                <p className="text-xs text-gray-600 mb-3">Set your price for this package</p>
+                                                                <div>
+                                                                    <label className="block text-xs font-medium text-gray-700 mb-1">Price ($)</label>
+                                                                    <input
+                                                                        type="number"
+                                                                        min="0"
+                                                                        step="1"
+                                                                        value={packagePrices[pkg.id]?.price ?? pkg.price}
+                                                                        onChange={(e) => {
+                                                                            const value = parseInt(e.target.value) || pkg.price;
+                                                                            setPackagePrices(prev => ({
+                                                                                ...prev,
+                                                                                [pkg.id]: {
+                                                                                    price: value
+                                                                                }
+                                                                            }));
+                                                                        }}
+                                                                        className="w-full px-3 py-2 text-sm border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white font-medium"
+                                                                        placeholder={pkg.price?.toString() || '0'}
+                                                                    />
+                                                                </div>
+                                                                <div className="mt-3 pt-3 border-t border-blue-200">
+                                                                    <div className="flex items-center gap-2 text-sm">
+                                                                        <DollarSign className="w-4 h-4 text-blue-600" />
+                                                                        <span className="font-bold text-blue-700">
+                                                                            Your Price: ${packagePrices[pkg.id]?.price ?? pkg.price}
+                                                                        </span>
+                                                                    </div>
+                                                                </div>
+                                                            </div>
+                                                        )}
+                                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3 pt-3 border-t border-gray-200">
+                                                            <div>
+                                                                <div className="text-xs font-semibold text-gray-700 mb-1">Exterior Services:</div>
+                                                                <ul className="text-xs text-gray-600 space-y-1">
+                                                                    {pkg.exteriorServices.map((svc, idx) => (
+                                                                        <li key={idx} className="flex items-start">
+                                                                            <CheckCircle2 className="w-3 h-3 text-green-500 mr-1 mt-0.5 flex-shrink-0" />
+                                                                            <span>{svc}</span>
+                                                                        </li>
+                                                                    ))}
+                                                                </ul>
+                                                            </div>
+                                                            <div>
+                                                                <div className="text-xs font-semibold text-gray-700 mb-1">Interior Services:</div>
+                                                                <ul className="text-xs text-gray-600 space-y-1">
+                                                                    {pkg.interiorServices.map((svc, idx) => (
+                                                                        <li key={idx} className="flex items-start">
+                                                                            <CheckCircle2 className="w-3 h-3 text-green-500 mr-1 mt-0.5 flex-shrink-0" />
+                                                                            <span>{svc}</span>
+                                                                        </li>
+                                                                    ))}
+                                                                </ul>
+                                                            </div>
+                                                        </div>
+                                                    </div>
+                                                    <div className="ml-4">
+                                                        <label className="relative inline-flex items-center cursor-pointer">
+                                                            <input
+                                                                type="checkbox"
+                                                                checked={isSelected}
+                                                                onChange={() => {
+                                                                    if (isSelected) {
+                                                                        // Remove package and its custom prices
+                                                                        setSelectedPackages(prev => prev.filter(id => id !== pkg.id));
+                                                                        setPackagePrices(prev => {
+                                                                            const updated = { ...prev };
+                                                                            delete updated[pkg.id];
+                                                                            return updated;
+                                                                        });
+                                                                    } else {
+                                                                        setSelectedPackages(prev => [...prev, pkg.id]);
+                                                                    }
+                                                                }}
+                                                                className="sr-only peer"
+                                                            />
+                                                            <div className="w-11 h-6 bg-gray-200 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-blue-300 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
+                                                        </label>
                                                     </div>
                                                 </div>
-                                                <button
-                                                    onClick={async () => {
-                                                        try {
-                                                            await signOut(auth);
-                                                            setShowMobileMenu(false);
-                                                        } catch (error) {
-                                                            console.error('Logout error:', error);
-                                                        }
-                                                    }}
-                                                    className="w-full text-left text-red-600 hover:text-red-500 px-4 py-2 rounded-lg hover:bg-red-50 transition-colors"
-                                                >
-                                                    Logout
-                                                </button>
-                                            </>
-                                        ) : (
-                                            // User is not logged in - show login/signup buttons
-                                            <>
-                                                <button
-                                                    onClick={() => {
-                                                        setShowLoginModal(true);
-                                                        setShowMobileMenu(false);
-                                                    }}
-                                                    className="w-full text-left text-gray-600 hover:text-cyan-500 px-4 py-2 rounded-lg hover:bg-gray-50 transition-colors"
-                                                >
-                                                    Log In
-                                                </button>
-                                                <button
-                                                    onClick={() => {
-                                                        setShowSignupModal(true);
-                                                        setShowMobileMenu(false);
-                                                    }}
-                                                    className="w-full bg-cyan-500 hover:bg-cyan-600 text-white px-4 py-3 rounded-lg font-semibold mt-2 transition-colors"
-                                                >
-                                                    Sign Up
-                                                </button>
-                                            </>
-                                        )}
-                                    </div>
+                                            </div>
+                                        );
+                                    })}
                                 </div>
-                            </div>
-                        )}
-                    </div>
-                </nav>
-
-                {/* Hero Section */}
-                <div className="bg-gradient-to-r from-cyan-500 via-blue-500 to-cyan-600 text-white">
-                    <div className="max-w-7xl mx-auto px-4 sm:px-6 py-12 sm:py-20 text-center">
-                        <h1 className="text-3xl sm:text-4xl md:text-5xl font-bold mb-4 sm:mb-6">
-                            Premium Mobile Auto<br className="hidden sm:block" />
-                            <span className="sm:inline"> </span>Detailing at Your Doorstep
-                        </h1>
-                        <p className="text-base sm:text-xl text-cyan-50 mb-6 sm:mb-8 max-w-2xl mx-auto px-4">
-                            Connect with trusted mobile detailers in your area. Book convenient appointments and get your vehicle detailed without leaving home.
-                        </p>
-                    </div>
-                </div>
-
-                {/* Search & Filter Section */}
-                <div className="bg-white border-b border-gray-200">
-                    <div className="max-w-7xl mx-auto px-4 sm:px-6 py-6">
-                        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 mb-4">
-                            <div>
-                                <label className="block text-sm font-semibold text-gray-700 mb-2">Service Area</label>
-                                <div className="flex gap-2">
-                                    <select
-                                        value={selectedArea}
-                                        onChange={(e) => setSelectedArea(e.target.value)}
-                                        className="flex-1 px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent text-sm sm:text-base"
-                                    >
-                                        <option>All Areas</option>
-                                        <option>Salt Lake City</option>
-                                        <option>Provo</option>
-                                        <option>Orem</option>
-                                        <option>West Valley City</option>
-                                        <option>West Jordan</option>
-                                        <option>Lehi</option>
-                                        <option>Ogden</option>
-                                        <option>Layton</option>
-                                        <option>Taylorsville</option>
-                                        <option>St. George</option>
-                                        <option>Local Area</option>
-                                    </select>
-                                    <button
-                                        onClick={getUserLocation}
-                                        disabled={locationLoading}
-                                        className="px-4 py-3 bg-cyan-500 text-white rounded-lg hover:bg-cyan-600 disabled:bg-gray-400 flex items-center gap-2 text-sm"
-                                    >
-                                        {locationLoading ? (
-                                            <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
-                                        ) : (
-                                            <MapPin className="w-4 h-4" />
-                                        )}
-                                        {locationLoading ? 'Finding...' : 'My Location'}
-                                    </button>
-                                </div>
-                            </div>
-                            <div>
-                                <label className="block text-sm font-semibold text-gray-700 mb-2">Service Type</label>
-                                <select
-                                    value={selectedType}
-                                    onChange={(e) => setSelectedType(e.target.value)}
-                                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent text-sm sm:text-base"
-                                >
-                                    <option>All Types</option>
-                                    <option>Interior Only</option>
-                                    <option>Exterior Only</option>
-                                    <option>Full Detail</option>
-                                    <option>Paint Correction</option>
-                                    <option>Ceramic Coating</option>
-                                </select>
-                            </div>
-                            <div className="sm:col-span-2 lg:col-span-1">
-                                <label className="block text-sm font-semibold text-gray-700 mb-2">Sort By</label>
-                                <select className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent text-sm sm:text-base">
-                                    <option>Highest Rating</option>
-                                    <option>Most Reviews</option>
-                                    <option>Price: Low to High</option>
-                                    <option>Price: High to Low</option>
-                                    <option>Nearest</option>
-                                </select>
-                            </div>
+                            )}
                         </div>
 
-                        <div className="flex items-center gap-2 flex-wrap">
-                            <span className="text-sm font-semibold text-gray-700 w-full sm:w-auto mb-2 sm:mb-0">Quick Filters:</span>
-                            {['Mobile', 'Certified', 'Same Day', 'Top Rated'].map(filter => (
-                                <button
-                                    key={filter}
-                                    onClick={() => toggleFilter(filter)}
-                                    className={`px-3 sm:px-4 py-2 rounded-lg text-xs sm:text-sm font-medium transition-colors ${activeFilters.includes(filter)
-                                        ? 'bg-cyan-500 text-white'
-                                        : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-                                        }`}
-                                >
-                                    {filter}
-                                </button>
-                            ))}
-                        </div>
-                    </div>
-                </div>
-
-                {/* Services Section */}
-                <div id="services-section" className="max-w-7xl mx-auto px-4 sm:px-6 py-8 sm:py-12">
-                    <div className="mb-6 sm:mb-8">
-                        <h2 className="text-2xl sm:text-3xl font-bold text-gray-800 mb-2">Available Detailing Services</h2>
-                        <p className="text-sm sm:text-base text-gray-600">
-                            Browse through our network of professional mobile detailers and find the perfect service for your vehicle
-                        </p>
-                    </div>
-                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 sm:gap-6">
-                        {filteredServices.length > 0 ? (
-                            filteredServices.map(service => (
-                                <ServiceCard key={service.id} service={service} />
-                            ))
-                        ) : (
-                            <div className="col-span-full text-center py-12">
-                                <div className="text-6xl mb-4">🚗</div>
-                                <h3 className="text-xl font-bold text-gray-800 mb-2">No Providers Found</h3>
-                                <p className="text-gray-600 mb-4">
-                                    {providersLoading ? 'Loading providers...' : 'No detailing services available in your area.'}
-                                </p>
-                                <p className="text-sm text-gray-500">
-                                    Debug: {services.length} total providers, {filteredServices.length} filtered
-                                </p>
-                            </div>
-                        )}
-                    </div>
-                </div>
-
-                {/* Why Choose Section */}
-                <div className="bg-gradient-to-r from-gray-50 to-cyan-50 py-12 sm:py-16">
-                    <div className="max-w-7xl mx-auto px-4 sm:px-6">
-                        <h2 className="text-2xl sm:text-3xl font-bold text-center text-gray-800 mb-8 sm:mb-12">
-                            Why Choose BRNNO
-                        </h2>
-                        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6 sm:gap-8">
-                            <div className="text-center">
-                                <div className="bg-cyan-500 w-16 h-16 sm:w-20 sm:h-20 rounded-full flex items-center justify-center mx-auto mb-4">
-                                    <MapPin className="text-white" size={32} />
-                                </div>
-                                <h3 className="text-lg sm:text-xl font-bold text-gray-800 mb-2">Come to You</h3>
-                                <p className="text-sm sm:text-base text-gray-600 px-4">
-                                    Professional detailers arrive at your location, saving you time and hassle
-                                </p>
-                            </div>
-                            <div className="text-center">
-                                <div className="bg-cyan-500 w-16 h-16 sm:w-20 sm:h-20 rounded-full flex items-center justify-center mx-auto mb-4">
-                                    <Shield className="text-white" size={32} />
-                                </div>
-                                <h3 className="text-lg sm:text-xl font-bold text-gray-800 mb-2">Verified Professionals</h3>
-                                <p className="text-sm sm:text-base text-gray-600 px-4">
-                                    All detailers are vetted and certified by our quality standards
-                                </p>
-                            </div>
-                            <div className="text-center sm:col-span-2 lg:col-span-1">
-                                <div className="bg-cyan-500 w-16 h-16 sm:w-20 sm:h-20 rounded-full flex items-center justify-center mx-auto mb-4">
-                                    <Lock className="text-white" size={32} />
-                                </div>
-                                <h3 className="text-lg sm:text-xl font-bold text-gray-800 mb-2">Secure Payment</h3>
-                                <p className="text-sm sm:text-base text-gray-600 px-4">
-                                    Book and pay securely through our platform with transparent pricing
-                                </p>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                {/* Footer */}
-                <footer className="bg-gray-800 text-white py-8">
-                    <div className="max-w-7xl mx-auto px-6 text-center">
-                        <p className="text-gray-400 text-sm">
-                            This page is from your design and was generated to make your detailing work easier.
-                        </p>
-                        <p className="text-gray-400 text-sm mt-2">
-                            If you have any comments or feedback, let us know!
-                        </p>
-                    </div>
-                </footer>
-
-                {/* Review Modal */}
-                {showReviewModal && (
-                    <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-                        <div className="bg-white rounded-xl p-6 w-full max-w-md">
-                            <h3 className="text-xl font-bold text-gray-800 mb-4">Write a Review</h3>
-
-                            <div className="space-y-4">
-                                <div>
-                                    <label className="block text-sm font-semibold text-gray-700 mb-2">Rating</label>
-                                    <div className="flex gap-1">
-                                        {[1, 2, 3, 4, 5].map(star => (
-                                            <button
-                                                key={star}
-                                                onClick={() => setReviewData(prev => ({ ...prev, rating: star }))}
-                                                className="text-2xl"
-                                            >
-                                                <Star
-                                                    className={star <= reviewData.rating ? 'fill-yellow-400 text-yellow-400' : 'text-gray-300'}
-                                                    size={32}
-                                                />
-                                            </button>
-                                        ))}
-                                    </div>
-                                    <p className="text-sm text-gray-500 mt-1">
-                                        {reviewData.rating === 1 ? 'Poor' :
-                                            reviewData.rating === 2 ? 'Fair' :
-                                                reviewData.rating === 3 ? 'Good' :
-                                                    reviewData.rating === 4 ? 'Very Good' : 'Excellent'}
-                                    </p>
-                                </div>
-
-                                <div>
-                                    <label className="block text-sm font-semibold text-gray-700 mb-2">Your Review</label>
-                                    <textarea
-                                        value={reviewData.comment}
-                                        onChange={(e) => setReviewData(prev => ({ ...prev, comment: e.target.value }))}
-                                        placeholder="Tell others about your experience..."
-                                        rows={4}
-                                        className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent resize-none"
-                                    />
-                                </div>
-                            </div>
-
-                            <div className="flex gap-3 mt-6">
-                                <button
-                                    onClick={() => {
-                                        setShowReviewModal(false);
-                                        setReviewData({ rating: 5, comment: '', providerId: null });
-                                    }}
-                                    className="flex-1 px-4 py-3 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 transition-colors"
-                                >
-                                    Cancel
-                                </button>
-                                <button
-                                    onClick={handleSubmitReview}
-                                    className="flex-1 px-4 py-3 bg-cyan-500 hover:bg-cyan-600 text-white rounded-lg font-semibold transition-colors"
-                                >
-                                    Submit Review
-                                </button>
+                        {/* Add-ons Section */}
+                        <div>
+                            <h3 className="text-lg font-semibold text-gray-900 mb-4">Available Add-ons</h3>
+                            <p className="text-sm text-gray-500 mb-4">Select which add-ons you want to offer with your packages</p>
+                            <div className="space-y-3">
+                                {ADD_ONS.map((addOn) => {
+                                    const isSelected = selectedAddOns.includes(addOn.id);
+                                    return (
+                                        <div
+                                            key={addOn.id}
+                                            className={`bg-white rounded-xl border-2 p-4 transition-all ${isSelected ? 'border-blue-600 bg-blue-50' : 'border-gray-200'
+                                                }`}
+                                        >
+                                            <div className="flex items-center justify-between">
+                                                <div className="flex-1">
+                                                    <div className="flex items-center gap-3 mb-1">
+                                                        <h4 className="font-semibold text-gray-900">{addOn.name}</h4>
+                                                        <span className="text-sm font-medium text-gray-600">+${addOn.price}</span>
+                                                    </div>
+                                                    <p className="text-sm text-gray-600">{addOn.description}</p>
+                                                </div>
+                                                <div className="ml-4">
+                                                    <label className="relative inline-flex items-center cursor-pointer">
+                                                        <input
+                                                            type="checkbox"
+                                                            checked={isSelected}
+                                                            onChange={() => {
+                                                                if (isSelected) {
+                                                                    setSelectedAddOns(prev => prev.filter(id => id !== addOn.id));
+                                                                } else {
+                                                                    setSelectedAddOns(prev => [...prev, addOn.id]);
+                                                                }
+                                                            }}
+                                                            className="sr-only peer"
+                                                        />
+                                                        <div className="w-11 h-6 bg-gray-200 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-blue-300 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
+                                                    </label>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    );
+                                })}
                             </div>
                         </div>
                     </div>
                 )}
 
-                {/* Add Vehicle Modal */}
-                {showAddVehicle && (
-                    <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-                        <div className="bg-white rounded-xl p-6 w-full max-w-md">
-                            <h3 className="text-xl font-bold text-gray-800 mb-4">Add New Vehicle</h3>
+                {activeTab === 'availability' && (
+                    <div>
+                        <h2 className="text-2xl font-bold text-gray-900 mb-6">Manage Availability</h2>
 
-                            <div className="space-y-4">
-                                <div className="grid grid-cols-2 gap-4">
-                                    <div>
-                                        <label className="block text-sm font-semibold text-gray-700 mb-2">Make</label>
-                                        <input
-                                            type="text"
-                                            value={newVehicle.make}
-                                            onChange={(e) => setNewVehicle(prev => ({ ...prev, make: e.target.value }))}
-                                            placeholder="e.g., Toyota"
-                                            className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                        />
-                                    </div>
-                                    <div>
-                                        <label className="block text-sm font-semibold text-gray-700 mb-2">Model</label>
-                                        <input
-                                            type="text"
-                                            value={newVehicle.model}
-                                            onChange={(e) => setNewVehicle(prev => ({ ...prev, model: e.target.value }))}
-                                            placeholder="e.g., Camry"
-                                            className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                        />
-                                    </div>
+                        {/* Weekly Schedule */}
+                        <div className="bg-white rounded-xl border border-gray-200 p-6 mb-6">
+                            <div className="flex items-center justify-between mb-4">
+                                <h3 className="text-lg font-semibold text-gray-900">Weekly Schedule</h3>
+                                <button
+                                    onClick={handleSaveWeeklySchedule}
+                                    className="px-4 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700"
+                                >
+                                    Save Schedule
+                                </button>
+                            </div>
+                            <p className="text-sm text-gray-500 mb-4">
+                                Set your default working hours for each day of the week. This schedule will remain constant until you change it.
+                            </p>
+
+                            <div className="space-y-3">
+                                {['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'].map((day) => {
+                                    const daySchedule = weeklySchedule[day] || { enabled: false, start: '09:00', end: '17:00' };
+                                    const dayName = day.charAt(0).toUpperCase() + day.slice(1);
+
+                                    return (
+                                        <div key={day} className="flex items-center gap-4 p-4 border border-gray-200 rounded-lg">
+                                            <div className="flex items-center gap-3 w-32">
+                                                <input
+                                                    type="checkbox"
+                                                    checked={daySchedule.enabled || false}
+                                                    onChange={() => handleToggleDay(day)}
+                                                    className="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
+                                                />
+                                                <label className="font-medium text-gray-900">{dayName}</label>
+                                            </div>
+
+                                            {daySchedule.enabled ? (
+                                                <div className="flex items-center gap-3 flex-1">
+                                                    <div className="flex items-center gap-2">
+                                                        <label className="text-sm text-gray-600">Start:</label>
+                                                        <input
+                                                            type="time"
+                                                            value={daySchedule.start || '09:00'}
+                                                            onChange={(e) => handleDayScheduleChange(day, 'start', e.target.value)}
+                                                            className="px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                                                        />
+                                                    </div>
+                                                    <span className="text-gray-400">to</span>
+                                                    <div className="flex items-center gap-2">
+                                                        <label className="text-sm text-gray-600">End:</label>
+                                                        <input
+                                                            type="time"
+                                                            value={daySchedule.end || '17:00'}
+                                                            onChange={(e) => handleDayScheduleChange(day, 'end', e.target.value)}
+                                                            className="px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                                                        />
+                                                    </div>
+                                                </div>
+                                            ) : (
+                                                <span className="text-sm text-gray-400 italic">Not available</span>
+                                            )}
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        </div>
+
+                        {/* Blackout Dates */}
+                        <div className="bg-white rounded-xl border border-gray-200 p-6">
+                            <div className="flex items-center justify-between mb-4">
+                                <h3 className="text-lg font-semibold text-gray-900">Blackout Dates</h3>
+                                <button
+                                    onClick={() => setShowBlackoutModal(true)}
+                                    className="px-4 py-2 bg-red-600 text-white rounded-lg font-semibold hover:bg-red-700 flex items-center gap-2"
+                                >
+                                    <Plus className="w-4 h-4" />
+                                    Add Blackout Date
+                                </button>
+                            </div>
+                            <p className="text-sm text-gray-500 mb-4">
+                                Block out dates when you're unavailable (holidays, emergencies, etc.). No bookings will be available on these dates.
+                            </p>
+
+                            {blackoutDates.length === 0 ? (
+                                <div className="text-center py-8 text-gray-500">
+                                    <Calendar className="w-12 h-12 mx-auto mb-2 text-gray-300" />
+                                    <p>No blackout dates set</p>
                                 </div>
+                            ) : (
+                                <div className="space-y-2">
+                                    {blackoutDates.map((blackout) => {
+                                        const date = new Date(blackout.date + 'T00:00:00');
+                                        const formattedDate = date.toLocaleDateString('en-US', {
+                                            weekday: 'long',
+                                            year: 'numeric',
+                                            month: 'long',
+                                            day: 'numeric'
+                                        });
 
-                                <div className="grid grid-cols-2 gap-4">
-                                    <div>
-                                        <label className="block text-sm font-semibold text-gray-700 mb-2">Year</label>
-                                        <input
-                                            type="number"
-                                            value={newVehicle.year}
-                                            onChange={(e) => setNewVehicle(prev => ({ ...prev, year: e.target.value }))}
-                                            placeholder="2023"
-                                            min="1990"
-                                            max="2025"
-                                            className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                        />
-                                    </div>
-                                    <div>
-                                        <label className="block text-sm font-semibold text-gray-700 mb-2">Color</label>
-                                        <input
-                                            type="text"
-                                            value={newVehicle.color}
-                                            onChange={(e) => setNewVehicle(prev => ({ ...prev, color: e.target.value }))}
-                                            placeholder="e.g., Silver"
-                                            className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                        />
-                                    </div>
+                                        return (
+                                            <div key={blackout.date} className="flex items-center justify-between p-3 bg-red-50 border border-red-200 rounded-lg">
+                                                <div className="flex items-center gap-3">
+                                                    <Calendar className="w-5 h-5 text-red-600" />
+                                                    <span className="font-medium text-gray-900">{formattedDate}</span>
+                                                </div>
+                                                <button
+                                                    onClick={() => handleRemoveBlackoutDate(blackout.date)}
+                                                    className="px-3 py-1 text-sm text-red-600 hover:bg-red-100 rounded-lg font-medium"
+                                                >
+                                                    Remove
+                                                </button>
+                                            </div>
+                                        );
+                                    })}
                                 </div>
+                            )}
+                        </div>
 
-                                <div>
-                                    <label className="block text-sm font-semibold text-gray-700 mb-2">License Plate (Optional)</label>
-                                    <input
-                                        type="text"
-                                        value={newVehicle.licensePlate}
-                                        onChange={(e) => setNewVehicle(prev => ({ ...prev, licensePlate: e.target.value }))}
-                                        placeholder="e.g., ABC123"
-                                        className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                                    />
+                        {/* Add Blackout Date Modal */}
+                        {showBlackoutModal && (
+                            <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+                                <div className="bg-white rounded-xl max-w-md w-full">
+                                    <div className="p-6 border-b border-gray-200">
+                                        <div className="flex items-center justify-between">
+                                            <h3 className="text-xl font-bold text-gray-900">Add Blackout Date</h3>
+                                            <button
+                                                onClick={() => {
+                                                    setShowBlackoutModal(false);
+                                                    setSelectedBlackoutDate('');
+                                                }}
+                                                className="text-gray-400 hover:text-gray-600"
+                                            >
+                                                <X className="w-6 h-6" />
+                                            </button>
+                                        </div>
+                                    </div>
+
+                                    <div className="p-6 space-y-4">
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                Select Date
+                                            </label>
+                                            <input
+                                                type="date"
+                                                value={selectedBlackoutDate}
+                                                onChange={(e) => setSelectedBlackoutDate(e.target.value)}
+                                                min={new Date().toISOString().split('T')[0]}
+                                                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                                            />
+                                        </div>
+                                        <p className="text-sm text-gray-500">
+                                            This date will be blocked out and no bookings will be available.
+                                        </p>
+                                    </div>
+
+                                    <div className="p-6 border-t border-gray-200 flex gap-3">
+                                        <button
+                                            onClick={handleAddBlackoutDate}
+                                            className="flex-1 px-4 py-2 bg-red-600 text-white rounded-lg font-semibold hover:bg-red-700"
+                                        >
+                                            Add Blackout Date
+                                        </button>
+                                        <button
+                                            onClick={() => {
+                                                setShowBlackoutModal(false);
+                                                setSelectedBlackoutDate('');
+                                            }}
+                                            className="px-6 py-2 border-2 border-gray-200 rounded-lg font-semibold hover:bg-gray-50"
+                                        >
+                                            Cancel
+                                        </button>
+                                    </div>
                                 </div>
                             </div>
+                        )}
+                    </div>
+                )}
 
-                            <div className="flex gap-3 mt-6">
+                {activeTab === 'admin' && userData?.role === 'admin' && (  // Change to userData
+                    <div>
+                        <div className="flex items-center justify-between mb-6">
+                            <h2 className="text-2xl font-bold text-gray-900">Admin Panel</h2>
+                            <div className="flex gap-2">
                                 <button
-                                    onClick={() => {
-                                        setShowAddVehicle(false);
-                                        setNewVehicle({
-                                            make: '',
-                                            model: '',
-                                            year: '',
-                                            color: '',
-                                            licensePlate: ''
-                                        });
+                                    onClick={async () => {
+                                        if (confirm('This will import all packages to Firestore. Continue?')) {
+                                            try {
+                                                await importPackagesToFirestore();
+                                            } catch (error) {
+                                                console.error('Import error:', error);
+                                            }
+                                        }
                                     }}
-                                    className="flex-1 px-4 py-3 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 transition-colors"
+                                    className="px-4 py-2 text-sm bg-green-600 text-white rounded-lg font-medium hover:bg-green-700"
                                 >
-                                    Cancel
+                                    Import Packages
                                 </button>
                                 <button
-                                    onClick={handleAddVehicle}
-                                    className="flex-1 px-4 py-3 bg-cyan-500 hover:bg-cyan-600 text-white rounded-lg font-semibold transition-colors"
+                                    onClick={listAllProviders}
+                                    className="px-4 py-2 text-sm bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700"
                                 >
-                                    Add Vehicle
+                                    List All Providers
+                                </button>
+                                <button
+                                    onClick={loadPendingProviders}
+                                    className="px-4 py-2 text-sm border-2 border-gray-200 rounded-lg font-medium hover:bg-gray-50"
+                                >
+                                    Refresh
                                 </button>
                             </div>
                         </div>
+
+                        <div className="mb-6">
+                            <h3 className="text-lg font-semibold text-gray-900 mb-4">Provider Approvals</h3>
+
+                            {loadingPending ? (
+                                <div className="text-center py-8">
+                                    <p className="text-gray-600">Loading pending applications...</p>
+                                </div>
+                            ) : pendingProviders.length === 0 ? (
+                                <div className="bg-white rounded-xl border border-gray-200 p-12 text-center">
+                                    <CheckCircle2 className="w-16 h-16 text-green-300 mx-auto mb-4" />
+                                    <h3 className="text-xl font-semibold text-gray-900 mb-2">No pending applications</h3>
+                                    <p className="text-gray-600">All provider applications have been reviewed.</p>
+                                </div>
+                            ) : (
+                                <div className="space-y-4">
+                                    {pendingProviders.map((provider) => (
+                                        <div key={provider.id} className="bg-white rounded-xl border-2 border-yellow-200 p-6">
+                                            <div className="flex items-start justify-between mb-4">
+                                                <div className="flex-1">
+                                                    <h3 className="text-xl font-bold text-gray-900 mb-2">
+                                                        {provider.businessName}
+                                                    </h3>
+                                                    <div className="space-y-2 text-sm text-gray-600">
+                                                        <div className="flex items-center gap-2">
+                                                            <Mail className="w-4 h-4" />
+                                                            <span>{provider.email}</span>
+                                                        </div>
+                                                        <div className="flex items-center gap-2">
+                                                            <Phone className="w-4 h-4" />
+                                                            <span>{provider.phone}</span>
+                                                        </div>
+                                                        {provider.ownerName && (
+                                                            <div className="flex items-center gap-2">
+                                                                <User className="w-4 h-4" />
+                                                                <span>Owner: {provider.ownerName}</span>
+                                                            </div>
+                                                        )}
+                                                        {provider.address && (
+                                                            <div className="flex items-center gap-2">
+                                                                <MapPin className="w-4 h-4" />
+                                                                <span>{provider.address}</span>
+                                                            </div>
+                                                        )}
+                                                        {provider.serviceArea && (
+                                                            <div className="flex items-center gap-2">
+                                                                <MapPin className="w-4 h-4" />
+                                                                <span>Service Area: {provider.serviceArea}</span>
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                                <span className="px-3 py-1 bg-yellow-100 text-yellow-800 rounded-full text-sm font-medium">
+                                                    Pending
+                                                </span>
+                                            </div>
+
+                                            {/* Business Details */}
+                                            <div className="grid grid-cols-2 gap-4 mb-4 p-4 bg-gray-50 rounded-lg">
+                                                <div>
+                                                    <label className="text-xs font-medium text-gray-500">Business License</label>
+                                                    <p className="text-sm font-semibold text-gray-900">{provider.businessLicenseNumber || 'N/A'}</p>
+                                                </div>
+                                                {provider.ein && (
+                                                    <div>
+                                                        <label className="text-xs font-medium text-gray-500">EIN</label>
+                                                        <p className="text-sm font-semibold text-gray-900">{provider.ein}</p>
+                                                    </div>
+                                                )}
+                                                <div>
+                                                    <label className="text-xs font-medium text-gray-500">Insurance Provider</label>
+                                                    <p className="text-sm font-semibold text-gray-900">{provider.insuranceProvider || 'N/A'}</p>
+                                                </div>
+                                                <div>
+                                                    <label className="text-xs font-medium text-gray-500">Insurance Number</label>
+                                                    <p className="text-sm font-semibold text-gray-900">{provider.insuranceNumber || 'N/A'}</p>
+                                                </div>
+                                            </div>
+
+                                            {provider.about && (
+                                                <div className="mb-4">
+                                                    <label className="text-xs font-medium text-gray-500">About</label>
+                                                    <p className="text-sm text-gray-700 mt-1">{provider.about}</p>
+                                                </div>
+                                            )}
+
+                                            {/* Action Buttons */}
+                                            <div className="flex gap-3 pt-4 border-t border-gray-200">
+                                                <button
+                                                    onClick={() => handleApproveProvider(provider.id)}
+                                                    className="flex-1 px-4 py-2 bg-green-600 text-white rounded-lg font-semibold hover:bg-green-700"
+                                                >
+                                                    Approve
+                                                </button>
+                                                <button
+                                                    onClick={() => handleRejectProvider(provider.id)}
+                                                    className="flex-1 px-4 py-2 bg-red-600 text-white rounded-lg font-semibold hover:bg-red-700"
+                                                >
+                                                    Reject
+                                                </button>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Rejected Providers Section */}
+                        <div className="mt-8">
+                            <div className="flex items-center justify-between mb-4">
+                                <h3 className="text-lg font-bold text-gray-900">Rejected Providers</h3>
+                                <button
+                                    onClick={loadRejectedProviders}
+                                    className="px-4 py-2 text-sm border-2 border-gray-200 rounded-lg font-semibold hover:bg-gray-50"
+                                >
+                                    Refresh
+                                </button>
+                            </div>
+                            {rejectedProviders.length === 0 ? (
+                                <div className="bg-white rounded-xl border border-gray-200 p-8 text-center">
+                                    <p className="text-gray-600">No rejected providers.</p>
+                                </div>
+                            ) : (
+                                <div className="space-y-4">
+                                    {rejectedProviders.map((provider) => (
+                                        <div key={provider.id} className="bg-white rounded-xl border-2 border-red-200 p-6">
+                                            <div className="flex items-start justify-between mb-4">
+                                                <div className="flex-1">
+                                                    <h4 className="text-lg font-bold text-gray-900 mb-2">
+                                                        {provider.businessName || provider.name || 'N/A'}
+                                                    </h4>
+                                                    <div className="space-y-1 text-sm text-gray-600">
+                                                        <div className="flex items-center gap-2">
+                                                            <Mail className="w-4 h-4" />
+                                                            <span>{provider.email}</span>
+                                                        </div>
+                                                        {provider.phone && (
+                                                            <div className="flex items-center gap-2">
+                                                                <Phone className="w-4 h-4" />
+                                                                <span>{provider.phone}</span>
+                                                            </div>
+                                                        )}
+                                                        {provider.rejectionReason && (
+                                                            <div className="mt-2 p-2 bg-red-50 rounded text-xs text-red-800">
+                                                                <strong>Reason:</strong> {provider.rejectionReason}
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                                <span className="px-3 py-1 bg-red-100 text-red-800 rounded-full text-sm font-medium">
+                                                    Rejected
+                                                </span>
+                                            </div>
+                                            <div className="flex gap-3 pt-4 border-t border-gray-200">
+                                                <button
+                                                    onClick={() => handleDeleteProvider(provider.id)}
+                                                    className="flex-1 px-4 py-2 bg-red-600 text-white rounded-lg font-semibold hover:bg-red-700"
+                                                >
+                                                    Delete Account
+                                                </button>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                )}
+
+                {activeTab === 'notifications' && (
+                    <NotificationCenter
+                        notifications={notifications}
+                        unreadCount={unreadCount}
+                        onMarkAsRead={markNotificationAsRead}
+                        onMarkAllAsRead={() => markAllAsRead(currentUser.uid)}
+                    />
+                )}
+                {activeTab === 'profile' && (
+                    <div>
+                        <div className="flex items-center justify-between mb-6">
+                            <h2 className="text-2xl font-bold text-gray-900">Provider Profile</h2>
+                            {!isEditingProfile && userData && (
+                                <button
+                                    onClick={() => setIsEditingProfile(true)}
+                                    className="flex items-center gap-2 px-4 py-2 border-2 border-gray-200 rounded-lg font-semibold hover:bg-gray-50"
+                                >
+                                    <Edit2 className="w-4 h-4" />
+                                    Edit Profile
+                                </button>
+                            )}
+                        </div>
+                        {userData ? (
+                            <div className="bg-white rounded-xl border border-gray-200 p-8">
+                                {!isEditingProfile ? (
+                                    <>
+                                        <div className="space-y-6">
+                                            {/* Logo Display */}
+                                            <div>
+                                                <label className="block text-sm font-medium text-gray-500 mb-2">
+                                                    Business Logo
+                                                </label>
+                                                <div className="w-32 h-32 bg-gray-100 rounded-lg overflow-hidden border-2 border-gray-200 flex items-center justify-center">
+                                                    {userData.image ? (
+                                                        <img src={userData.image} alt="Business logo" className="w-full h-full object-cover" />
+                                                    ) : (
+                                                        <span className="text-gray-400 text-3xl font-bold">
+                                                            {userData.businessName?.charAt(0) || userData.name?.charAt(0) || '?'}
+                                                        </span>
+                                                    )}
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <label className="block text-sm font-medium text-gray-500 mb-1">
+                                                    Business Name
+                                                </label>
+                                                <div className="text-lg font-semibold text-gray-900">
+                                                    {userData.businessName || 'Not set'}
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <label className="block text-sm font-medium text-gray-500 mb-1">
+                                                    Service Area
+                                                </label>
+                                                <div className="text-lg font-semibold text-gray-900">
+                                                    {userData.serviceArea || userData.businessAddress || 'Not set'}
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <label className="block text-sm font-medium text-gray-500 mb-1">
+                                                    Business Address
+                                                </label>
+                                                <div className="text-lg font-semibold text-gray-900">
+                                                    {userData.businessAddress || userData.address || 'Not set'}
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <label className="block text-sm font-medium text-gray-500 mb-1">
+                                                    Primary Service
+                                                </label>
+                                                <div className="text-lg font-semibold text-gray-900">
+                                                    {userData.primaryService || 'Not set'}
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <label className="block text-sm font-medium text-gray-500 mb-1">
+                                                    Phone
+                                                </label>
+                                                <div className="text-lg font-semibold text-gray-900">
+                                                    {userData.phone || 'Not set'}
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <label className="block text-sm font-medium text-gray-500 mb-1">
+                                                    Email
+                                                </label>
+                                                <div className="text-lg font-semibold text-gray-900">
+                                                    {userData.email || 'Not set'}
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <div className="mt-6 pt-6 border-t border-gray-200">
+                                            <button
+                                                onClick={async () => {
+                                                    if (!currentUser?.email) {
+                                                        alert('Email address not found. Please contact support.');
+                                                        return;
+                                                    }
+
+                                                    try {
+                                                        await sendPasswordResetEmail(auth, currentUser.email);
+                                                        alert('Password reset email sent! Please check your inbox and follow the instructions to reset your password.');
+                                                    } catch (error) {
+                                                        console.error('Error sending password reset email:', error);
+                                                        alert(`Failed to send password reset email: ${error.message}`);
+                                                    }
+                                                }}
+                                                className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700 transition-colors"
+                                            >
+                                                <Shield className="w-4 h-4" />
+                                                Reset Password
+                                            </button>
+                                            <p className="text-xs text-gray-500 mt-2">
+                                                We'll send a password reset link to your email address.
+                                            </p>
+                                        </div>
+                                    </>
+                                ) : (
+                                    <div className="space-y-4">
+                                        {/* Logo Upload Section */}
+                                        <div>
+                                            <label className="block text-sm font-semibold text-gray-700 mb-2">
+                                                Business Logo
+                                            </label>
+
+                                            <div className="flex items-center gap-4">
+                                                {/* Current Logo Preview */}
+                                                <div className="w-32 h-32 bg-gray-100 rounded-lg overflow-hidden border-2 border-gray-200 flex items-center justify-center flex-shrink-0">
+                                                    {logoPreview ? (
+                                                        <img src={logoPreview} alt="Logo preview" className="w-full h-full object-cover" />
+                                                    ) : userData?.image ? (
+                                                        <img src={userData.image} alt="Current logo" className="w-full h-full object-cover" />
+                                                    ) : (
+                                                        <span className="text-gray-400 text-3xl font-bold">
+                                                            {userData?.businessName?.charAt(0) || userData?.name?.charAt(0) || '?'}
+                                                        </span>
+                                                    )}
+                                                </div>
+
+                                                {/* Upload Controls */}
+                                                <div className="flex-1">
+                                                    <input
+                                                        type="file"
+                                                        accept="image/*"
+                                                        onChange={handleFileSelect}
+                                                        className="hidden"
+                                                        id="logo-upload"
+                                                        disabled={uploadingLogo}
+                                                    />
+                                                    <label
+                                                        htmlFor="logo-upload"
+                                                        className={`inline-block px-4 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700 cursor-pointer transition-colors ${uploadingLogo ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                                    >
+                                                        {uploadingLogo ? 'Uploading...' : 'Choose Logo'}
+                                                    </label>
+
+                                                    {logoFile && (
+                                                        <div className="mt-2 flex items-center gap-2">
+                                                            <button
+                                                                onClick={handleLogoUpload}
+                                                                disabled={uploadingLogo}
+                                                                className="px-4 py-2 bg-green-600 text-white rounded-lg font-semibold hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                                                            >
+                                                                {uploadingLogo ? 'Uploading...' : 'Upload Logo'}
+                                                            </button>
+                                                            <button
+                                                                onClick={() => {
+                                                                    setLogoFile(null);
+                                                                    setLogoPreview(null);
+                                                                }}
+                                                                disabled={uploadingLogo}
+                                                                className="px-4 py-2 border-2 border-gray-300 rounded-lg font-semibold hover:bg-gray-50 disabled:opacity-50"
+                                                            >
+                                                                Cancel
+                                                            </button>
+                                                        </div>
+                                                    )}
+
+                                                    <p className="text-xs text-gray-500 mt-2">
+                                                        Recommended: Square image, max 5MB. Will appear on your detailer card.
+                                                    </p>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                Business Name
+                                            </label>
+                                            <input
+                                                type="text"
+                                                value={editedProviderProfile.businessName}
+                                                onChange={(e) => setEditedProviderProfile({ ...editedProviderProfile, businessName: e.target.value })}
+                                                className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                                                placeholder="Business Name"
+                                            />
+                                        </div>
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                Service Area
+                                            </label>
+                                            <input
+                                                type="text"
+                                                value={editedProviderProfile.serviceArea}
+                                                onChange={(e) => setEditedProviderProfile({ ...editedProviderProfile, serviceArea: e.target.value })}
+                                                className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                                                placeholder="City, State or ZIP codes"
+                                            />
+                                        </div>
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                Business Address
+                                            </label>
+                                            <input
+                                                type="text"
+                                                value={editedProviderProfile.businessAddress}
+                                                onChange={(e) => setEditedProviderProfile({ ...editedProviderProfile, businessAddress: e.target.value })}
+                                                className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                                                placeholder="123 Main St, City, State ZIP"
+                                            />
+                                        </div>
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                Phone
+                                            </label>
+                                            <input
+                                                type="tel"
+                                                value={editedProviderProfile.phone}
+                                                onChange={(e) => setEditedProviderProfile({ ...editedProviderProfile, phone: e.target.value })}
+                                                className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                                                placeholder="(555) 123-4567"
+                                            />
+                                        </div>
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                Email
+                                            </label>
+                                            <input
+                                                type="email"
+                                                value={editedProviderProfile.email}
+                                                onChange={(e) => setEditedProviderProfile({ ...editedProviderProfile, email: e.target.value })}
+                                                className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                                                placeholder="business@example.com"
+                                            />
+                                        </div>
+                                        <div className="flex gap-3 pt-4">
+                                            <button
+                                                onClick={async () => {
+                                                    try {
+                                                        // Update detailer collection
+                                                        await updateDoc(doc(db, 'detailer', currentUser.uid), {
+                                                            businessName: editedProviderProfile.businessName,
+                                                            serviceArea: editedProviderProfile.serviceArea,
+                                                            businessAddress: editedProviderProfile.businessAddress,
+                                                            phone: editedProviderProfile.phone,
+                                                            email: editedProviderProfile.email,
+                                                            updatedAt: serverTimestamp()
+                                                        });
+                                                        alert('Profile updated successfully!');
+                                                        setIsEditingProfile(false);
+                                                        loadProviderData(); // Reload to show updated data
+                                                    } catch (error) {
+                                                        console.error('Error updating provider profile:', error);
+                                                        alert('Failed to update profile');
+                                                    }
+                                                }}
+                                                className="px-6 py-3 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700"
+                                            >
+                                                Save Changes
+                                            </button>
+                                            <button
+                                                onClick={() => {
+                                                    setIsEditingProfile(false);
+                                                    // Reset to original values
+                                                    setEditedProviderProfile({
+                                                        businessName: userData?.businessName || '',
+                                                        serviceArea: userData?.serviceArea || '',
+                                                        businessAddress: userData?.businessAddress || userData?.address || '',
+                                                        phone: userData?.phone || '',
+                                                        email: userData?.email || ''
+                                                    });
+                                                    // Reset logo upload state
+                                                    setLogoFile(null);
+                                                    setLogoPreview(null);
+                                                }}
+                                                className="px-6 py-3 border-2 border-gray-200 rounded-lg font-semibold hover:bg-gray-50"
+                                            >
+                                                Cancel
+                                            </button>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                        ) : (
+                            <div className="bg-white rounded-xl border border-gray-200 p-12 text-center">
+                                <p className="text-gray-600">Provider profile not found</p>
+                            </div>
+                        )}
                     </div>
                 )}
             </div>
-        </Elements>
+        </div>
     );
-};
-
-export default BRNNOMarketplace;
+}
