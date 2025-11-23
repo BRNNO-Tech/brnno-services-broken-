@@ -7,11 +7,11 @@ service cloud.firestore {
              exists(/databases/$(database)/documents/detailer/$(request.auth.uid)) &&
              get(/databases/$(database)/documents/detailer/$(request.auth.uid)).data.role == 'admin';
     }
-    
-    // CUSTOMER collection: Only the authenticated user can read or write their *own* customer document
+
+    // CUSTOMER collection - allow authenticated users to read (detailers need this for bookings)
     // Prevent duplicate sign-ups: can't create if customer or detailer document already exists
     match /customer/{userId} {
-      allow read: if request.auth != null && request.auth.uid == userId;
+      allow read: if request.auth != null; // Any authenticated user can read
       allow create: if request.auth != null && 
         request.auth.uid == userId &&
         !exists(/databases/$(database)/documents/customer/$(userId)) &&
