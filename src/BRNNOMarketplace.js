@@ -5183,15 +5183,25 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                     let customerEmail = '';
                     let customerPhone = '';
                     if (booking.customerId) {
-                        // Get customer directly by UID (no query needed)
-                        const customerDoc = await getDoc(doc(db, 'customer', booking.customerId));
-                        if (customerDoc.exists()) {
-                            const customerData = customerDoc.data();
-                            customerName = customerData.firstName && customerData.lastName
-                                ? `${customerData.firstName} ${customerData.lastName}`
-                                : customerData.displayName || customerData.email || 'Unknown';
-                            customerEmail = customerData.email || '';
-                            customerPhone = customerData.phone || '';
+                        try {
+                            // Get customer directly by UID (no query needed)
+                            // Note: This may fail due to security rules - providers can't read customer docs
+                            // So we'll use booking data as fallback
+                            const customerDoc = await getDoc(doc(db, 'customer', booking.customerId));
+                            if (customerDoc.exists()) {
+                                const customerData = customerDoc.data();
+                                customerName = customerData.firstName && customerData.lastName
+                                    ? `${customerData.firstName} ${customerData.lastName}`
+                                    : customerData.displayName || customerData.email || 'Unknown';
+                                customerEmail = customerData.email || '';
+                                customerPhone = customerData.phone || '';
+                            }
+                        } catch (customerError) {
+                            // Permission denied - use booking data instead
+                            console.warn('Could not read customer document (expected for providers):', customerError);
+                            // Use customer email from booking if available
+                            customerEmail = booking.customerEmail || '';
+                            customerName = booking.customerEmail || 'Customer';
                         }
                     }
 
