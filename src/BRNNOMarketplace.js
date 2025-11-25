@@ -1307,7 +1307,10 @@ export default function BrnnoMarketplace() {
 
     async function handleLogout() {
         try {
-            // Clear all local state first
+            // Set loading to false FIRST to prevent stuck loading state
+            setLoading(false);
+
+            // Clear all local state
             setCurrentUser(null);
             setUserAccountType(null);
             setIsProvider(false);
@@ -1321,16 +1324,19 @@ export default function BrnnoMarketplace() {
             setUserCoordinates(null);
             setDetailers([]);
 
+            // Navigate to landing page BEFORE sign out
+            setCurrentPage('landing');
+            setModalType(null);
+
             // Sign out from Firebase
             await signOut(auth);
 
-            // Clear Firebase Auth storage from browser
+            // Clear Firebase Auth storage from browser (don't wait for it)
             try {
-                // Clear Firebase Auth persistence
                 if (typeof window !== 'undefined' && window.indexedDB) {
-                    // Clear IndexedDB Firebase Auth storage
                     const deleteReq = indexedDB.deleteDatabase('firebaseLocalStorageDb');
                     deleteReq.onsuccess = () => {
+                        console.log('✅ Firebase Auth storage cleared');
                     };
                     deleteReq.onerror = () => {
                         console.warn('⚠️ Could not clear Firebase Auth storage');
@@ -1346,21 +1352,23 @@ export default function BrnnoMarketplace() {
                 console.warn('⚠️ Could not clear browser storage:', storageError);
             }
 
-            // Navigate to landing page
-            setCurrentPage('landing');
+            // Force page reload with a small delay to ensure state updates
+            // Use setTimeout to ensure reload happens even if something blocks it
+            setTimeout(() => {
+                window.location.reload();
+            }, 100);
 
-            // Clear any modals
-            setModalType(null);
-
-            // Force page reload to clear any cached state
-            window.location.reload();
         } catch (error) {
             console.error('❌ Error during logout:', error);
+            // Ensure loading is false even on error
+            setLoading(false);
             // Still navigate to landing page even if signOut fails
             setCurrentPage('landing');
             setCurrentUser(null);
-            // Force reload to clear state
-            window.location.reload();
+            // Force reload with timeout fallback
+            setTimeout(() => {
+                window.location.reload();
+            }, 100);
         }
     }
 
@@ -3459,6 +3467,15 @@ function CustomerDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                         }
                     }
 
+                    // Get full provider data for rescheduling
+                    let providerData = null;
+                    if (booking.providerUserId) {
+                        const providerDoc = await getDoc(doc(db, 'detailer', booking.providerUserId));
+                        if (providerDoc.exists()) {
+                            providerData = providerDoc.data();
+                        }
+                    }
+
                     return {
                         id: bookingDoc.id,
                         detailerName: providerName,
@@ -3467,10 +3484,14 @@ function CustomerDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                             : booking.serviceName || 'Service',
                         services: booking.services || (booking.serviceName ? [{ name: booking.serviceName, price: booking.price }] : []),
                         date: booking.date ? new Date(booking.date).toLocaleDateString() : 'TBD',
+                        dateRaw: booking.date || null, // Store raw date for rescheduling
                         time: booking.time || 'TBD',
                         price: booking.price || 0,
                         address: booking.address || 'N/A',
-                        status: booking.status
+                        status: booking.status,
+                        providerUserId: booking.providerUserId || null,
+                        providerId: booking.providerId || null,
+                        providerData: providerData // Full provider data for availability
                     };
                 })
             );
@@ -3690,6 +3711,108 @@ function CustomerDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
 }
 
 function UpcomingAppointments({ appointments, onRefresh }) {
+    const [rescheduleAppointment, setRescheduleAppointment] = useState(null);
+    const [rescheduleDate, setRescheduleDate] = useState('');
+    const [rescheduleTime, setRescheduleTime] = useState('');
+    const [isRescheduling, setIsRescheduling] = useState(false);
+
+    // Calculate available times for reschedule date
+    const availableRescheduleTimes = useMemo(() => {
+        if (!rescheduleDate || !rescheduleAppointment?.providerData) {
+            return [];
+        }
+        const providerData = rescheduleAppointment.providerData;
+        if (providerData.defaultAvailability) {
+            return generateAvailableTimesForDate(
+                providerData.defaultAvailability,
+                providerData.dateOverrides || {},
+                rescheduleDate
+            );
+        }
+        return [];
+    }, [rescheduleDate, rescheduleAppointment]);
+
+    function handleOpenReschedule(apt) {
+        // Convert displayed date back to YYYY-MM-DD format
+        let dateValue = '';
+        if (apt.dateRaw) {
+            // If dateRaw is a Firestore timestamp
+            if (apt.dateRaw.seconds !== undefined) {
+                const date = new Date(apt.dateRaw.seconds * 1000);
+                dateValue = date.toISOString().split('T')[0];
+            } else if (apt.dateRaw.toDate && typeof apt.dateRaw.toDate === 'function') {
+                // Firestore Timestamp object
+                const date = apt.dateRaw.toDate();
+                dateValue = date.toISOString().split('T')[0];
+            } else if (apt.dateRaw instanceof Date) {
+                dateValue = apt.dateRaw.toISOString().split('T')[0];
+            } else if (typeof apt.dateRaw === 'string') {
+                // Already in YYYY-MM-DD format
+                dateValue = apt.dateRaw;
+            } else {
+                // Try to parse as date
+                const date = new Date(apt.dateRaw);
+                if (!isNaN(date.getTime())) {
+                    dateValue = date.toISOString().split('T')[0];
+                }
+            }
+        }
+        setRescheduleAppointment(apt);
+        setRescheduleDate(dateValue);
+        setRescheduleTime('');
+    }
+
+    async function handleReschedule() {
+        if (!rescheduleAppointment) return;
+
+        if (!rescheduleDate) {
+            alert('Please select a date');
+            return;
+        }
+
+        if (!rescheduleTime) {
+            alert('Please select a time');
+            return;
+        }
+
+        setIsRescheduling(true);
+        try {
+            // Store date as string (YYYY-MM-DD) to match how bookings are originally created
+            await updateDoc(doc(db, 'bookings', rescheduleAppointment.id), {
+                date: rescheduleDate,
+                time: rescheduleTime,
+                updatedAt: serverTimestamp(),
+                rescheduledAt: serverTimestamp()
+            });
+
+            // Notify provider if notification function exists
+            if (rescheduleAppointment.providerUserId) {
+                try {
+                    const bookingData = {
+                        id: rescheduleAppointment.id,
+                        date: rescheduleDate,
+                        time: rescheduleTime,
+                        customerName: rescheduleAppointment.detailerName
+                    };
+                    // You can add a notifyBookingRescheduled function if needed
+                } catch (notifError) {
+                    console.warn('Failed to notify provider:', notifError);
+                }
+            }
+
+            alert('Appointment rescheduled successfully!');
+            setRescheduleAppointment(null);
+            setRescheduleDate('');
+            setRescheduleTime('');
+            onRefresh();
+        } catch (error) {
+            console.error('Error rescheduling appointment:', error);
+            alert('Failed to reschedule appointment. Please try again.');
+        } finally {
+            setIsRescheduling(false);
+        }
+    }
+
     async function handleCancelBooking(appointmentId) {
         if (!confirm('Are you sure you want to cancel this appointment?')) return;
 
@@ -3768,7 +3891,7 @@ function UpcomingAppointments({ appointments, onRefresh }) {
                             <div className="flex gap-3 pt-4 border-t border-gray-100">
                                 <button
                                     className="flex-1 px-4 py-2 border-2 border-gray-200 rounded-lg font-semibold hover:bg-gray-50"
-                                    onClick={() => alert('Reschedule feature coming soon!')}
+                                    onClick={() => handleOpenReschedule(apt)}
                                 >
                                     Reschedule
                                 </button>
@@ -3781,6 +3904,99 @@ function UpcomingAppointments({ appointments, onRefresh }) {
                             </div>
                         </div>
                     ))}
+                </div>
+            )}
+
+            {/* Reschedule Modal */}
+            {rescheduleAppointment && (
+                <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+                    <div className="bg-white rounded-xl shadow-xl max-w-md w-full p-6 max-h-[90vh] overflow-y-auto">
+                        <div className="flex items-center justify-between mb-4">
+                            <h3 className="text-xl font-bold text-gray-900">Reschedule Appointment</h3>
+                            <button
+                                onClick={() => {
+                                    setRescheduleAppointment(null);
+                                    setRescheduleDate('');
+                                    setRescheduleTime('');
+                                }}
+                                className="text-gray-400 hover:text-gray-600"
+                            >
+                                <X className="w-6 h-6" />
+                            </button>
+                        </div>
+
+                        <div className="mb-4 p-4 bg-gray-50 rounded-lg">
+                            <p className="text-sm text-gray-600 mb-1">Current Appointment</p>
+                            <p className="font-semibold text-gray-900">{rescheduleAppointment.detailerName}</p>
+                            <p className="text-sm text-gray-600">{rescheduleAppointment.service}</p>
+                            <p className="text-sm text-gray-600 mt-2">
+                                {rescheduleAppointment.date} at {rescheduleAppointment.time}
+                            </p>
+                        </div>
+
+                        <div className="space-y-4">
+                            <div>
+                                <label className="block font-semibold text-gray-900 mb-2 text-sm">Select New Date</label>
+                                <input
+                                    type="date"
+                                    value={rescheduleDate}
+                                    onChange={(e) => {
+                                        setRescheduleDate(e.target.value);
+                                        setRescheduleTime(''); // Clear time when date changes
+                                    }}
+                                    min={new Date().toISOString().split('T')[0]}
+                                    className="w-full px-4 py-2 border-2 border-gray-200 rounded-lg focus:border-blue-600 focus:outline-none text-sm"
+                                />
+                            </div>
+
+                            <div>
+                                <label className="block font-semibold text-gray-900 mb-2 text-sm">Select New Time</label>
+                                {availableRescheduleTimes.length === 0 ? (
+                                    <div className="p-3 bg-gray-100 border-2 border-gray-200 rounded-lg text-center">
+                                        <p className="text-gray-600 font-medium text-sm">
+                                            {rescheduleDate ? 'No availability on this day' : 'Please select a date first'}
+                                        </p>
+                                    </div>
+                                ) : (
+                                    <div className="grid grid-cols-3 gap-2 max-h-48 overflow-y-auto">
+                                        {availableRescheduleTimes.map((time) => (
+                                            <button
+                                                key={time}
+                                                onClick={() => setRescheduleTime(time)}
+                                                className={`px-3 py-2 border-2 rounded-lg font-medium transition-all text-sm ${rescheduleTime === time
+                                                    ? 'border-blue-600 bg-blue-50 text-blue-700'
+                                                    : 'border-gray-200 text-gray-700 hover:border-blue-300'
+                                                    }`}
+                                            >
+                                                {time}
+                                            </button>
+                                        ))}
+                                    </div>
+                                )}
+                            </div>
+
+                            <div className="flex gap-3 pt-4">
+                                <button
+                                    onClick={() => {
+                                        setRescheduleAppointment(null);
+                                        setRescheduleDate('');
+                                        setRescheduleTime('');
+                                    }}
+                                    className="flex-1 px-4 py-2 border-2 border-gray-200 rounded-lg font-semibold hover:bg-gray-50"
+                                    disabled={isRescheduling}
+                                >
+                                    Cancel
+                                </button>
+                                <button
+                                    onClick={handleReschedule}
+                                    disabled={isRescheduling || !rescheduleDate || !rescheduleTime}
+                                    className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed"
+                                >
+                                    {isRescheduling ? 'Rescheduling...' : 'Confirm Reschedule'}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
                 </div>
             )}
         </div>
@@ -5178,1193 +5394,1130 @@ function ProviderDashboard({ currentUser, onBackToMarketplace, onLogout, showPro
                 bookingsSnapshot.docs.map(async (bookingDoc) => {
                     const booking = bookingDoc.data();
 
-                    ustomer details
-                    omerName = 'Unknown Customer';
-                    omerEmail = '';
-                        Phone = '';
-                    ing.customerId) {
-                        
-                        et customer directly by UID (no query needed)
-                    // Note: This may fail due to security rules - providers can't read customer docs
-back
-                    const customerDoc = await getDoc(doc(db, 'customer', booking.customerId));
-                        customerDoc.exists()) {
-                        const customerData = customerDoc.data();
-                    ustomerName = customerData.firstName && customerData.lastName
-                    ? `${customerData.firstName} ${customerData.lastName}`
+                    // Get customer details
+                    let customerName = 'Unknown Customer';
+                    let customerEmail = '';
+                    let customerPhone = '';
+                    if (booking.customerId) {
+                        try {
+                            // Get customer directly by UID (no query needed)
+                            // Note: This may fail due to security rules - providers can't read customer docs
+                            // So we'll use booking data as fallback
+                            const customerDoc = await getDoc(doc(db, 'customer', booking.customerId));
+                            if (customerDoc.exists()) {
+                                const customerData = customerDoc.data();
+                                customerName = customerData.firstName && customerData.lastName
+                                    ? `${customerData.firstName} ${customerData.lastName}`
                                     : customerData.displayName || customerData.email || 'Unknown';
-                            customerEmail = customerData.email || '';
+                                customerEmail = customerData.email || '';
                                 customerPhone = customerData.phone || '';
                             }
-                    } catch (customerError) {
-                        // Permission denied - use booking data instead
-                                            console.warn('Could not read customer document (expected for providers):', customerError);
-                        // Use customer email from booking if available
-                       customerEmail = booking.customerEmail || '';
-                        customerName = booking.customerEmail || 'Customer';
-             }
-                
-                
-            
-            ingDoc.id,
-        omerName,
+                        } catch (customerError) {
+                            // Permission denied - use booking data instead
+                            console.warn('Could not read customer document (expected for providers):', customerError);
+                            // Use customer email from booking if available
+                            customerEmail = booking.customerEmail || '';
+                            customerName = booking.customerEmail || 'Customer';
+                        }
+                    }
+
+                    return {
+                        id: bookingDoc.id,
+                        customerName,
                         customerEmail,
-        omerPhone,
-        ice: booking.services && booking.services.length > 0
-        ? booking.services.map(s => s.name).join(', ')
-        : booking.serviceName || 'Service',
-        ices: booking.services || (booking.serviceName ? [{ name: booking.serviceName, price: booking.price }] : []),
-    date: booking.date ? new Date(booking.date.seconds ? booking.date.seconds * 1000 : booking.date).toLocaleDateString() : 'TBD',
-    time: booking.time || 'TBD',
+                        customerPhone,
+                        service: booking.services && booking.services.length > 0
+                            ? booking.services.map(s => s.name).join(', ')
+                            : booking.serviceName || 'Service',
+                        services: booking.services || (booking.serviceName ? [{ name: booking.serviceName, price: booking.price }] : []),
+                        date: booking.date ? new Date(booking.date.seconds ? booking.date.seconds * 1000 : booking.date).toLocaleDateString() : 'TBD',
+                        time: booking.time || 'TBD',
                         price: booking.price || 0,
-    address: booking.address || 'N/A',
-    cleType: booking.vehicleType || 'Not specified',
-    status: booking.status || 'pending',
-    createdAt: booking.createdAt
-    
-    
-        
-        
-    ate (upcoming first)
-    .sort((a, b) => {
-    te === 'TBD') return 1;
-    te === 'TBD') return -1;
-    ew Date(a.date) - new Date(b.date);
-    
-    
-    bookingsList);
-or) {
+                        address: booking.address || 'N/A',
+                        vehicleType: booking.vehicleType || 'Not specified',
+                        status: booking.status || 'pending',
+                        createdAt: booking.createdAt
+                    };
+                })
+            );
+
+            // Sort by date (upcoming first)
+            bookingsList.sort((a, b) => {
+                if (a.date === 'TBD') return 1;
+                if (b.date === 'TBD') return -1;
+                return new Date(a.date) - new Date(b.date);
+            });
+
+            setBookings(bookingsList);
+        } catch (error) {
             console.error('Error loading bookings:', error);
             setBookings([]);
         }
+    }
 
-
-    on handleUpdateBookingStatus(bookingId, newStatus) {
-    
-    t updateDoc(doc(db, 'bookings', bookingId), {
-    status: newStatus,
-                updatedAt: serverTimestamp()
-});
-
-    // Create notification if booking is cancelled
-    if (newStatus === 'cancelled') {
+    async function handleUpdateBookingStatus(bookingId, newStatus) {
         try {
+            await updateDoc(doc(db, 'bookings', bookingId), {
+                status: newStatus,
+                updatedAt: serverTimestamp()
+            });
+
+            // Create notification if booking is cancelled
+            if (newStatus === 'cancelled') {
+                try {
                     const bookingDoc = await getDoc(doc(db, 'bookings', bookingId));
                     if (bookingDoc.exists()) {
-                    const bookingData = { id: bookingId, ...bookingDoc.data() };
-                    if (bookingData.providerUserId) {
-                        await notifyBookingCancelled(bookingData.providerUserId, bookingData);
+                        const bookingData = { id: bookingId, ...bookingDoc.data() };
+                        if (bookingData.providerUserId) {
+                            await notifyBookingCancelled(bookingData.providerUserId, bookingData);
+                        }
                     }
-                }
-            } catch (notifError) {
+                } catch (notifError) {
                     console.warn('Failed to create cancellation notification:', notifError);
-            }
-            }
-            
-            alert(`Booking ${newStatus} successfully`);
-                Bookings();
-                    or) {
-                ole.error('Error updating booking:', error);
-                    ailed to update booking');
-                
-            
-
-            nction handleToggleService(serviceId) {  
-    
-    
-        vices = services.map(service =>
-            service.id === serviceId
-                ? { ...service, active: !service.active }
-                rvice
-                
-                
-            ces(updatedServices);
-        
-            irestore
-        const providerQuery = query(
-ection(db, 'providers'),
-            where('userId', '==',  currentUser.uid)
-        
-                            t providerSnapshot = await getDocs(providerQuery);
-                    
-                    !providerSnapshot.empty) {
-                    await updateDoc(doc(db, 'providers', providerSnapshot.docs[0].id), {
-                        services: updatedServices,
-                        updatedAt: serverTimestamp()
-                    });
-    alert('Service status updated!');
-
-tch (error) {
-ole.error('Error updating service:', error);
-                alert('Failed to update service');
-            // Revert on error
-                    ProviderData();
-                                            
-                                             
-                
-    async function handleSaveService(updatedService) {
-                {
-            // More robustmatching - check id, slug, or name as fallback
-            datedServices = services.map(service => {
-                 by id first, then slug, then name as fallback
-                tches =
-                    .id && updatedService.id && service.id === updatedService.id) ||
-                    .slug && updatedService.slug && service.slug === updatedService.slug) ||
-                        e && updatedService.name && service.name === updatedService.name);
-                            
-                        atches ? updatedService : service;
-                                           
-                                                    
-we actually found and updated a service
-                                t serviceFound = updatedServices.some((s, idx) => {
-                    const original = services[idx];
-                    return JSON.stringify (s) !== J SON.stringify(original);
-                });
-                
-                if (!serviceFound) {
-                    console.warn('Service not found for update:', updatedService);
-                    alert('Service not found. Please try again.');
-                    return;
                 }
-
-                setServices(updatedServices);
-                setShowEditModal(false);
-                setEditingService(null);
-                
-                    pdate in Firestore (detailer collection)
-                    t updateDoc(doc(db, 'detailer', currentUser.uid), {
-                        ices: updatedServices,
-                        tedAt: serverTimestamp()
-                        
-
-                    eload provider data to ensure consistency
-                await loadProviderData();
-            alert('Service updated successfully!');
-                tch (error) {
-                console.error('Error saving service:', error);
-                    t('Failed to save service: ' + (error.message || 'Unknown error'));
-                    eload to revert any local changes
-                loadProviderData();
-        }
-                
-                    
-                    dleEditService(service) {
-                    ngService({ ...service });
-                howEditModal(true);
-    }
-                
-                nction handleSaveWeeklySchedule() {
-                {
-            // Update detailer collection
-                await updateDoc(doc(db, 'detailer', currentUser.uid), {
-                    defaultAvailability: weeklySchedule,
-                    updatedAt: serverTimestamp()
-                    
-                alert('Weekly schedule saved successfully!');
-        } catch (error) {
-                console.error('Error saving schedule:', error);
-                alert('Failed to save schedule');
-                loadProviderData();
             }
-                
-                
-                 handleDayScheduleChange(day, field, value) {
-                eeklySchedule(prev => ({
+
+            alert(`Booking ${newStatus} successfully`);
+            loadBookings();
+        } catch (error) {
+            console.error('Error updating booking:', error);
+            alert('Failed to update booking');
+        }
+    }
+
+    async function handleToggleService(serviceId) {
+        try {
+            const updatedServices = services.map(service =>
+                service.id === serviceId
+                    ? { ...service, active: !service.active }
+                    : service
+            );
+
+            setServices(updatedServices);
+
+            // Update in Firestore
+            const providerQuery = query(
+                collection(db, 'providers'),
+                where('userId', '==', currentUser.uid)
+            );
+            const providerSnapshot = await getDocs(providerQuery);
+
+            if (!providerSnapshot.empty) {
+                await updateDoc(doc(db, 'providers', providerSnapshot.docs[0].id), {
+                    services: updatedServices,
+                    updatedAt: serverTimestamp()
+                });
+                alert('Service status updated!');
+            }
+        } catch (error) {
+            console.error('Error updating service:', error);
+            alert('Failed to update service');
+            // Revert on error
+            loadProviderData();
+        }
+    }
+
+    async function handleSaveService(updatedService) {
+        try {
+            // More robust matching - check id, slug, or name as fallback
+            const updatedServices = services.map(service => {
+                // Match by id first, then slug, then name as fallback
+                const matches =
+                    (service.id && updatedService.id && service.id === updatedService.id) ||
+                    (service.slug && updatedService.slug && service.slug === updatedService.slug) ||
+                    (service.name && updatedService.name && service.name === updatedService.name);
+
+                return matches ? updatedService : service;
+            });
+
+            // Check if we actually found and updated a service
+            const serviceFound = updatedServices.some((s, idx) => {
+                const original = services[idx];
+                return JSON.stringify(s) !== JSON.stringify(original);
+            });
+
+            if (!serviceFound) {
+                console.warn('Service not found for update:', updatedService);
+                alert('Service not found. Please try again.');
+                return;
+            }
+
+            setServices(updatedServices);
+            setShowEditModal(false);
+            setEditingService(null);
+
+            // Update in Firestore (detailer collection)
+            await updateDoc(doc(db, 'detailer', currentUser.uid), {
+                services: updatedServices,
+                updatedAt: serverTimestamp()
+            });
+
+            // Reload provider data to ensure consistency
+            await loadProviderData();
+            alert('Service updated successfully!');
+        } catch (error) {
+            console.error('Error saving service:', error);
+            alert('Failed to save service: ' + (error.message || 'Unknown error'));
+            // Reload to revert any local changes
+            loadProviderData();
+        }
+    }
+
+    function handleEditService(service) {
+        setEditingService({ ...service });
+        setShowEditModal(true);
+    }
+
+    async function handleSaveWeeklySchedule() {
+        try {
+            // Update detailer collection
+            await updateDoc(doc(db, 'detailer', currentUser.uid), {
+                defaultAvailability: weeklySchedule,
+                updatedAt: serverTimestamp()
+            });
+            alert('Weekly schedule saved successfully!');
+        } catch (error) {
+            console.error('Error saving schedule:', error);
+            alert('Failed to save schedule');
+            loadProviderData();
+        }
+    }
+
+    function handleDayScheduleChange(day, field, value) {
+        setWeeklySchedule(prev => ({
+            ...prev,
+            [day]: {
+                ...prev[day],
+                [field]: value
+            }
+        }));
+    }
+
+    function handleToggleDay(day) {
+        setWeeklySchedule(prev => {
+            const currentDay = prev[day] || {};
+            const isCurrentlyEnabled = currentDay.enabled || false;
+
+            return {
                 ...prev,
                 [day]: {
-                ...prev[day],
-                    [field]: value
+                    ...currentDay,
+                    enabled: !isCurrentlyEnabled,
+                    // If enabling and no start/end times exist, set defaults
+                    start: currentDay.start || '09:00',
+                    end: currentDay.end || '17:00'
                 }
-            }));
-        }
-
-        function handleToggleDay(day) {
-            setWeeklySchedule(prev => {
-                const currentDay = prev[day] || {};
-                const isCurrentlyEnabled = currentDay.enabled || false;
-                    
-                    rn {
-                    ...prev,
-                    [day]: {
-                        ...currentDay,
-                        enabled: !isCurrentlyEnabled,
-                        // If enabling and no start/end times exist, set defaults
-                        start: currentDay.start || '09:00',
-                        end: currentDay.end || '17:00'
-                    }
             };
-            });
-            
-                
-                nction handleAddBlackoutDate() {
-                    ectedBlackoutDate) {
-                    t('Please select a date');
-                return;
-            }
-        
-        if (blackoutDates.find(b => b.date === selectedBlackoutDate)) {
-                alert('This date is already blocked out');
-                return;
-                
-                
-        try {
-                const newBlackout = { date: selectedBlackoutDate, type: 'unavailable' };
-                    t updatedBlackouts = [...blackoutDates, newBlackout];
-                    lackoutDates(updatedBlackouts);
-                        
-                        e in Firestore
-                        e detailer collection
-                        tailerDoc = await getDoc(doc(db, 'detailer', currentUser.uid));
-                        
-                    detailerDoc.exists()) {
-                    const detailerData = detailerDoc.data();
-                    const dateOverrides = detailerData.dateOverrides || {};
-        
-                dateOverrides[selectedBlackoutDate] = { type: 'unavailable' };
-        
-                    await updateDoc(doc(db, 'detailer', currentUser.uid), {
-                        dateOverrides: dateOverrides,
-                        updatedAt: serverTimestamp()
-                    });
-
-                    setSelectedBlackoutDate('');
-                    setShowBlackoutModal(false);
-                    alert('Blackout date added successfully!');
-                }
-        } catch (error) {
-                console.error('Error adding blackout date:', error);
-                alert('Failed to add blackout date');
-                loadProviderData();
-                
+        });
     }
-                
-                nction handleRemoveBlackoutDate(dateToRemove) {
-                !confirm('Are you sure you want to remove this blackout date?')) return;
 
-                {
-                    t updatedBlackouts = blackoutDates.filter(b => b.date !== dateToRemove);
-                    lackoutDates(updatedBlackouts);
-
-                    pdate in Firestore (detailer collection)
-            const detailerDoc = await getDoc(doc(db, 'detailer', currentUser.uid));
-                    
-                        ilerDoc.exists()) {
-                        t detailerData = detailerDoc.data();
-                    const dateOverrides = detailerData.dateOverrides || {};
-
-                    delete dateOverrides[dateToRemove];
-                    
-                    await updateDoc(doc(db, 'detailer', currentUser.uid), {
-                        dateOverrides: dateOverrides,
-                        updatedAt: serverTimestamp()
-                    });
-                
-                    alert('Blackout date removed successfully!');
-                }
-            } catch (error) {
-            console.error('Error removing blackout date:', error);
-                alert('Failed to remove blackout date');
-                loadProviderData();
+    async function handleAddBlackoutDate() {
+        if (!selectedBlackoutDate) {
+            alert('Please select a date');
+            return;
         }
-            
-                
-                nction handleApproveProvider(providerId) {
-        if (!confirm('Approve this provider? They will be able to accept bookings.')) return;
-                
-                {
-            // Get the detailer document
-                const detailerDoc = await getDoc(doc(db, 'detailer', providerId));
-                    
-                    !detailerDoc.exists()) {
-                alert('Error: Provider document not found!');
-                    return;
-            }
-                    
-                        tailerData = detailerDoc.data();
-                        
-                    repare update data
-            const updateData = {
-                    status: 'approved',
-                    approvedAt: serverTimestamp(),
-                    updatedAt: serverTimestamp()
-                };
-                
-                // If provider doesn't have packages, initialize with all packages
-                if (!detailerData.offeredPackages || detailerData.offeredPackages.length === 0) {
-                    updateData.offeredPackages = PACKAGES_DATA.map(pkg => pkg.id);
-            }
-        
-                // Perform the update (detailer collection)
-            await updateDoc(doc(db, 'detailer', providerId), updateData);
-            
-                // Verify the update succeeded by reading the document again
-                const verifyDoc = await getDoc(doc(db, 'detailer', providerId));
-            const verifyData = verifyDoc.data();
-                
-                    verifyData.status !== 'approved') {
-                    throw new Error('Update verification failed: status is still not approved');
-                }
 
-                alert('Provider approved successfully!');
-            // Reload pending providers list
-                await loadPendingProviders();
-                tch (error) {
-                    ole.error('Error approving provider:', error);
-                    t(`Failed to approve provider: ${error.message || 'Unknown error'}`);
-                    
-                
+        if (blackoutDates.find(b => b.date === selectedBlackoutDate)) {
+            alert('This date is already blocked out');
+            return;
+        }
 
-                nction handleRejectProvider(providerId) {
-                t reason = prompt('Reason for rejection (optional):');
-                    on === null) return; // User cancelled
-                
         try {
-                // Update detailer collection
-                await updateDoc(doc(db, 'detailer', providerId), {
-                status: 'rejected',
-                    rejectionReason: reason || '',
-                    rejectedAt: serverTimestamp(),
-                    updatedAt: serverTimestamp()
-            });
-                alert('Provider rejected.');
-                    PendingProviders();
-                loadRejectedProviders(); // Also reload rejected providers list
-        } catch (error) {
-                console.error('Error rejecting provider:', error);
-                alert('Failed to reject provider');
-                
-            
-                
-                nction handleDeleteProvider(providerId) {
-            if (!confirm('Are you sure you want to permanently delete this provider account? This action cannot be undone.')) {
-                return;
-        }
-        
-            try {
-                // Delete the detailer document
-            await deleteDoc(doc(db, 'detailer', providerId));
-                alert('Provider account deleted successfully.');
-                loadPendingProviders();
-                loadRejectedProviders(); // Reload rejected providers list
-                    (error) {
+            const newBlackout = { date: selectedBlackoutDate, type: 'unavailable' };
+            const updatedBlackouts = [...blackoutDates, newBlackout];
+            setBlackoutDates(updatedBlackouts);
 
-n error'}`);
+            // Update in Firestore
+            // Update detailer collection
+            const detailerDoc = await getDoc(doc(db, 'detailer', currentUser.uid));
 
-                        
-                
-                            
-                {
-                // Query users collection for providers (unified structure)
-                const providersQuery = query(
-                                
-                                    
-                                        
-                                            
-                const providersList = providersSnapshot.docs.map(doc => {
-                            
-                            
-                            
-                            
-                                
-                                                    email: data.email,
-                                                    businessName: data.businessName || data.name || 'N/A',
-                                                    status: data.status,
-                                                    hasPackages: (data.offeredPackages || []).length > 0,
-                                                    packageCount: (data.offeredPackages || []).length,
-                                        
-                    };
-                });
-                
-                // Log to console
-                console.table(providersList);
+            if (detailerDoc.exists()) {
+                const detailerData = detailerDoc.data();
+                const dateOverrides = detailerData.dateOverrides || {};
 
-                                                
-                                            
-                                            }\n   Status: ${p.status}\n   Packages: ${p.packageCount}\n   UserId: ${p.userId}\n   DocId: ${p.id}`
-                ).join('\n\n');
-                                                
-                alert(`Found  ${providersList.length} provide r (s):\n\n${details}\n\nCheck console for table view.`);
-                tch (error) {
-            console.error('Error listing providers:', error);
-                alert(`Error: ${error.message}`);
-                    
-                    
-                        
-                        election for logo upload
-                        ileSelect(e) {
-                         e.target.files[0];
-                        
-                        ate  file type  
-                        e.type.startsWith('image/')) {
-                        t('Please select an image file');
-                    return;
-                }
+                dateOverrides[selectedBlackoutDate] = { type: 'unavailable' };
 
-                // Validate file size (max 5MB)
-                if (file.size > 5 * 1024 * 1024) {
-                alert('Image size must be less than 5MB');
-                    return;      
-                }
-                    
-                setLogoFile(file);
-
-                // Create preview
-                                                    const reader = new FileReader();
-                reader.onloadend = () => {
-                    setLogoPreview(reader.result);
-                };
-                                                                      
-        }
-        }
-              
-            andle logo upload
-            c function handleLogoUpload() {
-                !logoFile) return;   
-                
-                    
-                    ploadingLogo(true);
-                
-            // Create storage reference
-                const storageRef = ref(storage, `provider-logos/${currentUser.uid}/${Date.now()}_${logoFile.name}`);
-                
-                    pload file
-                    t uploadBytes(storageRef, logoFile);
-                
-            // Get download URL
-                const downloadURL = await getDownloadURL(storageRef);
-
-                // Update detailer collection
                 await updateDoc(doc(db, 'detailer', currentUser.uid), {
-                    image: downloadURL,
+                    dateOverrides: dateOverrides,
                     updatedAt: serverTimestamp()
                 });
-                
-                alert('Logo uploaded successfully!');
-                setLogoFile(null);
-            setLogoPreview(null);
-                await loadProviderData();
-            } catch (error) {
-                console.error('Error uploading logo:', error);
-            alert(`Failed to upload logo: ${error.message}`);
-            } finally {
-                setUploadingLogo(false);
+
+                setSelectedBlackoutDate('');
+                setShowBlackoutModal(false);
+                alert('Blackout date added successfully!');
+            }
+        } catch (error) {
+            console.error('Error adding blackout date:', error);
+            alert('Failed to add blackout date');
+            loadProviderData();
         }
-                
-                
+    }
+
+    async function handleRemoveBlackoutDate(dateToRemove) {
+        if (!confirm('Are you sure you want to remove this blackout date?')) return;
+
+        try {
+            const updatedBlackouts = blackoutDates.filter(b => b.date !== dateToRemove);
+            setBlackoutDates(updatedBlackouts);
+
+            // Update in Firestore (detailer collection)
+            const detailerDoc = await getDoc(doc(db, 'detailer', currentUser.uid));
+
+            if (detailerDoc.exists()) {
+                const detailerData = detailerDoc.data();
+                const dateOverrides = detailerData.dateOverrides || {};
+
+                delete dateOverrides[dateToRemove];
+
+                await updateDoc(doc(db, 'detailer', currentUser.uid), {
+                    dateOverrides: dateOverrides,
+                    updatedAt: serverTimestamp()
+                });
+
+                alert('Blackout date removed successfully!');
+            }
+        } catch (error) {
+            console.error('Error removing blackout date:', error);
+            alert('Failed to remove blackout date');
+            loadProviderData();
+        }
+    }
+
+    async function handleApproveProvider(providerId) {
+        if (!confirm('Approve this provider? They will be able to accept bookings.')) return;
+
+        try {
+            // Get the detailer document
+            const detailerDoc = await getDoc(doc(db, 'detailer', providerId));
+
+            if (!detailerDoc.exists()) {
+                alert('Error: Provider document not found!');
+                return;
+            }
+
+            const detailerData = detailerDoc.data();
+
+            // Prepare update data
+            const updateData = {
+                status: 'approved',
+                approvedAt: serverTimestamp(),
+                updatedAt: serverTimestamp()
+            };
+
+            // If provider doesn't have packages, initialize with all packages
+            if (!detailerData.offeredPackages || detailerData.offeredPackages.length === 0) {
+                updateData.offeredPackages = PACKAGES_DATA.map(pkg => pkg.id);
+            }
+
+            // Perform the update (detailer collection)
+            await updateDoc(doc(db, 'detailer', providerId), updateData);
+
+            // Verify the update succeeded by reading the document again
+            const verifyDoc = await getDoc(doc(db, 'detailer', providerId));
+            const verifyData = verifyDoc.data();
+
+            if (verifyData.status !== 'approved') {
+                throw new Error('Update verification failed: status is still not approved');
+            }
+
+            alert('Provider approved successfully!');
+            // Reload pending providers list
+            await loadPendingProviders();
+        } catch (error) {
+            console.error('Error approving provider:', error);
+            alert(`Failed to approve provider: ${error.message || 'Unknown error'}`);
+        }
+    }
+
+    async function handleRejectProvider(providerId) {
+        const reason = prompt('Reason for rejection (optional):');
+        if (reason === null) return; // User cancelled
+
+        try {
+            // Update detailer collection
+            await updateDoc(doc(db, 'detailer', providerId), {
+                status: 'rejected',
+                rejectionReason: reason || '',
+                rejectedAt: serverTimestamp(),
+                updatedAt: serverTimestamp()
+            });
+            alert('Provider rejected.');
+            loadPendingProviders();
+            loadRejectedProviders(); // Also reload rejected providers list
+        } catch (error) {
+            console.error('Error rejecting provider:', error);
+            alert('Failed to reject provider');
+        }
+    }
+
+    async function handleDeleteProvider(providerId) {
+        if (!confirm('Are you sure you want to permanently delete this provider account? This action cannot be undone.')) {
+            return;
+        }
+
+        try {
+            // Delete the detailer document
+            await deleteDoc(doc(db, 'detailer', providerId));
+            alert('Provider account deleted successfully.');
+            loadPendingProviders();
+            loadRejectedProviders(); // Reload rejected providers list
+        } catch (error) {
+            console.error('Error deleting provider:', error);
+            alert(`Failed to delete provider: ${error.message || 'Unknown error'}`);
+        }
+    }
+
+    async function listAllProviders() {
+        try {
+            // Query users collection for providers (unified structure)
+            const providersQuery = query(
+                collection(db, 'detailer')
+            );
+            const providersSnapshot = await getDocs(providersQuery);
+
+            const providersList = providersSnapshot.docs.map(doc => {
+                const data = doc.data();
+                return {
+                    id: doc.id,
+                    userId: data.uid, // Now same as document ID
+                    email: data.email,
+                    businessName: data.businessName || data.name || 'N/A',
+                    status: data.status,
+                    hasPackages: (data.offeredPackages || []).length > 0,
+                    packageCount: (data.offeredPackages || []).length,
+                    createdAt: data.createdAt?.toDate?.() || 'N/A'
+                };
+            });
+
+            // Log to console
+            console.table(providersList);
+
+            // Also show in alert with details
+            const details = providersList.map((p, idx) =>
+                `${idx + 1}. ${p.businessName}\n   Email: ${p.email || 'N/A'}\n   Status: ${p.status}\n   Packages: ${p.packageCount}\n   UserId: ${p.userId}\n   DocId: ${p.id}`
+            ).join('\n\n');
+
+            alert(`Found ${providersList.length} provider(s):\n\n${details}\n\nCheck console for table view.`);
+        } catch (error) {
+            console.error('Error listing providers:', error);
+            alert(`Error: ${error.message}`);
+        }
+    }
+
+    // Handle file selection for logo upload
+    function handleFileSelect(e) {
+        const file = e.target.files[0];
+        if (file) {
+            // Validate file type
+            if (!file.type.startsWith('image/')) {
+                alert('Please select an image file');
+                return;
+            }
+
+            // Validate file size (max 5MB)
+            if (file.size > 5 * 1024 * 1024) {
+                alert('Image size must be less than 5MB');
+                return;
+            }
+
+            setLogoFile(file);
+
+            // Create preview
+            const reader = new FileReader();
+            reader.onloadend = () => {
+                setLogoPreview(reader.result);
+            };
+            reader.readAsDataURL(file);
+        }
+    }
+
+    // Handle logo upload
+    async function handleLogoUpload() {
+        if (!logoFile) return;
+
+        try {
+            setUploadingLogo(true);
+
+            // Create storage reference
+            const storageRef = ref(storage, `provider-logos/${currentUser.uid}/${Date.now()}_${logoFile.name}`);
+
+            // Upload file
+            await uploadBytes(storageRef, logoFile);
+
+            // Get download URL
+            const downloadURL = await getDownloadURL(storageRef);
+
+            // Update detailer collection
+            await updateDoc(doc(db, 'detailer', currentUser.uid), {
+                image: downloadURL,
+                updatedAt: serverTimestamp()
+            });
+
+            alert('Logo uploaded successfully!');
+            setLogoFile(null);
+            setLogoPreview(null);
+            await loadProviderData();
+        } catch (error) {
+            console.error('Error uploading logo:', error);
+            alert(`Failed to upload logo: ${error.message}`);
+        } finally {
+            setUploadingLogo(false);
+        }
+    }
+
     // --- EARLY RETURN FIX ---
-                ading or userData doesn't exist yet, show loading message
-                TOP the function here to prevent accessing undefined properties
+    // If loading or userData doesn't exist yet, show loading message
+    // and STOP the function here to prevent accessing undefined properties
     if (loading || !userData) {
-                rn (      
+        return (
+            <div className="min-h-screen bg-gray-50 flex items-center justify-center">
+                <div className="text-center">
+                    <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto"></div>
+                    <p className="text-gray-600">Loading dashboard...</p>
+                </div>
+            </div>
+        );
+    }
+    // --- END OF FIX ---
+    // If the code reaches this point, userData is guaranteed to exist
 
+    const upcomingBookings = bookings.filter(b => ['pending', 'confirmed', 'scheduled'].includes(b.status));
+    const completedBookings = bookings.filter(b => ['completed', 'cancelled'].includes(b.status));
 
-                                                00 mx-auto"></div>
-
-                                                
-                                                
-
-                                                
-                                                
-                                                    
-                                                        
-(b.status));
-
-                                                    
-
-
-                                                    
-0/90 via-blue-700/90 to-indigo-600/90 border-b border-blue-400/20 shadow-lg">
-                                                     
-                                                            <div className="fl ex items-center justify-between">
-                            <div>
-                                <h1 className="text-3xl font-bold text-white drop-shadow-md">
-                                    Provider Dashboard
-                                </h1>
-                                {userData && (
-                                    <p className="text-blue-100 mt-1 drop-shadow-sm">
-                                        {userData.businessName || userData.name || 'Your Business'}
-                                    </p>
-                                )}
-                            </div>
-                            <div className="flex items-center gap-4">
-                                <button
-                                    onClick={onBackToMarketplace}
-                                    className="px-4 py-2 text-white hover:text-blue-100 font-medium transition-colors drop-shadow-sm"
-                                >
-                                Marketplace
-                                </button>
-                                <button
-                                onClick={onLogout}
-                                    className="px-4 py-2 bg-red-500/90 backdrop-blur-sm text-white rounded-lg hover:bg-red-600/90 font-medium shadow-md transition-all"
-                                >
-                                    Logout
-                                </button>
-                            </div>
+    return (
+        <div className="min-h-screen bg-gray-50">
+            {/* Glassmorphic Header */}
+            <div className="sticky top-0 z-40 backdrop-blur-xl bg-gradient-to-r from-blue-600/90 via-blue-700/90 to-indigo-600/90 border-b border-blue-400/20 shadow-lg">
+                <div className="max-w-6xl mx-auto px-4 py-6">
+                    <div className="flex items-center justify-between">
+                        <div>
+                            <h1 className="text-3xl font-bold text-white drop-shadow-md">
+                                Provider Dashboard
+                            </h1>
+                            {userData && (
+                                <p className="text-blue-100 mt-1 drop-shadow-sm">
+                                    {userData.businessName || userData.name || 'Your Business'}
+                                </p>
+                            )}
                         </div>
-                            
-                                
-                                    
-                                
-                                bg-white border-b border-gray-200">
-                                    max-w-6xl mx-auto px-4">
-                                        flex gap-8">
-                                    
-                                onClick={() => setActiveTab('bookings')}
-                                className={`py-4 border-b-2 font-semibold transition-colors ${activeTab === 'bookings'
-                                    ? 'border-blue-600 text-blue-600'
-                                    : 'border-transparent text-gray-600 hover:text-gray-900'
-                                    }`}
-                                    
-                                Bookings ({upcomingBookings.length})
-                                    >
-                                ton
-                                onClick={() => setActiveTab('history')}
-                                    sName={`py-4 border-b-2 font-semibold transition-colors ${activeTab === 'history'
-                                    ? 'border-blue-600 text-blue-600'
-                                    : 'border-transparent text-gray-600 hover:text-gray-900'
-                                    }`}
-                                
-                                History ({completedBookings.length})
+                        <div className="flex items-center gap-4">
+                            <button
+                                onClick={onBackToMarketplace}
+                                className="px-4 py-2 text-white hover:text-blue-100 font-medium transition-colors drop-shadow-sm"
+                            >
+                                Marketplace
                             </button>
                             <button
-                                onClick={() => setActiveTab('packages')}
-                            className={`py-4 border-b-2 font-semibold transition-colors ${activeTab === 'packages'
-                                    ? 'border-blue-600 text-blue-600'
-                                    : 'border-transparent text-gray-600 hover:text-gray-900'
-                                    }`}
+                                onClick={onLogout}
+                                className="px-4 py-2 bg-red-500/90 backdrop-blur-sm text-white rounded-lg hover:bg-red-600/90 font-medium shadow-md transition-all"
                             >
-                                Packages
-                                tton>
-                                ton
-                                    ick={() => setActiveTab('availability')}
-                                    sName={`py-4 border-b-2 font-semibold transition-colors ${activeTab === 'availability'
-                                    ? 'border-blue-600 text-blue-600'
-                                    : 'border-transparent text-gray-600 hover:text-gray-900'
-                                    }`}
-                            >
-                                Availability
-                                tton>
-                                ton
-                                    ick={() => setActiveTab('profile')}
-                                    sName={`py-4 border-b-2 font-semibold transition-colors ${activeTab === 'profile'
-                                    ? 'border-blue-600 text-blue-600'
-                                    : 'border-transparent text-gray-600 hover:text-gray-900'
-                                    }`}
-                            >
-                                Profile
-                                tton>
-                                ton
-                                    ick={() => setActiveTab('notifications')}
-                                    sName={`py-4 border-b-2 font-semibold transition-colors relative ${activeTab === 'notifications'
-                                    ? 'border-blue-600 text-blue-600'
-                                    : 'border-transparent text-gray-600 hover:text-gray-900'
-                                    }`}
-                            >
-                                Notifications
-                                {unreadCount > 0 && (
-                                    <span className="absolute top-2 right-0 bg-red-500 text-white text-xs font-bold rounded-full w-5 h-5 flex items-center justify-center">
-                                        {unreadCount > 9 ? '9+' : unreadCount}
-                                    </span>
-                                    
+                                Logout
                             </button>
-                                rData?.role === 'admin' && (  // Change to userData
-                                <button
-                                    onClick={() => setActiveTab('admin')}
-                                    className={`py-4 border-b-2 font-semibold transition-colors ${activeTab === 'admin'
-                                        ? 'border-blue-600 text-blue-600'
-                                        : 'border-transparent text-gray-600 hover:text-gray-900'
-                                        }`}
-                                    
-                                    Admin {pendingProviders.length > 0 && `(${pendingProviders.length})`}
-                                </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            {/* Tabs */}
+            <div className="bg-white border-b border-gray-200">
+                <div className="max-w-6xl mx-auto px-4">
+                    <div className="flex gap-8">
+                        <button
+                            onClick={() => setActiveTab('bookings')}
+                            className={`py-4 border-b-2 font-semibold transition-colors ${activeTab === 'bookings'
+                                ? 'border-blue-600 text-blue-600'
+                                : 'border-transparent text-gray-600 hover:text-gray-900'
+                                }`}
+                        >
+                            Bookings ({upcomingBookings.length})
+                        </button>
+                        <button
+                            onClick={() => setActiveTab('history')}
+                            className={`py-4 border-b-2 font-semibold transition-colors ${activeTab === 'history'
+                                ? 'border-blue-600 text-blue-600'
+                                : 'border-transparent text-gray-600 hover:text-gray-900'
+                                }`}
+                        >
+                            History ({completedBookings.length})
+                        </button>
+                        <button
+                            onClick={() => setActiveTab('packages')}
+                            className={`py-4 border-b-2 font-semibold transition-colors ${activeTab === 'packages'
+                                ? 'border-blue-600 text-blue-600'
+                                : 'border-transparent text-gray-600 hover:text-gray-900'
+                                }`}
+                        >
+                            Packages
+                        </button>
+                        <button
+                            onClick={() => setActiveTab('availability')}
+                            className={`py-4 border-b-2 font-semibold transition-colors ${activeTab === 'availability'
+                                ? 'border-blue-600 text-blue-600'
+                                : 'border-transparent text-gray-600 hover:text-gray-900'
+                                }`}
+                        >
+                            Availability
+                        </button>
+                        <button
+                            onClick={() => setActiveTab('profile')}
+                            className={`py-4 border-b-2 font-semibold transition-colors ${activeTab === 'profile'
+                                ? 'border-blue-600 text-blue-600'
+                                : 'border-transparent text-gray-600 hover:text-gray-900'
+                                }`}
+                        >
+                            Profile
+                        </button>
+                        <button
+                            onClick={() => setActiveTab('notifications')}
+                            className={`py-4 border-b-2 font-semibold transition-colors relative ${activeTab === 'notifications'
+                                ? 'border-blue-600 text-blue-600'
+                                : 'border-transparent text-gray-600 hover:text-gray-900'
+                                }`}
+                        >
+                            Notifications
+                            {unreadCount > 0 && (
+                                <span className="absolute top-2 right-0 bg-red-500 text-white text-xs font-bold rounded-full w-5 h-5 flex items-center justify-center">
+                                    {unreadCount > 9 ? '9+' : unreadCount}
+                                </span>
                             )}
-                            v>
-                                
-                                
-                                    
-                                    
-                                    w-6xl mx-auto px-4 py-8">
-                            ab === 'bookings' && (
-                                
-                                 className="flex items-center justify-between mb-6">
-                                    className="text-2xl font-bold text-gray-900">Upcoming Bookings</h2>
-                                        
-                                    onClick={loadBookings}
-                                    className="px-4 py-2 text-sm border-2 border-gray-200 rounded-lg font-medium hover:bg-gray-50"
-                                >
-                                    Refresh
-                                </button>
-                                    
-                                    gBookings.length === 0 ? (
-                                        ssName="bg-white rounded-xl border border-gray-200 p-12 text-center">
-                                        endar className="w-16 h-16 text-gray-300 mx-auto mb-4" />
-                                        className="text-xl font-semibold text-gray-900 mb-2">No upcoming bookings</h3>
-                                    <p className="text-gray-600">New bookings will appear here</p>
-                                    v>
-                                (
-                                <div className="space-y-4">
-                                    {upcomingBookings.map((booking) => (
-                                        <div key={booking.id} className="bg-white rounded-xl border border-gray-200 p-6">
-                                            <div className="flex justify-between items-start mb-4">
+                        </button>
+                        {userData?.role === 'admin' && (  // Change to userData
+                            <button
+                                onClick={() => setActiveTab('admin')}
+                                className={`py-4 border-b-2 font-semibold transition-colors ${activeTab === 'admin'
+                                    ? 'border-blue-600 text-blue-600'
+                                    : 'border-transparent text-gray-600 hover:text-gray-900'
+                                    }`}
+                            >
+                                Admin {pendingProviders.length > 0 && `(${pendingProviders.length})`}
+                            </button>
+                        )}
+                    </div>
+                </div>
+            </div>
+
+            {/* Content */}
+            <div className="max-w-6xl mx-auto px-4 py-8">
+                {activeTab === 'bookings' && (
+                    <div>
+                        <div className="flex items-center justify-between mb-6">
+                            <h2 className="text-2xl font-bold text-gray-900">Upcoming Bookings</h2>
+                            <button
+                                onClick={loadBookings}
+                                className="px-4 py-2 text-sm border-2 border-gray-200 rounded-lg font-medium hover:bg-gray-50"
+                            >
+                                Refresh
+                            </button>
+                        </div>
+                        {upcomingBookings.length === 0 ? (
+                            <div className="bg-white rounded-xl border border-gray-200 p-12 text-center">
+                                <Calendar className="w-16 h-16 text-gray-300 mx-auto mb-4" />
+                                <h3 className="text-xl font-semibold text-gray-900 mb-2">No upcoming bookings</h3>
+                                <p className="text-gray-600">New bookings will appear here</p>
+                            </div>
+                        ) : (
+                            <div className="space-y-4">
+                                {upcomingBookings.map((booking) => (
+                                    <div key={booking.id} className="bg-white rounded-xl border border-gray-200 p-6">
+                                        <div className="flex justify-between items-start mb-4">
                                             <div className="flex-1">
-                                                    <h3 className="text-xl font-bold text-gray-900 mb-2">
-                                                        
+                                                <h3 className="text-xl font-bold text-gray-900 mb-2">
+                                                    {booking.customerName}
+                                                </h3>
 
-
-                                                                    
-
-
-
-
-t-blue-600">
-                                                            
-                                                          
-                                                            </div>      
-                                                    
-                                                         {booking.customerPhone && (
-0">
-
-r:text-blue-600">
-                                                                
-                                                                </a>    
-
-                                                            
-                                                    </div >   
-                                                        
-                                                            
-                                                    {/* Package/Service & Vehicle */}
-                                                    <div className="mb-4">
-                                                        {booking.packageName ? (
-                                                                            <div className="space-y-2 mb-2">
-                                                                            <div className="flex items-center justify-between">
-                                                                                    <p className="text-lg font-semibold text-gray-900">{booking.packageName}</p>
-                                                                                    {booking.packagePrice && (
-                                                                                    <span className="text-sm font-medium text-gray-600">
-                                                                            ${booking.packagePrice}
-                                                                                        </span>
-                                                                                    )}
-                                                                        
-                                                                            
-                                                                                    <div className="ml-4 space-y-1">
-                                                                                        {booking.addOns.map((addOn, idx) => (
-                                                                            <div key={idx} className="flex items-center justify-between text-sm">
-                                                                                 <span className="text-gray-600">+ {addOn.name}</span>
-                                                                                                   {a ddOn.price && (
-                                                                                    <span className="text-gray-600">${addOn.price}</span>
-                                                                                )}
-                                                                            </div>
-                                                                        ))}
-                                                                    </div>
-                                                                )}
+                                                {/* Contact Information */}
+                                                <div className="flex flex-wrap gap-4 mb-4 text-sm">
+                                                    {booking.customerEmail && (
+                                                        <div className="flex items-center gap-2 text-gray-600">
+                                                            <Mail className="w-4 h-4" />
+                                                            <a href={`mailto:${booking.customerEmail}`} className="hover:text-blue-600">
+                                                                {booking.customerEmail}
+                                                            </a>
                                                         </div>
-                                                        ) : booking.services && booking.services.length > 0 ? (
-                                                            <div className="space-y-2 mb-2">
-                                                                {booking.services.map((service, idx) => (
-                                                                    <div key={idx} className="flex items-center justify-between">
-                                                                        <p className="text-lg font-semibold text-gray-900">{service.name}</p>
-                                                                        {service.price && (
-                                                                    
-                                                                         text-gray-600">${service.price}</span>
-                                                                            
-                                                                                
-                                                                                    
-                                                                                    
-                                                                                                                                    
-                                                                                                                                    lassName="text-lg font-semibold text-gray-900 mb-2">{booking.service || booking.serviceName || 'Service'}</p>
-                                                                                                                                    
-                                                                                                                                        flex items-center gap-2 text-sm text-gray-600">
-                                                                        
-                                                                                 t-medium">Vehicle:</span> 
-                                                                                leType || 'Not specified' }</span>
-                                                                    
-                                                                       
-                                                                     
-                                                                                                                                                   
-                                                                            
-                                                                                
-                                                                                
-                                                                                    
-                                                                                
-                                                                            
-                                                                        y-
-                                                                    600">
-                                                                    lassName="w-4 h-4" /> 
-                                                                ime}</span>
-                                                                                                                                            
-                                                                             items-start gap-2 text-gray-600">
-                                                                        sName="w-4 h-4 mt-0.5 flex-shr i nk-0" /> 
-                                                                                                                                   assName="font-medium">{booking.address}</span>
-                                                                
-                                                            
-                                                         
-                                                             
-
-                                                                
-                                                       
-                                                        
-                                                            xt-sm font-medium ${booking.status === 'confirmed'
-                                                                    ? 'bg-green-100 text-green-800'
-                                                                
-                                                        ? 'bg-yellow-100 text-yellow-800'
-                                                            : 'bg-blue-100 text-blue-800'
-                                                        }`}>
-                                                        {booking.status.charAt(0).toUpperCase() + booking.status.slice(1)}
-                                                            
-                                                            
-                                                        
-                                                        
-                                                          
-                                               === 'pending' && (
-                                                    m e ="flex gap-3 pt-4 border-t border-gray-100">
-                                                        ton
-                                                                                                       onClick={() => handleUpdateBookingStatus(booking.id, 'confirmed')}
-                                                                                                             sName="flex-1 px-4 py-2 bg-green-600 text-white rounded-lg font-semibold hover:bg-green-700"
-                                                                                                              
-                                                         Accept
-                                                 
-                                                    
-                                                    
-                                                        o reject this booking?')) {
-                                                                                                    handleUpdateBookingStatus(booking.id, 'cancelled');
-                                                                                                }
-                                                                                        }}
-                                                                                            className="flex-1 px-4 py-2 bg-red-50 text-red-600 rounded-lg font-semibold hover:bg-red-100"
-                                                                                        
-                                                                                        Reject
-                                                            
-                                                                                
-
-                                                                
-                                                    .status === 'confirmed' && (
-                                                                                                                <div className="flex gap-3 pt-4 border-t border-gray-100">
-                                                                    
-                                                                        king.id, 'completed')}
-                                                                            -white rounded-lg font-semibold hover:bg-blue-700"
-
-
-                                                                                                 
-                                                        ton
-                                                        onClick={() => {
-                                                            if (confirm('Are you sure you want to cancel this booking?')) {
-                                                                handleUpdateBookingStatus(booking.id, 'cancelled');
-                                                            }
-                                                        }}
-                                                            sName="flex-1 px-4 py-2 bg-red-50 text-red-600 rounded-lg font-semibold hover:bg-red-100"
-                                                                                      
-
-                                                                              
-                                                                
-                                                    
-                                                                
-                                                    
-
-                                                                
-                                                                    
-                                                                    
-
-
-                                                                
-                                                        -bold text-gray-900 mb-6">Booking History</h2>
-                                                    h === 0 ? (
-                                                         rounded-xl border border-gray-200 p-12 text-center">
-                                                    xt-gray-600">No completed bookings yet</p>
-                                                    
-                                                        
-                                                            
-                                                                ing) => (
-                                                                            } className="bg-white rounded-xl border border-gray-200 p-6">
-                                                        me="flex justify-between items-start">
-                                                                    ssName="flex-1">
-                                                                    className="text-lg font-semibold text-gray-900 mb-2">
-
-
-                                                                            
-                                                    {/* Contact Information */}          
-
-                                                        <div className="flex flex-wrap gap-4 mb-3 text-sm">
-
-                                                                        mter  g ap-2 text-gray-600">
-                                                                    <Mail className="w-4 h-4" />
-                                                                                            <span>{booking.customerEmail}</span>
-                                                            </div>
-                                                                        )}
-                                                                    rPhone && (
-                                                                <div className="flex items-center gap-2 text-gray-600">
-                                                                    <Phone className="w-4 h-4" />
-                                                                    <span>{booking.customerPhone}</span>
-                                                                                                                                </div>
-                                                            )}
-                                                                                                                        </div>
-                                                                
-                                                                    
-                                                                    
-                                                                                                                    <div className="mb-2">
-                                                            xt-gray-600 mb-1 font-semibold">{booking.packageName}</p>
-                                                                        {booking.packagePrice && (
-                                                                <p className="text-gray-500 text-sm mb-1">
-                                                                                                                            ${booking.packagePrice}
-                                                            
-                                                        
-                                                                    {booking.addOns && booking.addOns.length > 0 && (
-                                                                 <div className="ml-2 mt-1">
-                                  
-                                                                          {booking.addOns.map((addOn, idx) => (
-                                                                         <p key={idx} className="text-gray-500 text-sm">
-                         
-                                                                                       + {addOn.name} {addOn.price ? `($${addOn.price})` : ''}
-                                                                         </p>
-                 
-                                                                                   ))}
-                                                                </div>
-                                 
-                                                                               )}
-                                                                                    
-                                                                ices && booking.services.length > 0 ? (
-                                                                                                                me="mb-2">
-                                                map( rvice, id)=> (
-                                                    ext-gray-600 mb-1">
-                                                    price ? `- $${service.price}` : ''}
-                                                                                                    </p>
-                                                                                                ))}
+                                                    )}
+                                                    {booking.customerPhone && (
+                                                        <div className="flex items-center gap-2 text-gray-600">
+                                                            <Phone className="w-4 h-4" />
+                                                            <a href={`tel:${booking.customerPhone}`} className="hover:text-blue-600">
+                                                                {booking.customerPhone}
+                                                            </a>
                                                         </div>
-                                                                                                (
-                                            ray-600 mb-1">{booking.service || booking.serviceName || 'Service'}</p>
-                                                            
-                                                                ="text-sm text-gray-500 mb-2">
-                                            "font-medium">Vehicle:</span> {booking.vehicleType || 'Not specified'}
-                                                
-                                                    t-sm text-gray-500 mt-2">
-                                                .time}</span>
-                                            address !== 'N/A' && (
-                                        x items-center gap-1">
-                                    sName="w-3 h-3" />
-                                                                                        ress}
-                                    
-                                
-                                                                    
-                                                                
-                                                            
-                                                        ssName="text-right ml-6">
-                                                    <p className="text-xl font-bold text-gray-900">
-                                                        ${booking.price.toFixed(2)}
-                                                            
-                                                                ame={`inline-block mt-2 px-3 py-1 rounded-full text-sm ${booking.status === 'completed'
-                                                                    100 text-green-800'
-                                                                ay-100 text-gray-800'
-                                                            
-                                                        {booking.status.charAt(0).toUpperCase() + booking.status.slice(1)}
-                                                    </span> 
-                                                                                        
-                                        
-                                            
-                                                                                        
-                                        
-                                            
-                                            
-                                                                                            
-                                            
-                                        
-                                    
-n mb-6">
+                                                    )}
+                                                </div>
 
-                                                    ext-2xl font-bold text-gray-900">Manage Packages</h2>
-mt-1">
-o offer to customers
-                                                    
-
-
-
-
-                                      
-                                
-                                
-                                    
-                                        
-                                        entUser: currentUser?.uid,
-                                            
-                                        
-                                    
-                                    
-                                        
-                                        
-
-                                        
-                                            
-                                                 
-                                        try {
-
-
-User.uid) {
- You must be logged in to save changes.';
-                                            ;
-                                    
-                                                alert(errorMsg);
-                                        se);   
-                                                return;
-                                            }
-                                        
-                                            // Unified structure: document ID is the UID
-                                        const docIdToUpdate = currentUser.uid;
-                                        
-                                            // Verify document exists
-                                            const detailerDocRef = doc(db, 'detailer', currentUser.uid);
-                                            const detailerDocSnap = await getDoc(detailerDocRef);
-                                            
-                                            if (!detailerDocSnap.exists()) {
-                                                console.error('⚠️ Detailer document not found!');
-                                            alert('Error: Your detailer account was not found. Please contact support.');
-                                                return;
-                                            }
-                                        
-                                        // Ensure packagePrices is always an object
-                                            const safePackagePrices = packagePrices || {};
-                                            
-                                        // Update detailer collection
-                                            await updateDoc(detailerDocRef, {
-                                                offeredPackages: selectedPackages,
-                                                addOns: selectedAddOns,
-                                                packagePrices: safePackagePrices,
-                                                updatedAt: serverTimestamp()
-                                                
-                                            
-                                        alert('Packages saved successfully!');
-                                            
-                                            // Reload provider data to reflect changes
-                                        await loadProviderData();
-                                            tch (error) {
-                                            console.error('❌ Error saving packages:', error);
-                                            console.error('Error details:', {
-                                            message: error.message,
-                                                code: error.code,
-                                                stack: error.stack
-                                                
-                                                t(`Failed to save packages: ${error.message || 'Unknown error'}`);
-                                            nally {
-                                        setSavingPackages(false);
-                                            console.log('🏁 Save process complete');
-                                            
-                                }}
-                                            ={savingPackages}
-                                            e="px-4 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700 transition-colors disabled:bg-gray-400 disabled:cursor-not-allowed flex items-center gap-2 cursor-pointer"
-                                                nterEvents: savingPackages ? 'none' : 'auto' }}
-                                                
-                                                ges ? ( 
-                                                
-                                            <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
-                                        Saving...                     
-
-                                     
-                                     
-                                        
-                                                 
-                                              
-                                             
-
-
-ay-900 mb-4">Available Packages</h3>
-
-er border-gray-200 p-12 text-center">
-                                                t-gray-300 mx-auto mb-4" />   
-                                                    semibold text-gray-900 mb-2">No packages available</h3>
-                                                        kages will appear here once they're added to the system.</p>
-                                                            
-                                                                
-                                                                
-                                        {availablePackages.map((pkg) => {
-                                            const isSelected = selectedPackages.includes(pkg.id);
-                                            return (
-                                                <div
-                                                    key={pkg.id}
-                                                    className={`bg-white rounded-xl border-2 p-6 transition-all ${isSelected ? 'border-blue-600 bg-blue-50' : 'border-gray-200'
-                                                        }`}
-                                                >
-                                                                flex items-start justify-between">
-                                                                me="flex-1">
-                                                                me="flex items-center gap-3 mb-2">
-                                                                e="text-lg font-semibold text-gray-900">{pkg.name}</h3>
-                                                                {isSelected && (
-                                                                    "px-2 py-1 rounded-full text-xs font-medium bg-green-100 text-green-800">
-                                                                        Offered
+                                                {/* Package/Service & Vehicle */}
+                                                <div className="mb-4">
+                                                    {booking.packageName ? (
+                                                        <div className="space-y-2 mb-2">
+                                                            <div className="flex items-center justify-between">
+                                                                <p className="text-lg font-semibold text-gray-900">{booking.packageName}</p>
+                                                                {booking.packagePrice && (
+                                                                    <span className="text-sm font-medium text-gray-600">
+                                                                        ${booking.packagePrice}
                                                                     </span>
                                                                 )}
-                                                                
-                                                                m text-gray-600 mb-3">{pkg.description}</p>
-                                                            <div className="flex flex-wrap items-center justify-between gap-4 text-sm mb-3 p-3 bg-gray-50 rounded-lg">
-                                                                <div className="flex items-center gap-4">
-                                                                    ssName="flex items-center gap-2">
-                                                                        <DollarSign className="w-4 h-4 text-gray-600" />
-                                                                       <span className={`font-bold text-lg ${isSelected && packagePrices[pkg.id] ? 'text-blue-600' : 'text-gray-900'}`}>
-                                                                    gePrices[pkg.id]?.price ?? pkg.price}
-                                                                        </span >  
-                                                                lected && packagePrices[pkg.id] && (
-                                                            "px-2 py-1 rounded-full text-xs bg-blue-100 text-blue-700 font-medium">Custom</span>
-                                                           )}
-                                                    
-                                                                </div> 
-                                 
-
-                                 
-                                    e prices if not set 
-es[pkg.id]) {
-                                        (prev => ({
-                                
-                                 
-                                e: pkg.price
-                                    
-                                    
-                                    
-                                        
-                                        -600 text-white rounded-lg font-semibold hover:bg-blue-700 flex items-center gap-2 text-sm"
-                                        
-                                    Edit2 className="w-4 h-4" />
-                                                                                        {packagePrices[pkg.id] ? 'Edit Prices' : 'Set Custom Prices'}
-                                                                                            tton>
-                                                                                                    
-                             
-                                                                                           
-                                                                                          
-                                                                                                    g section - only show if package is selected */}
-                                                                                            && packagePrices[pkg.id] && (
-                                                                      className="mb-3 p-4 bg-blue-50 rounded-lg border-2 border-blue-300">
-                                                                                                 <div className="flex items-center justify-between mb-3">
-                                                                        <label className="block text-sm font-semibold text-gray-900">
-                            lassName="w-4 h-4 inline mr-1" />
-                                                    Custom Pricing
-                                                    bel>
-                                                                            ton
-                             
-                                                                       ick={() => {
-                                          
-                              ackagePrices(prev => {
-                                            const updated = { ...prev };
-                                                te updated[pkg.id];
-                                                                                    return updated;
-                                                                                });
-                                                                            }}
-                                                                            className="text-xs text-red-600 hover:text-red-700 font-medium flex items-center gap-1 px-2 py-1 hover:bg-red-50 rounded"
-                                                                        >
-                                                                            <X className="w-3 h-3" />
-                                                                            Reset to Default
-                                                                        </button>
-                                                                    </div>
-                                                                    <p className="text-xs text-gray-600 mb-3">Set your price for this package</p>
-                                                                    <div>
-                                                                    <label className="block text-xs font-medium text-gray-700 mb-1">Price ($)</label>
-                                                                        <input
-                                                                            type="number"
-                                                                            min="0"
-                                                                            step="1"
-                                                                            value={packagePrices[pkg.id]?.price ?? pkg.price}
-                                                                            onChange={(e) => {
-                                                                                const value = parseInt(e.target.value) || pkg.price;
-                                                                                setPackagePrices(prev => ({
-                                                                                    ...prev,
-                                                                                    [pkg.id]: {
-                                                                                        price: value
-                                                                                    }
-                                                                                    
-                                                                                    
-                                                                                sName="w-full px-3 py-2 text-sm border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white font-medium"
-                                                                            placeholder={pkg.price?.toString() || '0'}
-                                                                            
-                                                                        v>
-                                                                            ssName="mt-3 pt-3 border-t border-blue-200">
-                                                                             className="flex items-center gap-2 text-sm">
-                                                                            <DollarSign className="w-4 h-4 text-blue-600" />
-                                                                            <span className="font-bold text-blue-700">
-                                                                                Your Price: ${packagePrices[pkg.id]?.price ?? pkg.price}
-                                                                            </span>
+                                                            </div>
+                                                            {booking.addOns && booking.addOns.length > 0 && (
+                                                                <div className="ml-4 space-y-1">
+                                                                    {booking.addOns.map((addOn, idx) => (
+                                                                        <div key={idx} className="flex items-center justify-between text-sm">
+                                                                            <span className="text-gray-600">+ {addOn.name}</span>
+                                                                            {addOn.price && (
+                                                                                <span className="text-gray-600">${addOn.price}</span>
+                                                                            )}
                                                                         </div>
-                                                                        v>
-                                                                            
-                                                                            
-                                                                            grid grid-cols-1 md:grid-cols-2 gap-3 mt-3 pt-3 border-t border-gray-200">
-                                                                            
-                                                                            ssName="text-xs font-semibold text-gray-700 mb-1">Exterior Services:</div>
-                                                                                e="text-xs text-gray-600 space-y-1">
-                                                                                eriorServices.map((svc, idx) => (
-                                                                                    {idx} className="flex items-start">
-                                                                                    ckCircle2 className="w-3 h-3 text-green-500 mr-1 mt-0.5 flex-shrink-0" />
-                                                                                        vc}</span>
-                                                                                    
-                                                                                
-                                                                            
-                                                                            
-                                                                            
-                                                                         className="text-xs font-semibold text-gray-700 mb-1">Interior Services:</div>
-                                                                    <ul className="text-xs text-gray-600 space-y-1">
-                                                                        {pkg.interiorServices.map((svc, idx) => (
-                                                                            <li key={idx} className="flex items-start">
-                                                                                <CheckCircle2 className="w-3 h-3 text-green-500 mr-1 mt-0.5 flex-shrink-0" />
-                                                                                <span>{svc}</span>
-                                                                                >
-                                                                            
-                                                                        >
-                                                                    v>
-                                                                v>
-                                                            v>
-                                                             className="ml-4">
-                                                                el className="relative inline-flex items-center cursor-pointer">
-                                                                    ut
-                                                                    type="checkbox"
-                                                                        ked={isSelected}
-                                                                            ={() => {
-                                                                                lected) {
-                                                                                emove package and its custom prices
-                                                                            setSelectedPackages(prev => prev.filter(id => id !== pkg.id));
+                                                                    ))}
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    ) : booking.services && booking.services.length > 0 ? (
+                                                        <div className="space-y-2 mb-2">
+                                                            {booking.services.map((service, idx) => (
+                                                                <div key={idx} className="flex items-center justify-between">
+                                                                    <p className="text-lg font-semibold text-gray-900">{service.name}</p>
+                                                                    {service.price && (
+                                                                        <span className="text-sm font-medium text-gray-600">${service.price}</span>
+                                                                    )}
+                                                                </div>
+                                                            ))}
+                                                        </div>
+                                                    ) : (
+                                                        <p className="text-lg font-semibold text-gray-900 mb-2">{booking.service || booking.serviceName || 'Service'}</p>
+                                                    )}
+                                                    <div className="flex items-center gap-2 text-sm text-gray-600">
+                                                        <Car className="w-4 h-4" />
+                                                        <span className="font-medium">Vehicle:</span>
+                                                        <span>{booking.vehicleType || 'Not specified'}</span>
+                                                    </div>
+                                                </div>
+
+                                                {/* Date, Time, and Address */}
+                                                <div className="space-y-2 text-sm">
+                                                    <div className="flex items-center gap-2 text-gray-600">
+                                                        <Calendar className="w-4 h-4" />
+                                                        <span className="font-medium">{booking.date}</span>
+                                                    </div>
+                                                    <div className="flex items-center gap-2 text-gray-600">
+                                                        <Clock className="w-4 h-4" />
+                                                        <span className="font-medium">{booking.time}</span>
+                                                    </div>
+                                                    <div className="flex items-start gap-2 text-gray-600">
+                                                        <MapPin className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                                                        <span className="font-medium">{booking.address}</span>
+                                                    </div>
+                                                </div>
+                                            </div>
+
+                                            <div className="text-right ml-6">
+                                                <p className="text-2xl font-bold text-gray-900 mb-2">
+                                                    ${booking.price.toFixed(2)}
+                                                </p>
+                                                <span className={`inline-block px-3 py-1 rounded-full text-sm font-medium ${booking.status === 'confirmed'
+                                                    ? 'bg-green-100 text-green-800'
+                                                    : booking.status === 'pending'
+                                                        ? 'bg-yellow-100 text-yellow-800'
+                                                        : 'bg-blue-100 text-blue-800'
+                                                    }`}>
+                                                    {booking.status.charAt(0).toUpperCase() + booking.status.slice(1)}
+                                                </span>
+                                            </div>
+                                        </div>
+
+                                        {booking.status === 'pending' && (
+                                            <div className="flex gap-3 pt-4 border-t border-gray-100">
+                                                <button
+                                                    onClick={() => handleUpdateBookingStatus(booking.id, 'confirmed')}
+                                                    className="flex-1 px-4 py-2 bg-green-600 text-white rounded-lg font-semibold hover:bg-green-700"
+                                                >
+                                                    Accept
+                                                </button>
+                                                <button
+                                                    onClick={() => {
+                                                        if (confirm('Are you sure you want to reject this booking?')) {
+                                                            handleUpdateBookingStatus(booking.id, 'cancelled');
+                                                        }
+                                                    }}
+                                                    className="flex-1 px-4 py-2 bg-red-50 text-red-600 rounded-lg font-semibold hover:bg-red-100"
+                                                >
+                                                    Reject
+                                                </button>
+                                            </div>
+                                        )}
+
+                                        {booking.status === 'confirmed' && (
+                                            <div className="flex gap-3 pt-4 border-t border-gray-100">
+                                                <button
+                                                    onClick={() => handleUpdateBookingStatus(booking.id, 'completed')}
+                                                    className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700"
+                                                >
+                                                    Mark Complete
+                                                </button>
+                                                <button
+                                                    onClick={() => {
+                                                        if (confirm('Are you sure you want to cancel this booking?')) {
+                                                            handleUpdateBookingStatus(booking.id, 'cancelled');
+                                                        }
+                                                    }}
+                                                    className="flex-1 px-4 py-2 bg-red-50 text-red-600 rounded-lg font-semibold hover:bg-red-100"
+                                                >
+                                                    Cancel
+                                                </button>
+                                            </div>
+                                        )}
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+                )}
+
+                {activeTab === 'history' && (
+                    <div>
+                        <h2 className="text-2xl font-bold text-gray-900 mb-6">Booking History</h2>
+                        {completedBookings.length === 0 ? (
+                            <div className="bg-white rounded-xl border border-gray-200 p-12 text-center">
+                                <p className="text-gray-600">No completed bookings yet</p>
+                            </div>
+                        ) : (
+                            <div className="space-y-4">
+                                {completedBookings.map((booking) => (
+                                    <div key={booking.id} className="bg-white rounded-xl border border-gray-200 p-6">
+                                        <div className="flex justify-between items-start">
+                                            <div className="flex-1">
+                                                <h3 className="text-lg font-semibold text-gray-900 mb-2">
+                                                    {booking.customerName}
+                                                </h3>
+
+                                                {/* Contact Information */}
+                                                {(booking.customerEmail || booking.customerPhone) && (
+                                                    <div className="flex flex-wrap gap-4 mb-3 text-sm">
+                                                        {booking.customerEmail && (
+                                                            <div className="flex items-center gap-2 text-gray-600">
+                                                                <Mail className="w-4 h-4" />
+                                                                <span>{booking.customerEmail}</span>
+                                                            </div>
+                                                        )}
+                                                        {booking.customerPhone && (
+                                                            <div className="flex items-center gap-2 text-gray-600">
+                                                                <Phone className="w-4 h-4" />
+                                                                <span>{booking.customerPhone}</span>
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                )}
+
+                                                {booking.packageName ? (
+                                                    <div className="mb-2">
+                                                        <p className="text-gray-600 mb-1 font-semibold">{booking.packageName}</p>
+                                                        {booking.packagePrice && (
+                                                            <p className="text-gray-500 text-sm mb-1">
+                                                                ${booking.packagePrice}
+                                                            </p>
+                                                        )}
+                                                        {booking.addOns && booking.addOns.length > 0 && (
+                                                            <div className="ml-2 mt-1">
+                                                                {booking.addOns.map((addOn, idx) => (
+                                                                    <p key={idx} className="text-gray-500 text-sm">
+                                                                        + {addOn.name} {addOn.price ? `($${addOn.price})` : ''}
+                                                                    </p>
+                                                                ))}
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                ) : booking.services && booking.services.length > 0 ? (
+                                                    <div className="mb-2">
+                                                        {booking.services.map((service, idx) => (
+                                                            <p key={idx} className="text-gray-600 mb-1">
+                                                                {service.name} {service.price ? `- $${service.price}` : ''}
+                                                            </p>
+                                                        ))}
+                                                    </div>
+                                                ) : (
+                                                    <p className="text-gray-600 mb-1">{booking.service || booking.serviceName || 'Service'}</p>
+                                                )}
+                                                <p className="text-sm text-gray-500 mb-2">
+                                                    <span className="font-medium">Vehicle:</span> {booking.vehicleType || 'Not specified'}
+                                                </p>
+                                                <div className="flex flex-wrap gap-4 text-sm text-gray-500 mt-2">
+                                                    <span>{booking.date} at {booking.time}</span>
+                                                    {booking.address && booking.address !== 'N/A' && (
+                                                        <span className="flex items-center gap-1">
+                                                            <MapPin className="w-3 h-3" />
+                                                            {booking.address}
+                                                        </span>
+                                                    )}
+                                                </div>
+                                            </div>
+                                            <div className="text-right ml-6">
+                                                <p className="text-xl font-bold text-gray-900">
+                                                    ${booking.price.toFixed(2)}
+                                                </p>
+                                                <span className={`inline-block mt-2 px-3 py-1 rounded-full text-sm ${booking.status === 'completed'
+                                                    ? 'bg-green-100 text-green-800'
+                                                    : 'bg-gray-100 text-gray-800'
+                                                    }`}>
+                                                    {booking.status.charAt(0).toUpperCase() + booking.status.slice(1)}
+                                                </span>
+                                            </div>
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+                )}
+
+                {activeTab === 'packages' && (
+                    <div>
+                        <div className="flex items-center justify-between mb-6">
+                            <div>
+                                <h2 className="text-2xl font-bold text-gray-900">Manage Packages</h2>
+                                <p className="text-sm text-gray-500 mt-1">
+                                    Select which packages you want to offer to customers
+                                </p>
+                            </div>
+                            <button
+                                type="button"
+                                onClick={async (e) => {
+                                    e.preventDefault();
+                                    e.stopPropagation();
+
+                                    console.log('🔵 Save button clicked!', {
+                                        savingPackages,
+                                        currentUser: currentUser?.uid,
+                                        selectedPackages,
+                                        selectedAddOns,
+                                        packagePrices
+                                    });
+
+                                    if (savingPackages) {
+                                        return;
+                                    }
+
+                                    try {
+                                        setSavingPackages(true);
+
+                                        if (!currentUser || !currentUser.uid) {
+                                            const errorMsg = 'Error: You must be logged in to save changes.';
+                                            console.error('❌', errorMsg);
+                                            alert(errorMsg);
+                                            setSavingPackages(false);
+                                            return;
+                                        }
+
+                                        // Unified structure: document ID is the UID
+                                        const docIdToUpdate = currentUser.uid;
+
+                                        // Verify document exists
+                                        const detailerDocRef = doc(db, 'detailer', currentUser.uid);
+                                        const detailerDocSnap = await getDoc(detailerDocRef);
+
+                                        if (!detailerDocSnap.exists()) {
+                                            console.error('⚠️ Detailer document not found!');
+                                            alert('Error: Your detailer account was not found. Please contact support.');
+                                            return;
+                                        }
+
+                                        // Ensure packagePrices is always an object
+                                        const safePackagePrices = packagePrices || {};
+
+                                        // Update detailer collection
+                                        await updateDoc(detailerDocRef, {
+                                            offeredPackages: selectedPackages,
+                                            addOns: selectedAddOns,
+                                            packagePrices: safePackagePrices,
+                                            updatedAt: serverTimestamp()
+                                        });
+
+                                        alert('Packages saved successfully!');
+
+                                        // Reload provider data to reflect changes
+                                        await loadProviderData();
+                                    } catch (error) {
+                                        console.error('❌ Error saving packages:', error);
+                                        console.error('Error details:', {
+                                            message: error.message,
+                                            code: error.code,
+                                            stack: error.stack
+                                        });
+                                        alert(`Failed to save packages: ${error.message || 'Unknown error'}`);
+                                    } finally {
+                                        setSavingPackages(false);
+                                        console.log('🏁 Save process complete');
+                                    }
+                                }}
+                                disabled={savingPackages}
+                                className="px-4 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700 transition-colors disabled:bg-gray-400 disabled:cursor-not-allowed flex items-center gap-2 cursor-pointer"
+                                style={{ pointerEvents: savingPackages ? 'none' : 'auto' }}
+                            >
+                                {savingPackages ? (
+                                    <>
+                                        <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                                        Saving...
+                                    </>
+                                ) : (
+                                    'Save Changes'
+                                )}
+                            </button>
+                        </div>
+
+                        {/* Packages Section */}
+                        <div className="mb-8">
+                            <h3 className="text-lg font-semibold text-gray-900 mb-4">Available Packages</h3>
+                            {availablePackages.length === 0 ? (
+                                <div className="bg-white rounded-xl border border-gray-200 p-12 text-center">
+                                    <Package className="w-16 h-16 text-gray-300 mx-auto mb-4" />
+                                    <h3 className="text-xl font-semibold text-gray-900 mb-2">No packages available</h3>
+                                    <p className="text-gray-600">Packages will appear here once they're added to the system.</p>
+                                </div>
+                            ) : (
+                                <div className="space-y-4">
+                                    {availablePackages.map((pkg) => {
+                                        const isSelected = selectedPackages.includes(pkg.id);
+                                        return (
+                                            <div
+                                                key={pkg.id}
+                                                className={`bg-white rounded-xl border-2 p-6 transition-all ${isSelected ? 'border-blue-600 bg-blue-50' : 'border-gray-200'
+                                                    }`}
+                                            >
+                                                <div className="flex items-start justify-between">
+                                                    <div className="flex-1">
+                                                        <div className="flex items-center gap-3 mb-2">
+                                                            <h3 className="text-lg font-semibold text-gray-900">{pkg.name}</h3>
+                                                            {isSelected && (
+                                                                <span className="px-2 py-1 rounded-full text-xs font-medium bg-green-100 text-green-800">
+                                                                    Offered
+                                                                </span>
+                                                            )}
+                                                        </div>
+                                                        <p className="text-sm text-gray-600 mb-3">{pkg.description}</p>
+                                                        <div className="flex flex-wrap items-center justify-between gap-4 text-sm mb-3 p-3 bg-gray-50 rounded-lg">
+                                                            <div className="flex items-center gap-4">
+                                                                <div className="flex items-center gap-2">
+                                                                    <DollarSign className="w-4 h-4 text-gray-600" />
+                                                                    <span className={`font-bold text-lg ${isSelected && packagePrices[pkg.id] ? 'text-blue-600' : 'text-gray-900'}`}>
+                                                                        ${packagePrices[pkg.id]?.price ?? pkg.price}
+                                                                    </span>
+                                                                    {isSelected && packagePrices[pkg.id] && (
+                                                                        <span className="px-2 py-1 rounded-full text-xs bg-blue-100 text-blue-700 font-medium">Custom</span>
+                                                                    )}
+                                                                </div>
+                                                            </div>
+                                                            {isSelected && (
+                                                                <button
+                                                                    onClick={() => {
+                                                                        // Initialize prices if not set
+                                                                        if (!packagePrices[pkg.id]) {
+                                                                            setPackagePrices(prev => ({
+                                                                                ...prev,
+                                                                                [pkg.id]: {
+                                                                                    price: pkg.price
+                                                                                }
+                                                                            }));
+                                                                        }
+                                                                    }}
+                                                                    className="px-4 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700 flex items-center gap-2 text-sm"
+                                                                >
+                                                                    <Edit2 className="w-4 h-4" />
+                                                                    {packagePrices[pkg.id] ? 'Edit Prices' : 'Set Custom Prices'}
+                                                                </button>
+                                                            )}
+                                                        </div>
+
+                                                        {/* Price editing section - only show if package is selected */}
+                                                        {isSelected && packagePrices[pkg.id] && (
+                                                            <div className="mb-3 p-4 bg-blue-50 rounded-lg border-2 border-blue-300">
+                                                                <div className="flex items-center justify-between mb-3">
+                                                                    <label className="block text-sm font-semibold text-gray-900">
+                                                                        <Edit2 className="w-4 h-4 inline mr-1" />
+                                                                        Custom Pricing
+                                                                    </label>
+                                                                    <button
+                                                                        onClick={() => {
                                                                             setPackagePrices(prev => {
                                                                                 const updated = { ...prev };
                                                                                 delete updated[pkg.id];
                                                                                 return updated;
                                                                             });
-                                                                        } else {
-                                                                            setSelectedPackages(prev => [...prev, pkg.id]);
-                                                                            
-                                                                                
-                                                                                r-only peer"
-                                                                            
-                                                                        ssName="w-11 h-6 bg-gray-200 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-blue-300 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
-                                                                    
-                                                                
-                                                            
-                                                        
-                                                        
-                                                            
-                                                                
-                                                                    
-                                                                    
-                                                                    
-                                                                        
-                                                                            
-                                                                            ay-900 mb-4">Available Add-ons</h3>
-                                                                            lect which add-ons you want to offer with your packages</p>
-                                                                                
-                                                                                
-                                                                                es(addOn.id);
-                                                                            
-                                                                        
-                                                                            
-                                                                        nded-xl border-2 p-4 transition-all ${isSelected ? 'border-blue-600 bg-blue-50' : 'border-gray-200'
-                                                                    
-                                                                    
-                                                                flex items-center justify-between">
-                                                                me="flex-1">
-                                                             className="flex items-center gap-3 mb-1">
-                                                            <h4 className="font-semibold text-gray-900">{addOn.name}</h4>
-                                                            <span className="text-sm font-medium text-gray-600">+${addOn.price}</span>
+                                                                        }}
+                                                                        className="text-xs text-red-600 hover:text-red-700 font-medium flex items-center gap-1 px-2 py-1 hover:bg-red-50 rounded"
+                                                                    >
+                                                                        <X className="w-3 h-3" />
+                                                                        Reset to Default
+                                                                    </button>
+                                                                </div>
+                                                                <p className="text-xs text-gray-600 mb-3">Set your price for this package</p>
+                                                                <div>
+                                                                    <label className="block text-xs font-medium text-gray-700 mb-1">Price ($)</label>
+                                                                    <input
+                                                                        type="number"
+                                                                        min="0"
+                                                                        step="1"
+                                                                        value={packagePrices[pkg.id]?.price ?? pkg.price}
+                                                                        onChange={(e) => {
+                                                                            const value = parseInt(e.target.value) || pkg.price;
+                                                                            setPackagePrices(prev => ({
+                                                                                ...prev,
+                                                                                [pkg.id]: {
+                                                                                    price: value
+                                                                                }
+                                                                            }));
+                                                                        }}
+                                                                        className="w-full px-3 py-2 text-sm border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white font-medium"
+                                                                        placeholder={pkg.price?.toString() || '0'}
+                                                                    />
+                                                                </div>
+                                                                <div className="mt-3 pt-3 border-t border-blue-200">
+                                                                    <div className="flex items-center gap-2 text-sm">
+                                                                        <DollarSign className="w-4 h-4 text-blue-600" />
+                                                                        <span className="font-bold text-blue-700">
+                                                                            Your Price: ${packagePrices[pkg.id]?.price ?? pkg.price}
+                                                                        </span>
+                                                                    </div>
+                                                                </div>
+                                                            </div>
+                                                        )}
+                                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3 pt-3 border-t border-gray-200">
+                                                            <div>
+                                                                <div className="text-xs font-semibold text-gray-700 mb-1">Exterior Services:</div>
+                                                                <ul className="text-xs text-gray-600 space-y-1">
+                                                                    {pkg.exteriorServices.map((svc, idx) => (
+                                                                        <li key={idx} className="flex items-start">
+                                                                            <CheckCircle2 className="w-3 h-3 text-green-500 mr-1 mt-0.5 flex-shrink-0" />
+                                                                            <span>{svc}</span>
+                                                                        </li>
+                                                                    ))}
+                                                                </ul>
+                                                            </div>
+                                                            <div>
+                                                                <div className="text-xs font-semibold text-gray-700 mb-1">Interior Services:</div>
+                                                                <ul className="text-xs text-gray-600 space-y-1">
+                                                                    {pkg.interiorServices.map((svc, idx) => (
+                                                                        <li key={idx} className="flex items-start">
+                                                                            <CheckCircle2 className="w-3 h-3 text-green-500 mr-1 mt-0.5 flex-shrink-0" />
+                                                                            <span>{svc}</span>
+                                                                        </li>
+                                                                    ))}
+                                                                </ul>
+                                                            </div>
                                                         </div>
-                                                        <p className="text-sm text-gray-600">{addOn.description}</p>
                                                     </div>
                                                     <div className="ml-4">
                                                         <label className="relative inline-flex items-center cursor-pointer">
                                                             <input
-                                                            type="checkbox"
+                                                                type="checkbox"
                                                                 checked={isSelected}
                                                                 onChange={() => {
                                                                     if (isSelected) {
-                                                                        setSelectedAddOns(prev => prev.filter(id => id !== addOn.id));
+                                                                        // Remove package and its custom prices
+                                                                        setSelectedPackages(prev => prev.filter(id => id !== pkg.id));
+                                                                        setPackagePrices(prev => {
+                                                                            const updated = { ...prev };
+                                                                            delete updated[pkg.id];
+                                                                            return updated;
+                                                                        });
                                                                     } else {
-                                                                        setSelectedAddOns(prev => [...prev, addOn.id]);
+                                                                        setSelectedPackages(prev => [...prev, pkg.id]);
                                                                     }
                                                                 }}
                                                                 className="sr-only peer"
@@ -6373,697 +6526,740 @@ es[pkg.id]) {
                                                         </label>
                                                     </div>
                                                 </div>
-                                                    
-                                                        
-                                                            
-                                                            
-                                                        
-                                                        
-                                                    
-                                                    
-                                                        
-                                                            
-                                                                xt-gray-900 mb-6">Manage Availability</h2>
-                                                                
-                                                                
-                                                                    er border-gray-200 p-6 mb-6">
-                                                                        y-between mb-4">
-                                                                    bold text-gray-900">Weekly Schedule</h3>
-                                                                        
-                                                                    edule}
-                                                                blue-600 text-white rounded-lg font-semibold hover:bg-blue-700"
-                                                                
-                                                            
-                                                            
-                                                        
-                                                    m text-gray-500 mb-4">
-                                                ault working hours for each day of the week. This schedule will remain constant until you change it.
-                                            
-                                        
-                                     className="space-y-3">
-                                    {['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'].map((day) => {
-                                        const daySchedule = weeklySchedule[day] || { enabled: false, start: '09:00', end: '17:00' };
-                                        const dayName = day.charAt(0).toUpperCase() + day.slice(1);
-                    
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Add-ons Section */}
+                        <div>
+                            <h3 className="text-lg font-semibold text-gray-900 mb-4">Available Add-ons</h3>
+                            <p className="text-sm text-gray-500 mb-4">Select which add-ons you want to offer with your packages</p>
+                            <div className="space-y-3">
+                                {ADD_ONS.map((addOn) => {
+                                    const isSelected = selectedAddOns.includes(addOn.id);
                                     return (
-                                            <div key={day} className="flex items-center gap-4 p-4 border border-gray-200 rounded-lg">
-                                                <div className="flex items-center gap-3 w-32">
-                                                    <input
+                                        <div
+                                            key={addOn.id}
+                                            className={`bg-white rounded-xl border-2 p-4 transition-all ${isSelected ? 'border-blue-600 bg-blue-50' : 'border-gray-200'
+                                                }`}
+                                        >
+                                            <div className="flex items-center justify-between">
+                                                <div className="flex-1">
+                                                    <div className="flex items-center gap-3 mb-1">
+                                                        <h4 className="font-semibold text-gray-900">{addOn.name}</h4>
+                                                        <span className="text-sm font-medium text-gray-600">+${addOn.price}</span>
+                                                    </div>
+                                                    <p className="text-sm text-gray-600">{addOn.description}</p>
+                                                </div>
+                                                <div className="ml-4">
+                                                    <label className="relative inline-flex items-center cursor-pointer">
+                                                        <input
+                                                            type="checkbox"
+                                                            checked={isSelected}
+                                                            onChange={() => {
+                                                                if (isSelected) {
+                                                                    setSelectedAddOns(prev => prev.filter(id => id !== addOn.id));
+                                                                } else {
+                                                                    setSelectedAddOns(prev => [...prev, addOn.id]);
+                                                                }
+                                                            }}
+                                                            className="sr-only peer"
+                                                        />
+                                                        <div className="w-11 h-6 bg-gray-200 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-blue-300 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
+                                                    </label>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {activeTab === 'availability' && (
+                    <div>
+                        <h2 className="text-2xl font-bold text-gray-900 mb-6">Manage Availability</h2>
+
+                        {/* Weekly Schedule */}
+                        <div className="bg-white rounded-xl border border-gray-200 p-6 mb-6">
+                            <div className="flex items-center justify-between mb-4">
+                                <h3 className="text-lg font-semibold text-gray-900">Weekly Schedule</h3>
+                                <button
+                                    onClick={handleSaveWeeklySchedule}
+                                    className="px-4 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700"
+                                >
+                                    Save Schedule
+                                </button>
+                            </div>
+                            <p className="text-sm text-gray-500 mb-4">
+                                Set your default working hours for each day of the week. This schedule will remain constant until you change it.
+                            </p>
+
+                            <div className="space-y-3">
+                                {['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'].map((day) => {
+                                    const daySchedule = weeklySchedule[day] || { enabled: false, start: '09:00', end: '17:00' };
+                                    const dayName = day.charAt(0).toUpperCase() + day.slice(1);
+
+                                    return (
+                                        <div key={day} className="flex items-center gap-4 p-4 border border-gray-200 rounded-lg">
+                                            <div className="flex items-center gap-3 w-32">
+                                                <input
                                                     type="checkbox"
-                                                        checked={daySchedule.enabled || false}
-                                                        onChange={() => handleToggleDay(day)}
-                                                        className="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
-                                                    />
-                                                    <label className="font-medium text-gray-900">{dayName}</label>
-                                                </div>
-                                        
-                                                {daySchedule.enabled ? (
-                                                    <div className="flex items-center gap-3 flex-1">
-                                                        <div className="flex items-center gap-2">
-                                                            <label className="text-sm text-gray-600">Start:</label>
-                                                            <input
-                                                                type="time"
-                                                                value={daySchedule.start || '09:00'}
-                                                            onChange={(e) => handleDayScheduleChange(day, 'start', e.target.value)}
-                                                                className="px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                                                            />
-                                                        </div>
-                                                        <span className="text-gray-400">to</span>
-                                                    <div className="flex items-center gap-2">
-                                                            <label className="text-sm text-gray-600">End:</label>
-                                                            <input
-                                                                type="time"
-                                                                value={daySchedule.end || '17:00'}
-                                                                onChange={(e) => handleDayScheduleChange(day, 'end', e.target.value)}
-                                                                className="px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                                                            />
-                                                        </div>
-                                                    </div>
-                                                    (
-                                                    <span className="text-sm text-gray-400 italic">Not available</span>
-                                            )}
-                                                v>
-                                                    
-                                                        
-                                                            
-                                                            
-                                                                
-                                                                
-                                                                border border-gray-200 p-6">
-                                                                r justify-between mb-4">
-                                                            ont-semibold text-gray-900">Blackout Dates</h3>
-                                                        
-                                                        etShowBlackoutModal(true)}
-                                                        py-2 bg-red-600 text-white rounded-lg font-semibold hover:bg-red-700 flex items-center gap-2"
-                                                            
-                                                             h-4" />
-                                                                
-                                                                
-                                                                
-                                                                500 mb-4">
-                                                            're unavailable (holidays, emergencies, etc.). No bookings will be available on these dates.
-                                                        
-                                                    
-                                                ength === 0 ? (
-                                                    text-center py-8 text-gray-500">
-                                                r className="w-12 h-12 mx-auto mb-2 text-gray-300" />
-                                            o blackout dates set</p>
-                                        v>
-                                    (
-                                    <div className="space-y-2">
-                                        {blackoutDates.map((blackout) => {
-                                        const date = new Date(blackout.date + 'T00:00:00');
-                                            const formattedDate = date.toLocaleDateString('en-US', {
-                                                weekday: 'long',
-                                                year: 'numeric',
-                                                month: 'long',
-                                                day: 'numeric'
-                                            });
-                                        
-                                            return (
-                                                <div key={blackout.date} className="flex items-center justify-between p-3 bg-red-50 border border-red-200 rounded-lg">
-                                                    <div className="flex items-center gap-3">
-                                                        <Calendar className="w-5 h-5 text-red-600" />
-                                                        <span className="font-medium text-gray-900">{formattedDate}</span>
-                                                    </div>
-                                                    <button
-                                                        onClick={() => handleRemoveBlackoutDate(blackout.date)}
-                                                    className="px-3 py-1 text-sm text-red-600 hover:bg-red-100 rounded-lg font-medium"
-                                                    >
-                                                        Remove
-                                                    </button>
-                                                </div>
-                                            );
-                                        })}
-                                    </div>
-                                        
-                                            
-                                            
-                                                e Modal */}
-                                                & (
-                                                fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
-                                                me="bg-white rounded-xl max-w-md w-full">
-                                             className="p-6 border-b border-gray-200">
-                                        <div className="flex items-center justify-between">
-                                                <h3 className="text-xl font-bold text-gray-900">Add Blackout Date</h3>
-                                                <button
-                                                    onClick={() => {
-                                                        setShowBlackoutModal(false);
-                                                        setSelectedBlackoutDate('');
-                                                    }}
-                                                    className="text-gray-400 hover:text-gray-600"
-                                                        
-                                                        lassName="w-6 h-6" />
-                                                    tton>
-                                                        
-                                                    
-                                                
-                                             className="p-6 space-y-4">
-                                            <div>
-                                                <label className="block text-sm font-medium text-gray-700 mb-2">
-                                                    Select Date
-                                                </label>
-                                            <input
-                                                    type="date"
-                                                    value={selectedBlackoutDate}
-                                                    onChange={(e) => setSelectedBlackoutDate(e.target.value)}
-                                                    min={new Date().toISOString().split('T')[0]}
-                                                    className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                                                    checked={daySchedule.enabled || false}
+                                                    onChange={() => handleToggleDay(day)}
+                                                    className="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
                                                 />
-                                                v>
-                                                lassName="text-sm text-gray-500">
-                                                     date will be blocked out and no bookings will be available.
-                                                        
-                                                        
-                                                    
-                                                    me="p-6 border-t border-gray-200 flex gap-3">
-                                                ton
-                                                    ick={handleAddBlackoutDate}
-                                                className="flex-1 px-4 py-2 bg-red-600 text-white rounded-lg font-semibold hover:bg-red-700"
-                                            >
-                                                Add Blackout Date
-                                        </button>
+                                                <label className="font-medium text-gray-900">{dayName}</label>
+                                            </div>
+
+                                            {daySchedule.enabled ? (
+                                                <div className="flex items-center gap-3 flex-1">
+                                                    <div className="flex items-center gap-2">
+                                                        <label className="text-sm text-gray-600">Start:</label>
+                                                        <input
+                                                            type="time"
+                                                            value={daySchedule.start || '09:00'}
+                                                            onChange={(e) => handleDayScheduleChange(day, 'start', e.target.value)}
+                                                            className="px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                                                        />
+                                                    </div>
+                                                    <span className="text-gray-400">to</span>
+                                                    <div className="flex items-center gap-2">
+                                                        <label className="text-sm text-gray-600">End:</label>
+                                                        <input
+                                                            type="time"
+                                                            value={daySchedule.end || '17:00'}
+                                                            onChange={(e) => handleDayScheduleChange(day, 'end', e.target.value)}
+                                                            className="px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                                                        />
+                                                    </div>
+                                                </div>
+                                            ) : (
+                                                <span className="text-sm text-gray-400 italic">Not available</span>
+                                            )}
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        </div>
+
+                        {/* Blackout Dates */}
+                        <div className="bg-white rounded-xl border border-gray-200 p-6">
+                            <div className="flex items-center justify-between mb-4">
+                                <h3 className="text-lg font-semibold text-gray-900">Blackout Dates</h3>
+                                <button
+                                    onClick={() => setShowBlackoutModal(true)}
+                                    className="px-4 py-2 bg-red-600 text-white rounded-lg font-semibold hover:bg-red-700 flex items-center gap-2"
+                                >
+                                    <Plus className="w-4 h-4" />
+                                    Add Blackout Date
+                                </button>
+                            </div>
+                            <p className="text-sm text-gray-500 mb-4">
+                                Block out dates when you're unavailable (holidays, emergencies, etc.). No bookings will be available on these dates.
+                            </p>
+
+                            {blackoutDates.length === 0 ? (
+                                <div className="text-center py-8 text-gray-500">
+                                    <Calendar className="w-12 h-12 mx-auto mb-2 text-gray-300" />
+                                    <p>No blackout dates set</p>
+                                </div>
+                            ) : (
+                                <div className="space-y-2">
+                                    {blackoutDates.map((blackout) => {
+                                        const date = new Date(blackout.date + 'T00:00:00');
+                                        const formattedDate = date.toLocaleDateString('en-US', {
+                                            weekday: 'long',
+                                            year: 'numeric',
+                                            month: 'long',
+                                            day: 'numeric'
+                                        });
+
+                                        return (
+                                            <div key={blackout.date} className="flex items-center justify-between p-3 bg-red-50 border border-red-200 rounded-lg">
+                                                <div className="flex items-center gap-3">
+                                                    <Calendar className="w-5 h-5 text-red-600" />
+                                                    <span className="font-medium text-gray-900">{formattedDate}</span>
+                                                </div>
+                                                <button
+                                                    onClick={() => handleRemoveBlackoutDate(blackout.date)}
+                                                    className="px-3 py-1 text-sm text-red-600 hover:bg-red-100 rounded-lg font-medium"
+                                                >
+                                                    Remove
+                                                </button>
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Add Blackout Date Modal */}
+                        {showBlackoutModal && (
+                            <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+                                <div className="bg-white rounded-xl max-w-md w-full">
+                                    <div className="p-6 border-b border-gray-200">
+                                        <div className="flex items-center justify-between">
+                                            <h3 className="text-xl font-bold text-gray-900">Add Blackout Date</h3>
                                             <button
                                                 onClick={() => {
                                                     setShowBlackoutModal(false);
                                                     setSelectedBlackoutDate('');
                                                 }}
-                                                className="px-6 py-2 border-2 border-gray-200 rounded-lg font-semibold hover:bg-gray-50"
-                                                    
-                                                    el
-                                                    >
-                                                    
-                                                    
-                                                
-                                            
-                                            
-                                                
-                                            
-                                        n' && userData?.role === 'admin' && (  // Change to userData
+                                                className="text-gray-400 hover:text-gray-600"
+                                            >
+                                                <X className="w-6 h-6" />
+                                            </button>
+                                        </div>
+                                    </div>
+
+                                    <div className="p-6 space-y-4">
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                Select Date
+                                            </label>
+                                            <input
+                                                type="date"
+                                                value={selectedBlackoutDate}
+                                                onChange={(e) => setSelectedBlackoutDate(e.target.value)}
+                                                min={new Date().toISOString().split('T')[0]}
+                                                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                                            />
+                                        </div>
+                                        <p className="text-sm text-gray-500">
+                                            This date will be blocked out and no bookings will be available.
+                                        </p>
+                                    </div>
+
+                                    <div className="p-6 border-t border-gray-200 flex gap-3">
+                                        <button
+                                            onClick={handleAddBlackoutDate}
+                                            className="flex-1 px-4 py-2 bg-red-600 text-white rounded-lg font-semibold hover:bg-red-700"
+                                        >
+                                            Add Blackout Date
+                                        </button>
+                                        <button
+                                            onClick={() => {
+                                                setShowBlackoutModal(false);
+                                                setSelectedBlackoutDate('');
+                                            }}
+                                            className="px-6 py-2 border-2 border-gray-200 rounded-lg font-semibold hover:bg-gray-50"
+                                        >
+                                            Cancel
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                )}
+
+                {activeTab === 'admin' && userData?.role === 'admin' && (  // Change to userData
                     <div>
-                                        me="flex items-center justify-between mb-6">
-                                            e="text-2xl font-bold text-gray-900">Admin Panel</h2>
-                                                flex gap-2">
-                                                
-                                            ick={async () => {
-                                                confirm('This will import all packages to Firestore. Continue?')) {
-                                                try {
-                                                    await importPackagesToFirestore();
-                                                } catch (error) {
-                                                    console.error('Import error:', error);
-                                                    
-                                                
-                                                
-                                            sName="px-4 py-2 text-sm bg-green-600 text-white rounded-lg font-medium hover:bg-green-700"
-                                                
-                                            rt Packages
-                                        tton>
-                                    <button
-                                        onClick={listAllProviders}
-                                        className="px-4 py-2 text-sm bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700"
-                                    >
-                                        List All Providers
+                        <div className="flex items-center justify-between mb-6">
+                            <h2 className="text-2xl font-bold text-gray-900">Admin Panel</h2>
+                            <div className="flex gap-2">
+                                <button
+                                    onClick={async () => {
+                                        if (confirm('This will import all packages to Firestore. Continue?')) {
+                                            try {
+                                                await importPackagesToFirestore();
+                                            } catch (error) {
+                                                console.error('Import error:', error);
+                                            }
+                                        }
+                                    }}
+                                    className="px-4 py-2 text-sm bg-green-600 text-white rounded-lg font-medium hover:bg-green-700"
+                                >
+                                    Import Packages
                                 </button>
-                                    <button
-                                        onClick={loadPendingProviders}
-                                        className="px-4 py-2 text-sm border-2 border-gray-200 rounded-lg font-medium hover:bg-gray-50"
-                                    >
-                                        Refresh
-                                    </button>
-                                        
-                                            
-                                                
-                                                    
-                                                ext-lg font-semibold text-gray-900 mb-4">Provider Approvals</h3>
-                                                    
-                                                ? (
-                                            ssName="text-center py-8">
-                                        <p className="text-gray-600">Loading pending applications...</p>
-                                        v>
-                                    pendingProviders.length === 0 ? (
-                                         className="bg-white rounded-xl border border-gray-200 p-12 text-center">
-                                        <CheckCircle2 className="w-16 h-16 text-green-300 mx-auto mb-4" />
-                                        <h3 className="text-xl font-semibold text-gray-900 mb-2">No pending applications</h3>
-                                        <p className="text-gray-600">All provider applications have been reviewed.</p>
-                                        v>
-                                    (
-                                         className="space-y-4">
-                                        {pendingProviders.map((provider) => (
-                                            <div key={provider.id} className="bg-white rounded-xl border-2 border-yellow-200 p-6">
-                                                <div className="flex items-start justify-between mb-4">
-                                                    <div className="flex-1">
-                                                        <h3 className="text-xl font-bold text-gray-900 mb-2">
-                                                            {provider.businessName}
-                                                        </h3>
-                                                        <div className="space-y-2 text-sm text-gray-600">
-                                                            <div className="flex items-center gap-2">
-                                                            <Mail className="w-4 h-4" />
-                                                                <span>{provider.email}</span>
-                                                            </div>
+                                <button
+                                    onClick={listAllProviders}
+                                    className="px-4 py-2 text-sm bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700"
+                                >
+                                    List All Providers
+                                </button>
+                                <button
+                                    onClick={loadPendingProviders}
+                                    className="px-4 py-2 text-sm border-2 border-gray-200 rounded-lg font-medium hover:bg-gray-50"
+                                >
+                                    Refresh
+                                </button>
+                            </div>
+                        </div>
+
+                        <div className="mb-6">
+                            <h3 className="text-lg font-semibold text-gray-900 mb-4">Provider Approvals</h3>
+
+                            {loadingPending ? (
+                                <div className="text-center py-8">
+                                    <p className="text-gray-600">Loading pending applications...</p>
+                                </div>
+                            ) : pendingProviders.length === 0 ? (
+                                <div className="bg-white rounded-xl border border-gray-200 p-12 text-center">
+                                    <CheckCircle2 className="w-16 h-16 text-green-300 mx-auto mb-4" />
+                                    <h3 className="text-xl font-semibold text-gray-900 mb-2">No pending applications</h3>
+                                    <p className="text-gray-600">All provider applications have been reviewed.</p>
+                                </div>
+                            ) : (
+                                <div className="space-y-4">
+                                    {pendingProviders.map((provider) => (
+                                        <div key={provider.id} className="bg-white rounded-xl border-2 border-yellow-200 p-6">
+                                            <div className="flex items-start justify-between mb-4">
+                                                <div className="flex-1">
+                                                    <h3 className="text-xl font-bold text-gray-900 mb-2">
+                                                        {provider.businessName}
+                                                    </h3>
+                                                    <div className="space-y-2 text-sm text-gray-600">
                                                         <div className="flex items-center gap-2">
+                                                            <Mail className="w-4 h-4" />
+                                                            <span>{provider.email}</span>
+                                                        </div>
+                                                        <div className="flex items-center gap-2">
+                                                            <Phone className="w-4 h-4" />
+                                                            <span>{provider.phone}</span>
+                                                        </div>
+                                                        {provider.ownerName && (
+                                                            <div className="flex items-center gap-2">
+                                                                <User className="w-4 h-4" />
+                                                                <span>Owner: {provider.ownerName}</span>
+                                                            </div>
+                                                        )}
+                                                        {provider.address && (
+                                                            <div className="flex items-center gap-2">
+                                                                <MapPin className="w-4 h-4" />
+                                                                <span>{provider.address}</span>
+                                                            </div>
+                                                        )}
+                                                        {provider.serviceArea && (
+                                                            <div className="flex items-center gap-2">
+                                                                <MapPin className="w-4 h-4" />
+                                                                <span>Service Area: {provider.serviceArea}</span>
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                                <span className="px-3 py-1 bg-yellow-100 text-yellow-800 rounded-full text-sm font-medium">
+                                                    Pending
+                                                </span>
+                                            </div>
+
+                                            {/* Business Details */}
+                                            <div className="grid grid-cols-2 gap-4 mb-4 p-4 bg-gray-50 rounded-lg">
+                                                <div>
+                                                    <label className="text-xs font-medium text-gray-500">Business License</label>
+                                                    <p className="text-sm font-semibold text-gray-900">{provider.businessLicenseNumber || 'N/A'}</p>
+                                                </div>
+                                                {provider.ein && (
+                                                    <div>
+                                                        <label className="text-xs font-medium text-gray-500">EIN</label>
+                                                        <p className="text-sm font-semibold text-gray-900">{provider.ein}</p>
+                                                    </div>
+                                                )}
+                                                <div>
+                                                    <label className="text-xs font-medium text-gray-500">Insurance Provider</label>
+                                                    <p className="text-sm font-semibold text-gray-900">{provider.insuranceProvider || 'N/A'}</p>
+                                                </div>
+                                                <div>
+                                                    <label className="text-xs font-medium text-gray-500">Insurance Number</label>
+                                                    <p className="text-sm font-semibold text-gray-900">{provider.insuranceNumber || 'N/A'}</p>
+                                                </div>
+                                            </div>
+
+                                            {provider.about && (
+                                                <div className="mb-4">
+                                                    <label className="text-xs font-medium text-gray-500">About</label>
+                                                    <p className="text-sm text-gray-700 mt-1">{provider.about}</p>
+                                                </div>
+                                            )}
+
+                                            {/* Action Buttons */}
+                                            <div className="flex gap-3 pt-4 border-t border-gray-200">
+                                                <button
+                                                    onClick={() => handleApproveProvider(provider.id)}
+                                                    className="flex-1 px-4 py-2 bg-green-600 text-white rounded-lg font-semibold hover:bg-green-700"
+                                                >
+                                                    Approve
+                                                </button>
+                                                <button
+                                                    onClick={() => handleRejectProvider(provider.id)}
+                                                    className="flex-1 px-4 py-2 bg-red-600 text-white rounded-lg font-semibold hover:bg-red-700"
+                                                >
+                                                    Reject
+                                                </button>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Rejected Providers Section */}
+                        <div className="mt-8">
+                            <div className="flex items-center justify-between mb-4">
+                                <h3 className="text-lg font-bold text-gray-900">Rejected Providers</h3>
+                                <button
+                                    onClick={loadRejectedProviders}
+                                    className="px-4 py-2 text-sm border-2 border-gray-200 rounded-lg font-semibold hover:bg-gray-50"
+                                >
+                                    Refresh
+                                </button>
+                            </div>
+                            {rejectedProviders.length === 0 ? (
+                                <div className="bg-white rounded-xl border border-gray-200 p-8 text-center">
+                                    <p className="text-gray-600">No rejected providers.</p>
+                                </div>
+                            ) : (
+                                <div className="space-y-4">
+                                    {rejectedProviders.map((provider) => (
+                                        <div key={provider.id} className="bg-white rounded-xl border-2 border-red-200 p-6">
+                                            <div className="flex items-start justify-between mb-4">
+                                                <div className="flex-1">
+                                                    <h4 className="text-lg font-bold text-gray-900 mb-2">
+                                                        {provider.businessName || provider.name || 'N/A'}
+                                                    </h4>
+                                                    <div className="space-y-1 text-sm text-gray-600">
+                                                        <div className="flex items-center gap-2">
+                                                            <Mail className="w-4 h-4" />
+                                                            <span>{provider.email}</span>
+                                                        </div>
+                                                        {provider.phone && (
+                                                            <div className="flex items-center gap-2">
                                                                 <Phone className="w-4 h-4" />
                                                                 <span>{provider.phone}</span>
                                                             </div>
-                                                            {provider.ownerName && (
-                                                                <div className="flex items-center gap-2">
-                                                                    <User className="w-4 h-4" />
-                                                                    <span>Owner: {provider.ownerName}</span>
-                                                                </div>
-                                                            )}
-                                                            {provider.address && (
-                                                                <div className="flex items-center gap-2">
-                                                                    <MapPin className="w-4 h-4" />
-                                                                    <span>{provider.address}</span>
-                                                                </div>
-                                                            )}
-                                                            {provider.serviceArea && (
-                                                                <div className="flex items-center gap-2">
-                                                                    <MapPin className="w-4 h-4" />
-                                                                    <span>Service Area: {provider.serviceArea}</span>
-                                                                </div>
-                                                            )}
-                                                                
-                                                                
-                                                            assName="px-3 py-1 bg-yellow-100 text-yellow-800 rounded-full text-sm font-medium">
-                                                            ing
-                                                                
-                                                                
-                                                            
-                                                             Details */}
-                                                                grid grid-cols-2 gap-4 mb-4 p-4 bg-gray-50 rounded-lg">
-                                                                    
-                                                                    Name="text-xs font-medium text-gray-500">Business License</label>
-                                                                Name="text-sm font-semibold text-gray-900">{provider.businessLicenseNumber || 'N/A'}</p>
-                                                            
-                                                            r.ein && (
-                                                                
-                                                                    lassName="text-xs font-medium text-gray-500">EIN</label>
-                                                                    Name="text-sm font-semibold text-gray-900">{provider.ein}</p>
-                                                                
-                                                            
-                                                            
-                                                                lassName="text-xs font-medium text-gray-500">Insurance Provider</label>
-                                                                    ="text-sm font-semibold text-gray-900">{provider.insuranceProvider || 'N/A'}</p>
-                                                                    
-                                                                
-                                                            el className="text-xs font-medium text-gray-500">Insurance Number</label>
-                                                        <p className="text-sm font-semibold text-gray-900">{provider.insuranceNumber || 'N/A'}</p>
-                                                    </div>
-                                                    v>
-                                                        
-                                                    vider.about && (
-                                                    <div className="mb-4">
-                                                    <label className="text-xs font-medium text-gray-500">About</label>
-                                                        <p className="text-sm text-gray-700 mt-1">{provider.about}</p>
-                                                    </div>
-                                                    
-                                                        
-                                                        on Buttons */}
-                                                     className="flex gap-3 pt-4 border-t border-gray-200">
-                                                    <button
-                                                        onClick={() => handleApproveProvider(provider.id)}
-                                                            sName="flex-1 px-4 py-2 bg-green-600 text-white rounded-lg font-semibold hover:bg-green-700"
-                                                            
-                                                        Approve
-                                                    </button>
-                                                    <button
-                                                        onClick={() => handleRejectProvider(provider.id)}
-                                                        className="flex-1 px-4 py-2 bg-red-600 text-white rounded-lg font-semibold hover:bg-red-700"
-                                                    >
-                                                        Reject
-                                                        tton>
-                                                        
-                                                    
-                                                
-                                </div>
-                                                
-                                                    
-                                                        
-                                                        on */}
-                                                    
-                                                flex items-center justify-between mb-4">
-                                <h3 className="text-lg font-bold text-gray-900">Rejected Providers</h3>
-                                                
-                                                {loadRejectedProviders}
-                                                    x-4 py-2 text-sm border-2 border-gray-200 rounded-lg font-semibold hover:bg-gray-50"
-                                                        
-                                                        
-                                                    
-                                                        
-                                                    ength === 0 ? (
-                                                    bg-white rounded-xl border border-gray-200 p-8 text-center">
-                                                        xt-gray-600">No rejected providers.</p>
-                                                        
-                                                    
-                                                        e-y-4">
-                                                    viders.map((provider) => (
-                                                 key={provider.id} className="bg-white rounded-xl border-2 border-red-200 p-6">
-                                                <div className="flex items-start justify-between mb-4">
-                                                    <div className="flex-1">
-                                                        <h4 className="text-lg font-bold text-gray-900 mb-2">
-                                                            {provider.businessName || provider.name || 'N/A'}
-                                                        </h4>
-                                                    <div className="space-y-1 text-sm text-gray-600">
-                                                            <div className="flex items-center gap-2">
-                                                                <Mail className="w-4 h-4" />
-                                                                <span>{provider.email}</span>
+                                                        )}
+                                                        {provider.rejectionReason && (
+                                                            <div className="mt-2 p-2 bg-red-50 rounded text-xs text-red-800">
+                                                                <strong>Reason:</strong> {provider.rejectionReason}
                                                             </div>
-                                                            {provider.phone && (
-                                                                <div className="flex items-center gap-2">
-                                                                    <Phone className="w-4 h-4" />
-                                                                    <span>{provider.phone}</span>
-                                                                </div>
-                                                            )}
-                                                            {provider.rejectionReason && (
-                                                                <div className="mt-2 p-2 bg-red-50 rounded text-xs text-red-800">
-                                                                    <strong>Reason:</strong> {provider.rejectionReason}
-                                                                </div>
-                                                            )}
-                                                        </div>
+                                                        )}
                                                     </div>
-                                                    <span className="px-3 py-1 bg-red-100 text-red-800 rounded-full text-sm font-medium">
-                                                        Rejected
-                                                    </span>
-                                                    v>
-                                                        ssName="flex gap-3 pt-4 border-t border-gray-200">
-                                                            
-                                                        onClick={() => handleDeleteProvider(provider.id)}
-                                                        className="flex-1 px-4 py-2 bg-red-600 text-white rounded-lg font-semibold hover:bg-red-700"
-                                                            
-                                                                ccount
-                                                                
-                                                            
-                                                            
-                                                                
-                                                                    
-                                                                    
-                                                                
-                                                            
-                                                            
-                                                                
-                                                                    
-                                                                
-                                                            
-                                                        
-                                                    cationAsRead}
-                                                    arkAllAsRead(currentUser.uid)}
-                                                        
-                                                    
-                                                (
-                                                
-                                                    ms-center justify-between mb-6">
-                                                        font-bold text-gray-900">Provider Profile</h2>
-                                                        erData && (
-                                                    
-                                                        etIsEditingProfile(true)}
-                                                    lex items-center gap-2 px-4 py-2 border-2 border-gray-200 rounded-lg font-semibold hover:bg-gray-50"
-                                                
-                                            t2 className="w-4 h-4" />
-                                        Edit Profile
-                                    </button>
+                                                </div>
+                                                <span className="px-3 py-1 bg-red-100 text-red-800 rounded-full text-sm font-medium">
+                                                    Rejected
+                                                </span>
+                                            </div>
+                                            <div className="flex gap-3 pt-4 border-t border-gray-200">
+                                                <button
+                                                    onClick={() => handleDeleteProvider(provider.id)}
+                                                    className="flex-1 px-4 py-2 bg-red-600 text-white rounded-lg font-semibold hover:bg-red-700"
+                                                >
+                                                    Delete Account
+                                                </button>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                )}
+
+                {activeTab === 'notifications' && (
+                    <NotificationCenter
+                        notifications={notifications}
+                        unreadCount={unreadCount}
+                        onMarkAsRead={markNotificationAsRead}
+                        onMarkAllAsRead={() => markAllAsRead(currentUser.uid)}
+                    />
+                )}
+                {activeTab === 'profile' && (
+                    <div>
+                        <div className="flex items-center justify-between mb-6">
+                            <h2 className="text-2xl font-bold text-gray-900">Provider Profile</h2>
+                            {!isEditingProfile && userData && (
+                                <button
+                                    onClick={() => setIsEditingProfile(true)}
+                                    className="flex items-center gap-2 px-4 py-2 border-2 border-gray-200 rounded-lg font-semibold hover:bg-gray-50"
+                                >
+                                    <Edit2 className="w-4 h-4" />
+                                    Edit Profile
+                                </button>
+                            )}
+                        </div>
+                        {userData ? (
+                            <div className="bg-white rounded-xl border border-gray-200 p-8">
+                                {!isEditingProfile ? (
+                                    <>
+                                        <div className="space-y-6">
+                                            {/* Logo Display */}
+                                            <div>
+                                                <label className="block text-sm font-medium text-gray-500 mb-2">
+                                                    Business Logo
+                                                </label>
+                                                <div className="w-32 h-32 bg-gray-100 rounded-lg overflow-hidden border-2 border-gray-200 flex items-center justify-center">
+                                                    {userData.image ? (
+                                                        <img src={userData.image} alt="Business logo" className="w-full h-full object-cover" />
+                                                    ) : (
+                                                        <span className="text-gray-400 text-3xl font-bold">
+                                                            {userData.businessName?.charAt(0) || userData.name?.charAt(0) || '?'}
+                                                        </span>
+                                                    )}
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <label className="block text-sm font-medium text-gray-500 mb-1">
+                                                    Business Name
+                                                </label>
+                                                <div className="text-lg font-semibold text-gray-900">
+                                                    {userData.businessName || 'Not set'}
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <label className="block text-sm font-medium text-gray-500 mb-1">
+                                                    Service Area
+                                                </label>
+                                                <div className="text-lg font-semibold text-gray-900">
+                                                    {userData.serviceArea || userData.businessAddress || 'Not set'}
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <label className="block text-sm font-medium text-gray-500 mb-1">
+                                                    Business Address
+                                                </label>
+                                                <div className="text-lg font-semibold text-gray-900">
+                                                    {userData.businessAddress || userData.address || 'Not set'}
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <label className="block text-sm font-medium text-gray-500 mb-1">
+                                                    Primary Service
+                                                </label>
+                                                <div className="text-lg font-semibold text-gray-900">
+                                                    {userData.primaryService || 'Not set'}
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <label className="block text-sm font-medium text-gray-500 mb-1">
+                                                    Phone
+                                                </label>
+                                                <div className="text-lg font-semibold text-gray-900">
+                                                    {userData.phone || 'Not set'}
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <label className="block text-sm font-medium text-gray-500 mb-1">
+                                                    Email
+                                                </label>
+                                                <div className="text-lg font-semibold text-gray-900">
+                                                    {userData.email || 'Not set'}
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <div className="mt-6 pt-6 border-t border-gray-200">
+                                            <button
+                                                onClick={async () => {
+                                                    if (!currentUser?.email) {
+                                                        alert('Email address not found. Please contact support.');
+                                                        return;
+                                                    }
+
+                                                    try {
+                                                        await sendPasswordResetEmail(auth, currentUser.email);
+                                                        alert('Password reset email sent! Please check your inbox and follow the instructions to reset your password.');
+                                                    } catch (error) {
+                                                        console.error('Error sending password reset email:', error);
+                                                        alert(`Failed to send password reset email: ${error.message}`);
+                                                    }
+                                                }}
+                                                className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700 transition-colors"
+                                            >
+                                                <Shield className="w-4 h-4" />
+                                                Reset Password
+                                            </button>
+                                            <p className="text-xs text-gray-500 mt-2">
+                                                We'll send a password reset link to your email address.
+                                            </p>
+                                        </div>
+                                    </>
+                                ) : (
+                                    <div className="space-y-4">
+                                        {/* Logo Upload Section */}
+                                        <div>
+                                            <label className="block text-sm font-semibold text-gray-700 mb-2">
+                                                Business Logo
+                                            </label>
+
+                                            <div className="flex items-center gap-4">
+                                                {/* Current Logo Preview */}
+                                                <div className="w-32 h-32 bg-gray-100 rounded-lg overflow-hidden border-2 border-gray-200 flex items-center justify-center flex-shrink-0">
+                                                    {logoPreview ? (
+                                                        <img src={logoPreview} alt="Logo preview" className="w-full h-full object-cover" />
+                                                    ) : userData?.image ? (
+                                                        <img src={userData.image} alt="Current logo" className="w-full h-full object-cover" />
+                                                    ) : (
+                                                        <span className="text-gray-400 text-3xl font-bold">
+                                                            {userData?.businessName?.charAt(0) || userData?.name?.charAt(0) || '?'}
+                                                        </span>
+                                                    )}
+                                                </div>
+
+                                                {/* Upload Controls */}
+                                                <div className="flex-1">
+                                                    <input
+                                                        type="file"
+                                                        accept="image/*"
+                                                        onChange={handleFileSelect}
+                                                        className="hidden"
+                                                        id="logo-upload"
+                                                        disabled={uploadingLogo}
+                                                    />
+                                                    <label
+                                                        htmlFor="logo-upload"
+                                                        className={`inline-block px-4 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700 cursor-pointer transition-colors ${uploadingLogo ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                                    >
+                                                        {uploadingLogo ? 'Uploading...' : 'Choose Logo'}
+                                                    </label>
+
+                                                    {logoFile && (
+                                                        <div className="mt-2 flex items-center gap-2">
+                                                            <button
+                                                                onClick={handleLogoUpload}
+                                                                disabled={uploadingLogo}
+                                                                className="px-4 py-2 bg-green-600 text-white rounded-lg font-semibold hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                                                            >
+                                                                {uploadingLogo ? 'Uploading...' : 'Upload Logo'}
+                                                            </button>
+                                                            <button
+                                                                onClick={() => {
+                                                                    setLogoFile(null);
+                                                                    setLogoPreview(null);
+                                                                }}
+                                                                disabled={uploadingLogo}
+                                                                className="px-4 py-2 border-2 border-gray-300 rounded-lg font-semibold hover:bg-gray-50 disabled:opacity-50"
+                                                            >
+                                                                Cancel
+                                                            </button>
+                                                        </div>
+                                                    )}
+
+                                                    <p className="text-xs text-gray-500 mt-2">
+                                                        Recommended: Square image, max 5MB. Will appear on your detailer card.
+                                                    </p>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                Business Name
+                                            </label>
+                                            <input
+                                                type="text"
+                                                value={editedProviderProfile.businessName}
+                                                onChange={(e) => setEditedProviderProfile({ ...editedProviderProfile, businessName: e.target.value })}
+                                                className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                                                placeholder="Business Name"
+                                            />
+                                        </div>
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                Service Area
+                                            </label>
+                                            <input
+                                                type="text"
+                                                value={editedProviderProfile.serviceArea}
+                                                onChange={(e) => setEditedProviderProfile({ ...editedProviderProfile, serviceArea: e.target.value })}
+                                                className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                                                placeholder="City, State or ZIP codes"
+                                            />
+                                        </div>
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                Business Address
+                                            </label>
+                                            <input
+                                                type="text"
+                                                value={editedProviderProfile.businessAddress}
+                                                onChange={(e) => setEditedProviderProfile({ ...editedProviderProfile, businessAddress: e.target.value })}
+                                                className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                                                placeholder="123 Main St, City, State ZIP"
+                                            />
+                                        </div>
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                Phone
+                                            </label>
+                                            <input
+                                                type="tel"
+                                                value={editedProviderProfile.phone}
+                                                onChange={(e) => setEditedProviderProfile({ ...editedProviderProfile, phone: e.target.value })}
+                                                className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                                                placeholder="(555) 123-4567"
+                                            />
+                                        </div>
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                Email
+                                            </label>
+                                            <input
+                                                type="email"
+                                                value={editedProviderProfile.email}
+                                                onChange={(e) => setEditedProviderProfile({ ...editedProviderProfile, email: e.target.value })}
+                                                className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
+                                                placeholder="business@example.com"
+                                            />
+                                        </div>
+                                        <div className="flex gap-3 pt-4">
+                                            <button
+                                                onClick={async () => {
+                                                    try {
+                                                        // Update detailer collection
+                                                        await updateDoc(doc(db, 'detailer', currentUser.uid), {
+                                                            businessName: editedProviderProfile.businessName,
+                                                            serviceArea: editedProviderProfile.serviceArea,
+                                                            businessAddress: editedProviderProfile.businessAddress,
+                                                            phone: editedProviderProfile.phone,
+                                                            email: editedProviderProfile.email,
+                                                            updatedAt: serverTimestamp()
+                                                        });
+                                                        alert('Profile updated successfully!');
+                                                        setIsEditingProfile(false);
+                                                        loadProviderData(); // Reload to show updated data
+                                                    } catch (error) {
+                                                        console.error('Error updating provider profile:', error);
+                                                        alert('Failed to update profile');
+                                                    }
+                                                }}
+                                                className="px-6 py-3 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700"
+                                            >
+                                                Save Changes
+                                            </button>
+                                            <button
+                                                onClick={() => {
+                                                    setIsEditingProfile(false);
+                                                    // Reset to original values
+                                                    setEditedProviderProfile({
+                                                        businessName: userData?.businessName || '',
+                                                        serviceArea: userData?.serviceArea || '',
+                                                        businessAddress: userData?.businessAddress || userData?.address || '',
+                                                        phone: userData?.phone || '',
+                                                        email: userData?.email || ''
+                                                    });
+                                                    // Reset logo upload state
+                                                    setLogoFile(null);
+                                                    setLogoPreview(null);
+                                                }}
+                                                className="px-6 py-3 border-2 border-gray-200 rounded-lg font-semibold hover:bg-gray-50"
+                                            >
+                                                Cancel
+                                            </button>
+                                        </div>
+                                    </div>
                                 )}
                             </div>
-                            {userData ? (
-                                <div className="bg-white rounded-xl border border-gray-200 p-8">
-                                {!isEditingProfile ? (
-                                        <>
-                                            <div className="space-y-6">
-                                                {/* Logo Display */}
-                                                <div>
-                                                    <label className="block text-sm font-medium text-gray-500 mb-2">
-                                                        Business Logo
-                                                    </label>
-                                                    <div className="w-32 h-32 bg-gray-100 rounded-lg overflow-hidden border-2 border-gray-200 flex items-center justify-center">
-                                                        {userData.image ? (
-                                                            <img src={userData.image} alt="Business logo" className="w-full h-full object-cover" />
-                                                        ) : (
-                                                            <span className="text-gray-400 text-3xl font-bold">
-                                                                {userData.businessName?.charAt(0) || userData.name?.charAt(0) || '?'}
-                                                            </span>
-                                                        )}
-                                                    </div>
-                                                </div>
-                                                <div>
-                                                    <label className="block text-sm font-medium text-gray-500 mb-1">
-                                                        Business Name
-                                                    </label>
-                                                    <div className="text-lg font-semibold text-gray-900">
-                                                        {userData.businessName || 'Not set'}
-                                                    </div>
-                                                </div>
-                                                <div>
-                                                    <label className="block text-sm font-medium text-gray-500 mb-1">
-                                                        Service Area
-                                                    </label>
-                                                    <div className="text-lg font-semibold text-gray-900">
-                                                        {userData.serviceArea || userData.businessAddress || 'Not set'}
-                                                    </div>
-                                                    v>
-                                                        
-                                                            lassName="block text-sm font-medium text-gray-500 mb-1">
-                                                        Business Address
-                                                            
-                                                                me="text-lg font-semibold text-gray-900">
-                                                            rData.businessAddress || userData.address || 'Not set'}
-                                                        v>
-                                                    v>
-                                                <div>
-                                                    <label className="block text-sm font-medium text-gray-500 mb-1">
-                                                        Primary Service
-                                                        bel>
-                                                    <div className="text-lg font-semibold text-gray-900">
-                                                        {userData.primaryService || 'Not set'}
-                                                        v>
-                                                    v>
-                                                <div>
-                                                    <label className="block text-sm font-medium text-gray-500 mb-1">
-                                                        Phone
-                                                        bel>
-                                                    <div className="text-lg font-semibold text-gray-900">
-                                                        {userData.phone || 'Not set'}
-                                                        v>
-                                                    v>
-                                                <div>
-                                                    <label className="block text-sm font-medium text-gray-500 mb-1">
-                                                        Email
-                                                        bel>
-                                                    <div className="text-lg font-semibold text-gray-900">
-                                                        {userData.email || 'Not set'}
-                                                        v>
-                                                    v>
-                                                v>
-                                                 className="mt-6 pt-6 border-t border-gray-200">
-                                                    ton
-                                                        ick={async () => {
-                                                        if (!currentUser?.email) {
-                                                            alert('Email address not found. Please contact support.');
-                                                            return;
-                                                        }
-                                                
-                                                        try {
-                                                            await sendPasswordResetEmail(auth, currentUser.email);
-                                                            alert('Password reset email sent! Please check your inbox and follow the instructions to reset your password.');
-                                                        } catch (error) {
-                                                            console.error('Error sending password reset email:', error);
-                                                            alert(`Failed to send password reset email: ${error.message}`);
-                                                        }
-                                                    }}
-                                                    className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700 transition-colors"
-                                                    
-                                                        eld className="w-4 h-4" />
-                                                    Reset Password
-                                                    tton>
-                                                        Name="text-xs text-gray-500 mt-2">
-                                                    We'll send a password reset link to your email address.
-                                                </p>
-                                            </div>
-                                            
-                                                
-                                                    me="space-y-4">
-                                                        oad Section */}
-                                                            
-                                                            Name="block text-sm font-semibold text-gray-700 mb-2">
-                                                        ness Logo
-                                            </label>
-                                                        
-                                                            me="flex items-center gap-4">
-                                                            ent Logo Preview */}
-                                                         className="w-32 h-32 bg-gray-100 rounded-lg overflow-hidden border-2 border-gray-200 flex items-center justify-center flex-shrink-0">
-                                                            oPreview ? (
-                                                            <img src={logoPreview} alt="Logo preview" className="w-full h-full object-cover" />
-                                                        ) : userData?.image ? (
-                                                            <img src={userData.image} alt="Current logo" className="w-full h-full object-cover" />
-                                                        ) : (
-                                                            <span className="text-gray-400 text-3xl font-bold">
-                                                                {userData?.businessName?.charAt(0) || userData?.name?.charAt(0) || '?'}
-                                                            </span>
-                                                        )}
-                                                    </div>
-                                                    
-                                                    {/* Upload Controls */}
-                                                    <div className="flex-1">
-                                                        <input
-                                                            type="file"
-                                                            accept="image/*"
-                                                            onChange={handleFileSelect}  
-                                  
-                                
-                                    
-                                        
-                                            
-                                                
-                                                
-                                                 font-semibold hover:bg-blue-700 cursor-pointer transition-colors ${uploadingLogo ? 'opacity-50 cursor-not-allowed' : ''}`}
-                                                                                            >
-                                                
-                                            
-                                            
-                                                
-                                                       
-                                                                                                                <div className="mt-2 flex items-center gap-2">
-                                                    
-                                                
-                                                
-                                                ver:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed"
-                                            
-                                                
-                                                                                                    </button>
-                                        
-                                    
-                                
-
-                                
-                                                                    }}
-                                                                    disabled={uploadingLogo}
-                                                                    className="px-4 py-2 border-2 border-gray-300 rounded-lg font-semibold hover:bg-gray-50 disabled:opacity-50"
-                                                                >
-                                                                    Cancel
-                                                                </button>
-                                    
-                                    
-                                                        
-                                                            lassName="text-xs text-gray-500 mt-2">
-                                                            Recommended: Square image, max 5MB. Will appear on your detailer card.
-                                                    </p>
-                                                                                            v>
-
-                                                                
-                                                                    
-                                                                    ock text-sm font-medium text-gray-700 mb-2">
-                                                                    
-                                                                
-                                                                    
-                                                                
-                                                                dProviderProfile.businessName}
-                                                                     setEditedProviderProfile({ ...editedProviderProfile, businessName: e.target.value })}
-                                                                        -4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
-                                                                        s Name"
-                                                                    
-                                                                    
-                                                                    
-                                                                ="block text-sm font-medium text-gray-700 mb-2">
-                                                                    
-                                                                
-                                                            
-                                                        ="text"
-                                                value={editedProviderProfile.serviceArea}
-                                                        ange={(e) => setEditedProviderProfile({ ...editedProviderProfile, serviceArea: e.target.value })}
-                                                            e="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
-                                                        eholder="City, State or ZIP codes"
-                                                    
-                                                v>
-                                            <div>
-                                                <label className="block text-sm font-medium text-gray-700 mb-2">
-                                                    Business Address
-                                                    bel>
-                                                <input
-                                                    type="text"
-                                                    value={editedProviderProfile.businessAddress}
-                                                    onChange={(e) => setEditedProviderProfile({ ...editedProviderProfile, businessAddress: e.target.value })}
-                                                    className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
-                                                    placeholder="123 Main St, City, State ZIP"
-                                                    
-                                                v>
-                                            <div>
-                                                <label className="block text-sm font-medium text-gray-700 mb-2">
-                                                    Phone
-                                                    bel>
-                                                <input
-                                                    type="tel"
-                                                    value={editedProviderProfile.phone}
-                                                    onChange={(e) => setEditedProviderProfile({ ...editedProviderProfile, phone: e.target.value })}
-                                                    className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
-                                                    placeholder="(555) 123-4567"
-                                                    
-                                                v>
-                                            <div>
-                                                <label className="block text-sm font-medium text-gray-700 mb-2">
-                                                    Email
-                                                    bel>
-                                                <input
-                                                    type="email"
-                                                    value={editedProviderProfile.email}
-                                                    onChange={(e) => setEditedProviderProfile({ ...editedProviderProfile, email: e.target.value })}
-                                                    className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-blue-600 focus:outline-none"
-                                                    placeholder="business@example.com"
-                                                    
-                                                v>
-                                            <div className="flex gap-3 pt-4">
-                                                <button
-                                                    onClick={async () => {
-                                                        try {
-                                                            // Update detailer collection
-                                                            await updateDoc(doc(db, 'detailer', currentUser.uid), {
-                                                                businessName: editedProviderProfile.businessName,
-                                                                serviceArea: editedProviderProfile.serviceArea,
-                                                                businessAddress: editedProviderProfile.businessAddress,
-                                                                phone: editedProviderProfile.phone,
-                                                                email: editedProviderProfile.email,
-                                                                updatedAt: serverTimestamp()
-                                                            });
-                                                            alert('Profile updated successfully!');
-                                                            setIsEditingProfile(false);
-                                                            loadProviderData(); // Reload to show updated data
-                                                        } catch (error) {
-                                                            console.error('Error updating provider profile:', error);
-                                                            alert('Failed to update profile');
-                                                        }
-                                                    }}
-                                                    className="px-6 py-3 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700"
-                                                    
-                                                    Save Changes
-                                                </button>
-                                                <button
-                                                    onClick={() => {
-                                                        setIsEditingProfile(false);
-                                                        // Reset to original values
-                                                            ditedProviderProfile({
-                                                            businessName: userData?.businessName || '',
-                                                                iceArea: userData?.serviceArea || '',
-                                                                nessAddress: userData?.businessAddress || userData?.address || '',
-                                                                e: userData?.phone || '',
-                                                                l: userData?.email || ''
-                                                                
-                                                                 logo upload state
-                                                            ogoFile(null);
-                                                            ogoPreview(null);
-                                                            
-                                                            e="px-6 py-3 border-2 border-gray-200 rounded-lg font-semibold hover:bg-gray-50"
-                                                        
-                                                            
-                                                            
-                                                        
-                                                    
-                                                    
-                                                
-                                                    
-                                                bg-white rounded-xl border border-gray-200 p-12 text-center">
-                                                ="text-gray-600">Provider profile not found</p>
-                                                    
-                                                        
-                                                        
-                                                        
-                                                            
-                                                            
-                                                            
+                        ) : (
+                            <div className="bg-white rounded-xl border border-gray-200 p-12 text-center">
+                                <p className="text-gray-600">Provider profile not found</p>
+                            </div>
+                        )}
+                    </div>
+                )}
+            </div>
+        </div>
+    );
 }
